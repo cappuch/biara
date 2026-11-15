@@ -70,3 +70,34 @@ impl Line {
         e
     }
 }
+
+/// `prefix` then `i` in decimal: the key of virtual row `i`. Rune asks for every row's key when
+/// a list first shows, millions of them for a big listing, so this writes the digits directly
+/// rather than through `format!`.
+pub fn row_key(prefix: &str, i: usize) -> String {
+    let mut digits = [0u8; 20];
+    let (mut n, mut at) = (i, digits.len());
+    loop {
+        at -= 1;
+        digits[at] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    let mut key = String::with_capacity(prefix.len() + digits.len() - at);
+    key.push_str(prefix);
+    key.extend(digits[at..].iter().map(|&d| d as char));
+    key
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn row_keys_are_the_prefix_and_the_decimal_index() {
+        for i in [0, 7, 10, 99, 1_234_567, usize::MAX] {
+            assert_eq!(super::row_key("l", i), format!("l{i}"));
+        }
+        assert_eq!(super::row_key("fn", 42), "fn42");
+    }
+}

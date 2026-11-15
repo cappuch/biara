@@ -7,7 +7,7 @@ use rune_kit::TextInput;
 
 use crate::backend::Index;
 
-use super::{App, theme::*, widgets};
+use super::{App, code::row_key, theme::*, widgets};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SideTab {
@@ -213,7 +213,7 @@ fn virtual_list(
                 .virtual_rows(
                     count,
                     ROW,
-                    move |_: &App, i| Cow::Owned(format!("{prefix}{i}")),
+                    move |_: &App, i| Cow::Owned(row_key(prefix, i)),
                     build,
                 )
                 .virtual_rows_version((prefix, version, count)),

@@ -1188,19 +1188,19 @@ mod tests {
             Token {
                 start: 0,
                 end: 2,
-                kind: "identifier".into(),
+                kind: biara_proto::tokens::TokenKind::Identifier,
                 symbol: Some(SymbolRef::Function { address: 1 }),
             },
             Token {
                 start: 2,
                 end: 3,
-                kind: "whitespace".into(),
+                kind: biara_proto::tokens::TokenKind::Whitespace,
                 symbol: None,
             },
             Token {
                 start: 3,
                 end: 5,
-                kind: "identifier".into(),
+                kind: biara_proto::tokens::TokenKind::Identifier,
                 symbol: None,
             },
         ];
@@ -1211,13 +1211,13 @@ mod tests {
             Token {
                 start: 0,
                 end: 2,
-                kind: "identifier".into(),
+                kind: biara_proto::tokens::TokenKind::Identifier,
                 symbol: None,
             },
             Token {
                 start: 1,
                 end: 2,
-                kind: "identifier".into(),
+                kind: biara_proto::tokens::TokenKind::Identifier,
                 symbol: None,
             },
         ];
@@ -1225,7 +1225,7 @@ mod tests {
         let oob = vec![Token {
             start: 0,
             end: 9,
-            kind: "identifier".into(),
+            kind: biara_proto::tokens::TokenKind::Identifier,
             symbol: None,
         }];
         assert!(substitute(body, &oob, &renames).is_err());
@@ -1233,7 +1233,7 @@ mod tests {
         let split = vec![Token {
             start: 0,
             end: 2,
-            kind: "identifier".into(),
+            kind: biara_proto::tokens::TokenKind::Identifier,
             symbol: None,
         }];
         assert!(substitute(body, &split, &BTreeMap::new()).is_err());

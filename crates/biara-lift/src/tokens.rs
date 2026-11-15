@@ -22,15 +22,15 @@
 //! by construction. No heuristic call/address/member-position guessing,
 //! no dropped plain-value refs: every address-backed referent attributes.
 /// Raw lexical token: byte offsets, coarse kind, and exact text.
-struct Raw {
+struct Raw<'a> {
     start: usize,
     end: usize,
-    kind: &'static str,
-    text: String,
+    kind: TokenKind,
+    text: &'a str,
 }
 use std::collections::BTreeMap;
 
-use biara_proto::tokens::{SymbolRef, Token};
+use biara_proto::tokens::{SymbolRef, Token, TokenKind};
 
 /// C identifier sanitization shared with the renderer (`ident()` in
 /// cpp/cgen.cpp): non-alphanumeric bytes become `_`, leading digits gain
@@ -147,8 +147,8 @@ pub fn lex(body: &str, signature: &str, symbols: &[LexSymbol]) -> Vec<Token> {
             raw.push(Raw {
                 start,
                 end: i,
-                kind: "comment",
-                text: body[start..i].to_owned(),
+                kind: TokenKind::Comment,
+                text: &body[start..i],
             });
             continue;
         }
@@ -161,8 +161,8 @@ pub fn lex(body: &str, signature: &str, symbols: &[LexSymbol]) -> Vec<Token> {
             raw.push(Raw {
                 start,
                 end: i,
-                kind: "comment",
-                text: body[start..i].to_owned(),
+                kind: TokenKind::Comment,
+                text: &body[start..i],
             });
             continue;
         }
@@ -182,8 +182,8 @@ pub fn lex(body: &str, signature: &str, symbols: &[LexSymbol]) -> Vec<Token> {
             raw.push(Raw {
                 start,
                 end: i,
-                kind: "string",
-                text: body[start..i].to_owned(),
+                kind: TokenKind::String,
+                text: &body[start..i],
             });
             continue;
         }
@@ -195,8 +195,8 @@ pub fn lex(body: &str, signature: &str, symbols: &[LexSymbol]) -> Vec<Token> {
             raw.push(Raw {
                 start,
                 end: i,
-                kind: "whitespace",
-                text: body[start..i].to_owned(),
+                kind: TokenKind::Whitespace,
+                text: &body[start..i],
             });
             continue;
         }
@@ -214,15 +214,15 @@ pub fn lex(body: &str, signature: &str, symbols: &[LexSymbol]) -> Vec<Token> {
                 | "return" | "break" | "continue" | "sizeof" | "struct" | "union" | "enum"
                 | "typedef" | "static" | "extern" | "const" | "volatile" | "void" | "char"
                 | "short" | "int" | "long" | "signed" | "unsigned" | "float" | "double"
-                | "bool" | "_Bool" => "keyword",
-                _ if text.chars().all(|c| c.is_ascii_digit()) => "number",
-                _ => "identifier",
+                | "bool" | "_Bool" => TokenKind::Keyword,
+                _ if text.chars().all(|c| c.is_ascii_digit()) => TokenKind::Number,
+                _ => TokenKind::Identifier,
             };
             raw.push(Raw {
                 start,
                 end: i,
                 kind,
-                text: text.to_owned(),
+                text,
             });
             continue;
         }
@@ -243,8 +243,8 @@ pub fn lex(body: &str, signature: &str, symbols: &[LexSymbol]) -> Vec<Token> {
             raw.push(Raw {
                 start,
                 end: i,
-                kind: "number",
-                text: body[start..i].to_owned(),
+                kind: TokenKind::Number,
+                text: &body[start..i],
             });
             continue;
         }
@@ -287,8 +287,8 @@ pub fn lex(body: &str, signature: &str, symbols: &[LexSymbol]) -> Vec<Token> {
         raw.push(Raw {
             start,
             end: i,
-            kind: "punct",
-            text: body[start..i].to_owned(),
+            kind: TokenKind::Punct,
+            text: &body[start..i],
         });
     }
     // The body's own definition name: first table-spelled `identifier(` in
@@ -296,16 +296,13 @@ pub fn lex(body: &str, signature: &str, symbols: &[LexSymbol]) -> Vec<Token> {
     // defined symbol; a non-table spelling never defines one.
     let mut own_name: Option<&str> = None;
     for (index, token) in raw.iter().enumerate() {
-        if token.kind == "identifier" {
+        if token.kind == TokenKind::Identifier {
             let mut next = index + 1;
-            while next < raw.len() && raw[next].kind == "whitespace" {
+            while next < raw.len() && raw[next].kind == TokenKind::Whitespace {
                 next += 1;
             }
-            if next < raw.len()
-                && raw[next].text == "("
-                && functions.contains_key(token.text.as_str())
-            {
-                own_name = Some(token.text.as_str());
+            if next < raw.len() && raw[next].text == "(" && functions.contains_key(token.text) {
+                own_name = Some(token.text);
                 break;
             }
         }
@@ -313,45 +310,42 @@ pub fn lex(body: &str, signature: &str, symbols: &[LexSymbol]) -> Vec<Token> {
     let mut tokens = Vec::with_capacity(raw.len());
     for (index, token) in raw.iter().enumerate() {
         let mut symbol: Option<SymbolRef> = None;
-        if token.kind == "identifier" {
+        if token.kind == TokenKind::Identifier {
             // Previous significant token: member-field sides (`p->field`,
             // `p.field`) are layout display names, never symbols. The
             // base `p` keeps its own symbol; only the field side drops.
             let mut prev = index;
             while prev > 0
-                && (raw[prev - 1].kind == "whitespace" || raw[prev - 1].kind == "comment")
+                && (raw[prev - 1].kind == TokenKind::Whitespace
+                    || raw[prev - 1].kind == TokenKind::Comment)
             {
                 prev -= 1;
             }
-            let prev_text = if prev > 0 {
-                raw[prev - 1].text.as_str()
-            } else {
-                ""
-            };
-            let is_definition = own_name == Some(token.text.as_str())
+            let prev_text = if prev > 0 { raw[prev - 1].text } else { "" };
+            let is_definition = own_name == Some(token.text)
                 && raw[..index]
                     .iter()
-                    .all(|t| t.kind != "identifier" || t.text != token.text);
+                    .all(|t| t.kind != TokenKind::Identifier || t.text != token.text);
             if prev_text == "->" || prev_text == "." {
                 symbol = None;
             } else if is_definition {
                 // The definition site references the record's function.
-                if let Some(&address) = functions.get(token.text.as_str()) {
+                if let Some(&address) = functions.get(token.text) {
                     symbol = Some(SymbolRef::Function { address });
                 }
-            } else if let Some(&address) = functions.get(token.text.as_str()) {
+            } else if let Some(&address) = functions.get(token.text) {
                 // Authoritative hit: calls, declarations, function
                 // values, casts, plain uses all attribute. Locals were
                 // suffixed against this table at emission, so a hit is
                 // a genuine symbol, never a shadowed local.
                 symbol = Some(SymbolRef::Function { address });
-            } else if let Some(&address) = globals.get(token.text.as_str()) {
+            } else if let Some(&address) = globals.get(token.text) {
                 // Authoritative hit: declarations, plain loads, address
                 // uses, dereferences, member bases all attribute. No
                 // plain-value shortcut: every address-backed referent
                 // renames.
                 symbol = Some(SymbolRef::Global { address });
-            } else if let Some(&(layout, function)) = types.get(token.text.as_str()) {
+            } else if let Some(&(layout, function)) = types.get(token.text) {
                 // Authoritative hit: declaration slots, casts, `struct`
                 // uses all attribute, with the referencing function
                 // scope encoded explicitly.
@@ -361,7 +355,7 @@ pub fn lex(body: &str, signature: &str, symbols: &[LexSymbol]) -> Vec<Token> {
         tokens.push(Token {
             start: token.start as u64,
             end: token.end as u64,
-            kind: token.kind.to_owned(),
+            kind: token.kind,
             symbol,
         });
     }

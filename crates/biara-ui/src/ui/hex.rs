@@ -7,7 +7,11 @@ use std::borrow::Cow;
 use biara_loader::Image;
 use rune::{El, GrowthSpec, ScrollSpec, Tx, col, row, text};
 
-use super::{App, code::Line, theme::*};
+use super::{
+    App,
+    code::{Line, row_key},
+    theme::*,
+};
 
 const PER_ROW: u64 = 16;
 
@@ -91,7 +95,7 @@ pub fn view(app: &App) -> El {
                 .virtual_rows(
                     app.hex.rows(),
                     ROW_H,
-                    |_: &App, i| Cow::Owned(format!("h{i}")),
+                    |_: &App, i| Cow::Owned(row_key("h", i)),
                     build_row,
                 )
                 .virtual_rows_version((app.hex.version, app.hex.rows())),

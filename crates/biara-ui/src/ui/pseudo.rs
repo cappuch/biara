@@ -6,12 +6,16 @@
 
 use std::{borrow::Cow, sync::Arc};
 
-use biara_proto::tokens::SymbolRef;
+use biara_proto::tokens::{SymbolRef, TokenKind};
 use rune::{Color, El, GrowthSpec, ScrollSpec, Tx, col, el, row, text};
 
 use crate::backend::{Decompiled, decomp::Status};
 
-use super::{App, code::Line, theme::*};
+use super::{
+    App,
+    code::{Line, row_key},
+    theme::*,
+};
 
 /// What the view is showing.
 #[derive(Default)]
@@ -21,7 +25,9 @@ pub struct State {
     pub doc: Option<Arc<Decompiled>>,
     /// An identifier the user clicked; every occurrence is highlighted.
     pub word: Option<String>,
-    /// Bumped when the rows change (new document, rename).
+    /// Bumped when a new document replaces the rows. Row keys are indices, so nothing else
+    /// changes them: a rename or a highlighted word only changes what mounted rows draw, and
+    /// those are rebuilt anyway. A bump makes the next commit compare every row's key.
     pub version: u64,
     seen: u64,
 }
@@ -46,10 +52,6 @@ impl State {
             changed = true;
         }
         changed
-    }
-
-    pub fn invalidate(&mut self) {
-        self.version += 1;
     }
 }
 
@@ -88,10 +90,10 @@ pub fn view(app: &App) -> El {
                     .virtual_rows(
                         lines,
                         ROW_H,
-                        |_: &App, i| Cow::Owned(format!("p{i}")),
+                        |_: &App, i| Cow::Owned(row_key("p", i)),
                         build_row,
                     )
-                    .virtual_rows_version((app.pseudo.version, lines, app.display_version())),
+                    .virtual_rows_version((app.pseudo.version, lines)),
             );
     }
     match app.decomp.as_ref().map(|d| d.status(entry)) {
@@ -124,15 +126,15 @@ fn build_row(s: &App, i: usize) -> El {
             Some(SymbolRef::Function { address }) | Some(SymbolRef::Global { address }) => {
                 (s.token_name(*address, raw), Some(format!("a{address:x}")))
             }
-            _ if t.kind == "identifier" => (s.local_name(raw), Some(format!("w{raw}"))),
+            _ if t.kind == TokenKind::Identifier => (s.local_name(raw), Some(format!("w{raw}"))),
             _ => (raw.to_owned(), None),
         };
         let called = tokens[n + 1..]
             .iter()
-            .find(|u| u.kind != "whitespace")
+            .find(|u| u.kind != TokenKind::Whitespace)
             .is_some_and(|u| doc.body[u.start as usize..u.end as usize].starts_with('('));
-        let color = token_color(&t.kind, &t.symbol, raw, called);
-        let marked = s.pseudo.word.as_deref() == Some(raw) && t.kind == "identifier";
+        let color = token_color(t.kind, &t.symbol, raw, called);
+        let marked = s.pseudo.word.as_deref() == Some(raw) && t.kind == TokenKind::Identifier;
         line.run(&shown, color, link, marked.then_some(p.accent_soft));
         at = end;
     }
@@ -163,15 +165,15 @@ fn build_row(s: &App, i: usize) -> El {
     )
 }
 
-fn token_color(kind: &str, symbol: &Option<SymbolRef>, raw: &str, called: bool) -> Color {
+fn token_color(kind: TokenKind, symbol: &Option<SymbolRef>, raw: &str, called: bool) -> Color {
     let p = colors();
     match kind {
-        "keyword" => p.keyword,
-        "number" => p.number,
-        "string" => p.string,
-        "comment" => p.comment,
-        "punct" => p.punct,
-        "identifier" => match symbol {
+        TokenKind::Keyword => p.keyword,
+        TokenKind::Number => p.number,
+        TokenKind::String => p.string,
+        TokenKind::Comment => p.comment,
+        TokenKind::Punct => p.punct,
+        TokenKind::Identifier => match symbol {
             Some(SymbolRef::Function { .. }) => p.function,
             Some(SymbolRef::Global { .. }) => p.global,
             Some(SymbolRef::Type { .. }) => p.ty,
@@ -202,6 +204,5 @@ fn link(s: &mut App, id: &str, tx: &mut Tx) {
         } else {
             Some(word.to_owned())
         };
-        s.pseudo.invalidate();
     }
 }

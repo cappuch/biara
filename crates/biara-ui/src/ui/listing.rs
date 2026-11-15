@@ -6,12 +6,18 @@ use rune::{El, GrowthSpec, ScrollSpec, Tx, col, el, row, text};
 
 use crate::backend::{HeadKind, Insn, XrefKind, disasm};
 
-use super::{App, code::Line, theme::*};
+use super::{
+    App,
+    code::{Line, row_key},
+    theme::*,
+};
 
 /// Listing view state.
 #[derive(Default)]
 pub struct State {
-    /// Bumped when the rows change.
+    /// Bumped when a new program replaces the rows. Row keys are indices, so nothing else
+    /// changes them: a rename only changes what mounted rows draw, and those are rebuilt
+    /// anyway. A bump makes the next commit compare every row's key.
     version: u64,
 }
 
@@ -44,10 +50,10 @@ pub fn view(app: &App) -> El {
                 .virtual_rows(
                     count,
                     ROW_H,
-                    |_: &App, i| Cow::Owned(format!("l{i}")),
+                    |_: &App, i| Cow::Owned(row_key("l", i)),
                     build_row,
                 )
-                .virtual_rows_version((app.listing.version, count, app.display_version())),
+                .virtual_rows_version((app.listing.version, count)),
         )
 }
 

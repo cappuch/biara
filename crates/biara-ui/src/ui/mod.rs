@@ -97,6 +97,9 @@ pub struct App {
     pub side_w: f32,
     pub side_tab: SideTab,
     pub main_tab: MainTab,
+    /// The main tabs shown since the program opened, as bits by `MainTab as u8`: their views
+    /// stay mounted (see `main_area`). Set while drawing, which only sees `&App`.
+    shown_tabs: std::cell::Cell<u8>,
     pub filter: TextEdit,
     pub sidebar: sidebar::Lists,
     pub listing: listing::State,
@@ -135,6 +138,7 @@ impl Default for App {
             side_w: 300.0,
             side_tab: SideTab::Functions,
             main_tab: MainTab::Listing,
+            shown_tabs: std::cell::Cell::new(0),
             filter: TextEdit::new(""),
             sidebar: sidebar::Lists::default(),
             listing: listing::State::default(),
@@ -556,8 +560,6 @@ impl App {
     pub fn names_changed(&mut self) {
         self.display_epoch += 1;
         self.sidebar.rebuild(&self.index, &self.filter.text);
-        self.listing.invalidate();
-        self.pseudo.invalidate();
     }
 
     // Navigation -------------------------------------------------------------------------
@@ -643,7 +645,10 @@ impl App {
         let entry = self.function_of(self.cur);
         let (status, completed) = match (&self.decomp, entry) {
             (Some(d), Some(e)) => {
-                if self.main_tab == MainTab::Pseudo {
+                // A result the view already shows needs no request, even once the cache let it go.
+                if self.main_tab == MainTab::Pseudo
+                    && self.pseudo.doc.as_ref().is_none_or(|doc| doc.entry != e)
+                {
                     d.request(e);
                 }
                 (d.status(e), d.completed())
@@ -757,14 +762,41 @@ pub fn view(app: &App, _cx: &mut Cx<App>) -> El {
 
 fn main_area(app: &App) -> El {
     let p = colors();
-    let content = match (&app.load, app.main_tab) {
-        // The hex view needs only the parsed image.
-        (Load::Opening { .. } | Load::Ready, MainTab::Hex) => hex::view(app),
-        (Load::Ready, MainTab::Listing) => listing::view(app),
-        (Load::Ready, MainTab::Graph) => graph_view::view(app),
-        (Load::Ready, MainTab::Pseudo) => pseudo::view(app),
-        _ => widgets::placeholder(app),
+    let tab = app.main_tab;
+    let ready = matches!(app.load, Load::Ready);
+    // The hex view needs only the parsed image.
+    let hex = ready || matches!(app.load, Load::Opening { .. });
+    // A virtual list keeps its row keys (and its scroll position) only while it is in the tree,
+    // and building them again for millions of rows takes seconds. So the long views stay
+    // mounted, at zero height while another tab shows, from the first time their tab does.
+    app.shown_tabs.set(app.shown_tabs.get() | 1 << tab as u8);
+    let mounted = |t: MainTab| app.shown_tabs.get() & (1 << t as u8) != 0;
+    let pane = |key: &'static str, t: MainTab, view: fn(&App) -> El| {
+        let pane = col().key(key).w_full().min_h(0.0).child(view(app));
+        if t == tab {
+            pane.grow(1.0)
+        } else {
+            pane.h(0.0)
+        }
     };
+    let mut content = col().w_full().grow(1.0).min_h(0.0);
+    if hex && mounted(MainTab::Hex) {
+        content = content.child(pane("pane-hex", MainTab::Hex, hex::view));
+    }
+    if ready {
+        if mounted(MainTab::Listing) {
+            content = content.child(pane("pane-listing", MainTab::Listing, listing::view));
+        }
+        if mounted(MainTab::Pseudo) {
+            content = content.child(pane("pane-pseudo", MainTab::Pseudo, pseudo::view));
+        }
+        if tab == MainTab::Graph {
+            content = content.child(pane("pane-graph", MainTab::Graph, graph_view::view));
+        }
+    }
+    if !ready && !(hex && tab == MainTab::Hex) {
+        content = content.child(widgets::placeholder(app));
+    }
     col()
         .grow(1.0)
         .min_w(0.0)
@@ -772,7 +804,7 @@ fn main_area(app: &App) -> El {
         .fill(p.panel)
         .child(widgets::main_tabs(app))
         .child(el().w_full().h(1.0).fill(p.line))
-        .child(col().w_full().grow(1.0).min_h(0.0).child(content))
+        .child(content)
         .child(el().w_full().h(1.0).fill(p.line))
         .child(bottom::panel(app))
 }

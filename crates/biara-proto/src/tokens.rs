@@ -41,6 +41,21 @@ pub enum SymbolRef {
     Type { layout: u32, #[serde(default)] function: u64 },
 }
 
+/// What lexical class a [`Token`] is; serialized as its snake_case name
+/// (`identifier`, `keyword`, ...).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenKind {
+    Identifier,
+    Keyword,
+    Number,
+    String,
+    Comment,
+    Punct,
+    Whitespace,
+    Other,
+}
+
 /// One lexical unit of a rendered function body: byte offsets plus an
 /// optional semantic symbol reference. Span-only (no per-token text
 /// copy): clients slice `body[start..end]`; `substitute` validates
@@ -52,10 +67,9 @@ pub struct Token {
     pub start: u64,
     /// One-past-the-end byte offset within the function body.
     pub end: u64,
-    /// `identifier`, `keyword`, `number`, `string`, `comment`, `punct`,
-    /// `whitespace`, or `other`. Consumers mask non-code spans with it;
-    /// identity always comes from `symbol`, never from position guessing.
-    pub kind: String,
+    /// Consumers mask non-code spans with it; identity always comes from
+    /// `symbol`, never from position guessing.
+    pub kind: TokenKind,
     /// Semantic reference, when the lexer attributed this token to a
     /// known symbol. `None` for locals, parameters, literals, comments,
     /// keywords and punctuation: never rename targets.

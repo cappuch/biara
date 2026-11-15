@@ -3028,9 +3028,10 @@ mod tests {
                 // Only non-member positions may attribute; member sides
                 // must not.
                 let idx = tokens.iter().position(|u| u.start == t.start).unwrap();
-                let prev = tokens[..idx]
-                    .iter()
-                    .rfind(|u| u.kind != "whitespace" && u.kind != "comment");
+                let prev = tokens[..idx].iter().rfind(|u| {
+                    u.kind != biara_proto::tokens::TokenKind::Whitespace
+                        && u.kind != biara_proto::tokens::TokenKind::Comment
+                });
                 let prev_text = prev
                     .map(|u| &body[u.start as usize..u.end as usize])
                     .unwrap_or("");
@@ -3045,7 +3046,7 @@ mod tests {
         let code_refs: Vec<_> = tokens.iter().filter(|t| t.symbol.is_some()).collect();
         assert!(code_refs.iter().all(|t| {
             let idx = tokens.iter().position(|u| u.start == t.start).unwrap();
-            tokens[idx].kind == "identifier"
+            tokens[idx].kind == biara_proto::tokens::TokenKind::Identifier
         }));
     }
 
@@ -3060,19 +3061,19 @@ mod tests {
             Token {
                 start: 0,
                 end: 2,
-                kind: "identifier".into(),
+                kind: biara_proto::tokens::TokenKind::Identifier,
                 symbol: Some(SymbolRef::Function { address: 42 }),
             },
             Token {
                 start: 2,
                 end: 3,
-                kind: "whitespace".into(),
+                kind: biara_proto::tokens::TokenKind::Whitespace,
                 symbol: None,
             },
             Token {
                 start: 3,
                 end: 5,
-                kind: "identifier".into(),
+                kind: biara_proto::tokens::TokenKind::Identifier,
                 symbol: Some(SymbolRef::Global { address: 42 }),
             },
         ];
