@@ -218,11 +218,17 @@ pub fn resolution_view(cfg: &Cfg, pending: &BTreeSet<u64>) -> Cfg {
     view
 }
 
+/// Version of [`RecoveryState`]'s serialized form; persistent stores key saved
+/// states by it, so a changed form starts afresh instead of misreading one.
+pub const RECOVERY_STATE_VERSION: u32 = 2;
+
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 pub struct RecoveryState {
     pub round: usize,
     pub attempted_jumps: BTreeSet<u64>,
-    pub graph_cache: BTreeMap<u64, Vec<u64>>,
+    /// Per function, a digest of what its resolution read ([`graph_digest`]):
+    /// constant in size, where the inputs themselves grow with every block.
+    pub graph_cache: BTreeMap<u64, [u8; 32]>,
     pub callback_entries: BTreeSet<u64>,
 }
 
@@ -304,6 +310,7 @@ pub fn recover_resolving<'c>(
         mut graph_cache,
         mut callback_entries,
     } = state;
+    let bodies = Bodies::new(opts.cfg.discovery.as_ref());
     loop {
         let mut cfg = biara_cfg::recover_from(
             lib,
@@ -357,7 +364,7 @@ pub fn recover_resolving<'c>(
             if !f.blocks.is_disjoint(&unresolved_sites)
                 || graph_cache
                     .get(&f.entry)
-                    .is_none_or(|old| graph_inputs(&cfg, f).ne(old.iter().copied()))
+                    .is_none_or(|old| *old != graph_digest(&cfg, f))
             {
                 pending.insert(f.entry);
             }
@@ -428,7 +435,7 @@ pub fn recover_resolving<'c>(
         drop(sites);
         cfg.recovery.callback_limit_reached |= callbacks.limited;
         for &entry in &pending {
-            graph_cache.insert(entry, graph_inputs(&cfg, &cfg.functions[&entry]).collect());
+            graph_cache.insert(entry, graph_digest(&cfg, &cfg.functions[&entry]));
         }
         let open_flow: BTreeMap<_, BTreeSet<_>> =
             cfg.functions
@@ -472,6 +479,17 @@ pub fn recover_resolving<'c>(
                 }
                 mapped
             });
+            // A switch's cases lie in its own function. An index the jump
+            // does not bound (a byte read from memory) enumerates past the
+            // table into its neighbours, whose entries land in other
+            // functions: dropped, and the table is not known to be whole.
+            if !is_call {
+                let before = resolution.targets.len();
+                resolution.targets.retain(|&t| bodies.allows(site, t));
+                if resolution.targets.len() != before {
+                    resolution.complete = false;
+                }
+            }
             // Context evidence cannot create an exhaustive proof. Keep an
             // independent local proof only if it covers every added candidate.
             resolution.complete &= callbacks
@@ -559,6 +577,15 @@ pub fn recover_resolving<'c>(
 
 /// Exact, allocation-free comparison input for a function's recovered graph.
 /// Cache owns one flat sequence; no hash equality can hide a new predecessor.
+/// Digest of [`graph_inputs`].
+fn graph_digest(cfg: &Cfg, function: &biara_cfg::Function) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    for word in graph_inputs(cfg, function) {
+        hasher.update(&word.to_le_bytes());
+    }
+    hasher.finalize().into()
+}
+
 fn graph_inputs<'a>(
     cfg: &'a Cfg,
     function: &'a biara_cfg::Function,
@@ -576,6 +603,51 @@ fn graph_inputs<'a>(
         .chain(std::iter::once(calls.map_or(0, |t| t.targets.len()) as u64))
         .chain(calls.into_iter().flat_map(|t| t.targets.iter().copied()))
     }))
+}
+
+/// Known function bodies ([`biara_cfg::Discovery::extents`]), for telling a
+/// jump table's cases from what lies past its end.
+struct Bodies {
+    extents: Vec<std::ops::Range<u64>>,
+    /// Per extent, the largest end of it and those before it.
+    ends: Vec<u64>,
+}
+
+impl Bodies {
+    fn new(discovery: Option<&biara_cfg::Discovery>) -> Self {
+        let extents = discovery.map_or_else(Vec::new, |d| d.extents.clone());
+        let ends = extents
+            .iter()
+            .scan(0, |end, r| {
+                *end = r.end.max(*end);
+                Some(*end)
+            })
+            .collect();
+        Self { extents, ends }
+    }
+
+    /// Whether a jump at `site` may go to `target`: unless a known body holds
+    /// `site`, anything; else a place in such a body, or the start of any
+    /// body (a tail call through a table of functions).
+    fn allows(&self, site: u64, target: u64) -> bool {
+        let mut i = self.extents.partition_point(|r| r.start <= site);
+        let mut inside = false;
+        while i > 0 && self.ends[i - 1] > site {
+            i -= 1;
+            let body = &self.extents[i];
+            if body.contains(&site) {
+                if body.contains(&target) {
+                    return true;
+                }
+                inside = true;
+            }
+        }
+        !inside
+            || self
+                .extents
+                .binary_search_by_key(&target, |r| r.start)
+                .is_ok()
+    }
 }
 
 #[derive(Default)]

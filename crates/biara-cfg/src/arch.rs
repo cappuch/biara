@@ -182,6 +182,11 @@ pub struct ArchSpec {
     /// authenticating a correctly signed pointer removes it again, so
     /// `paciasp ... autiasp; ret` still returns to the caller's lr.
     pub pointer_auth_helpers: &'static [&'static str],
+    /// Pure helpers that compute state lazily from an operation argument,
+    /// which TCG specializes itself when the operation is known while
+    /// translating: (name, index of that argument). The decompiler inlines
+    /// them where the operation is constant only after optimization.
+    pub specialized_helpers: &'static [(&'static str, u32)],
 }
 
 impl ArchSpec {
@@ -354,6 +359,10 @@ const X86_64_LINUX: ArchSpec = ArchSpec {
     ],
     helper_regs_complete: true,
     pointer_auth_helpers: &[],
+    // x86 condition codes: `cc_op` is the last argument. Not `cc_compute_all`:
+    // inlined, it spells out the whole EFLAGS word (parity included) wherever
+    // more than one flag is read, which reads worse than the call.
+    specialized_helpers: &[("cc_compute_c", 3), ("cc_compute_nz", 2)],
 };
 
 const AARCH64_LINUX: ArchSpec = ArchSpec {
@@ -436,6 +445,8 @@ const AARCH64_LINUX: ArchSpec = ArchSpec {
         "xpaci",
         "xpacd",
     ],
+    // NZCV is computed eagerly; nothing to specialize.
+    specialized_helpers: &[],
 };
 
 const AARCH64_ARGS: &[&str] = &["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"];

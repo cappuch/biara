@@ -57,22 +57,25 @@ uint64_t calc(uint64_t arg0, uint64_t arg1, uint64_t arg2)
     uint64_t value0;
 
     value0 = (uint32_t)arg0;
-    if (value0 > 7ull) {
-        return -1ull;
+    if (value0 > 7) {
+        return -1;
     }
     switch (value0) {
-    case 0ull:
+    case 0:
         return arg1 + arg2;
-    case 1ull:
+    case 1:
         return arg1 - arg2;
-    case 2ull:
+    case 2:
         return arg2 * arg1;
-    case 3ull:
-        if (arg2 == 0ull) {
-            return 0ull;
+    case 3:
+        if (arg2 == 0) {
+            return 0;
         }
         return (uint64_t)((int64_t)arg1 / (int64_t)arg2);
-    /* ... cases 4 to 7 ... */
+    /* ... cases 4 to 6 ... */
+    case 7:
+    default:
+        return arg1 ^ arg2;
     }
 }
 /* Analysis evidence:
@@ -208,6 +211,9 @@ Cold run, release build, 6-core desktop CPU, default settings:
 
 Very large binaries (tens of MB) can take a long time and a lot of memory. `--memory-mib` caps
 the analysis and the store lets an interrupted run resume.
+
+Decompiling one function costs about its size: a 69,000-block obfuscated function (35 MB of C)
+takes under a minute, most of it in LLVM's own passes.
 
 ## Limits
 

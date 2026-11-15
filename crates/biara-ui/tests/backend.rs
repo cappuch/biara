@@ -458,6 +458,9 @@ fn scale_report() {
             memory_mib: std::env::var("BIARA_UI_MEM_MIB")
                 .ok()
                 .and_then(|v| v.parse().ok()),
+            max_blocks: std::env::var("BIARA_UI_MAX_BLOCKS")
+                .ok()
+                .and_then(|v| v.parse().ok()),
         },
     );
     loop {

@@ -153,14 +153,15 @@ impl Default for App {
 
 // Startup ----------------------------------------------------------------------------------
 
-/// Command line: `biara-ui [BINARY] [--sync] [--goto ADDR|NAME] [--tab listing|pseudo]`.
-/// `--sync` waits for analysis (and the requested view) before the first frame, which is what
-/// a headless snapshot needs.
+/// Command line: `biara-ui [BINARY] [--sync] [--goto ADDR|NAME] [--tab listing|pseudo]
+/// [--max-blocks N]`. `--sync` waits for analysis (and the requested view) before the first
+/// frame, which is what a headless snapshot needs.
 struct Args {
     path: Option<PathBuf>,
     sync: bool,
     goto: Option<String>,
     tab: Option<MainTab>,
+    max_blocks: Option<usize>,
 }
 
 fn args() -> Args {
@@ -169,12 +170,14 @@ fn args() -> Args {
         sync: false,
         goto: None,
         tab: None,
+        max_blocks: None,
     };
     let mut it = rune::extra_args().iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--sync" => a.sync = true,
             "--goto" => a.goto = it.next().cloned(),
+            "--max-blocks" => a.max_blocks = it.next().and_then(|v| parse_count(v)),
             "--tab" => {
                 a.tab = it.next().and_then(|v| match v.as_str() {
                     "listing" | "disasm" => Some(MainTab::Listing),
@@ -205,9 +208,29 @@ pub fn parse_addr(text: &str) -> Option<u64> {
     t.parse().ok().or_else(|| u64::from_str_radix(t, 16).ok())
 }
 
+/// A positive count: `2000000`, `2_000_000`, `2,000,000`, `500k` or `2M`.
+pub fn parse_count(text: &str) -> Option<usize> {
+    let t: String = text
+        .trim()
+        .chars()
+        .filter(|c| !matches!(c, '_' | ',' | ' '))
+        .collect();
+    let (digits, scale) = match t.chars().last()? {
+        'k' | 'K' => (&t[..t.len() - 1], 1_000),
+        'm' | 'M' => (&t[..t.len() - 1], 1_000_000),
+        _ => (t.as_str(), 1),
+    };
+    digits
+        .parse::<usize>()
+        .ok()?
+        .checked_mul(scale)
+        .filter(|&n| n > 0)
+}
+
 fn init() -> App {
     let args = args();
     let mut app = App::default();
+    app.open_options.max_blocks = args.max_blocks;
     if let Some(path) = args.path {
         app.open(path);
     }
@@ -273,6 +296,34 @@ impl App {
         };
         self.events = Some(backend::recovery::open(path.clone(), notify, options));
         self.path = Some(path);
+    }
+
+    /// The block limit the next analysis uses.
+    pub fn block_limit(&self) -> usize {
+        self.open_options
+            .max_blocks
+            .unwrap_or(biara_cfg::DEFAULT_MAX_BLOCKS)
+    }
+
+    /// Change the block limit; the open binary is analysed again under it.
+    pub fn set_block_limit(&mut self, limit: usize) {
+        if limit == self.block_limit() {
+            return;
+        }
+        self.open_options.max_blocks = Some(limit);
+        if let Some(path) = self.path.clone() {
+            self.open(path);
+        }
+        self.log.push(format!("Block limit set to {limit}"));
+    }
+
+    /// The block limit the open program stopped at, if it did.
+    pub fn block_limit_reached(&self) -> Option<usize> {
+        self.program
+            .as_ref()
+            .map(|p| &p.cfg.recovery)
+            .filter(|r| r.block_limit_reached)
+            .map(|r| r.block_limit)
     }
 
     /// Block until analysis finishes (or fails): for headless runs and tests.

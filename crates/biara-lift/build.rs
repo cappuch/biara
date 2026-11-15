@@ -26,6 +26,8 @@ fn main() {
     println!("cargo:rerun-if-changed=cpp/index_switches.cpp");
     println!("cargo:rerun-if-changed=cpp/trim.cpp");
     println!("cargo:rerun-if-changed=cpp/output.cpp");
+    println!("cargo:rerun-if-changed=cpp/specialize.cpp");
+    println!("cargo:rerun-if-changed=cpp/helper_effects.cpp");
     println!("cargo:rerun-if-changed=cpp/parallel.cpp");
 
     let bindir = PathBuf::from(llvm_config("--bindir"));
@@ -40,6 +42,8 @@ fn main() {
         .file("cpp/index_switches.cpp")
         .file("cpp/trim.cpp")
         .file("cpp/output.cpp")
+        .file("cpp/specialize.cpp")
+        .file("cpp/helper_effects.cpp")
         .warnings(true)
         .flag_if_supported("-Wno-unused-parameter");
     let flags = llvm_config("--cxxflags");

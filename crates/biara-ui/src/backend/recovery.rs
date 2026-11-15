@@ -73,6 +73,9 @@ pub struct OpenOptions {
     /// Analysis memory budget in MiB, shared by the coordinator and the workers; `None` picks
     /// from free memory.
     pub memory_mib: Option<u64>,
+    /// Translation blocks recovery may reach before it stops; `None` is
+    /// [`biara_cfg::DEFAULT_MAX_BLOCKS`].
+    pub max_blocks: Option<usize>,
 }
 
 /// Start opening `path` on a new thread; events arrive on the returned channel.
@@ -129,6 +132,7 @@ fn run(
     let opts = biara_lift::ResolveOptions {
         cfg: biara_cfg::Options {
             os: image.os,
+            max_blocks: options.max_blocks.unwrap_or(biara_cfg::DEFAULT_MAX_BLOCKS),
             imports: image.imports.clone(),
             discovery: Some(discovery),
             function_starts: image.function_starts(),

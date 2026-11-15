@@ -642,6 +642,13 @@ void Types::propagate(const std::vector<std::tuple<Base, Value *, CallBase *>> &
   // compares full (offset, bytes) pairs per class, so a width widening at
   // a known offset counts as progress. Leftovers set FixpointTruncated.
   std::map<int, std::map<int64_t, unsigned>> XAcc;
+  // Bumped whenever a class's facts, the widest of `Acc` and `XAcc` per
+  // offset, grow. Merging `XAcc` into `Acc` leaves that unchanged.
+  std::vector<uint64_t> Version(Parent.size());
+  // The source version each (target, pointee) field flow last carried. The
+  // flow only adds facts and the target only grows, so carrying the same
+  // version again changes nothing: skipping it keeps the rounds exact.
+  DenseMap<std::pair<int, int>, uint64_t> Flowed;
   auto snapshot = [&]() {
     std::map<int, std::map<int64_t, unsigned>> S;
     for (auto &[C, Offs] : XAcc)
@@ -657,8 +664,11 @@ void Types::propagate(const std::vector<std::tuple<Base, Value *, CallBase *>> &
         ++Dropped.UnsupportedBases;
       return;
     }
-    unsigned &W = XAcc[C][Off];
+    auto [At, New] = XAcc[C].try_emplace(Off, 0);
+    unsigned &W = At->second;
     WidthsChanged |= Observed[C][Off].insert(Bytes).second;
+    if (New || Bytes > W)
+      ++Version[C];
     W = std::max(W, Bytes);
   };
   // Per-site return instantiation: call result -> the classes observed at
@@ -964,6 +974,9 @@ void Types::propagate(const std::vector<std::tuple<Base, Value *, CallBase *>> &
       if (FP == FieldPtr.end())
         return;
       int PC = find(FP->second);
+      auto [Last, First] = Flowed.try_emplace({P, PC}, 0);
+      if (!First && Last->second == Version[PC])
+        return;
       auto flow = [&](const std::map<int64_t, unsigned> &Offs) {
         for (auto [Off, Bytes] : Offs)
           note(P, Off, Bytes);
@@ -974,6 +987,7 @@ void Types::propagate(const std::vector<std::tuple<Base, Value *, CallBase *>> &
       auto Jt = XAcc.find(PC);
       if (Jt != XAcc.end() && Jt->first != P)
         flow(Jt->second);
+      Flowed[{P, PC}] = Version[PC];
     };
     for (auto &[B, V] : Loaded)
       fieldLink(B, V);

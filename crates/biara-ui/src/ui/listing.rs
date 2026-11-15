@@ -73,8 +73,14 @@ fn build_row(s: &App, i: usize) -> El {
                     &format!("  {} bytes · {} blocks", f.size, f.blocks),
                     p.comment,
                 );
-                if f.callers > 0 {
-                    line.push(&format!(" · {} callers", f.callers), p.comment);
+                match f.callers {
+                    0 => {}
+                    1 => {
+                        line.push(" · 1 caller", p.comment);
+                    }
+                    n => {
+                        line.push(&format!(" · {n} callers"), p.comment);
+                    }
                 }
                 if full.is_some() {
                     line.push(&format!(" · {}", f.name), p.comment);

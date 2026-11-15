@@ -548,6 +548,11 @@ impl Image {
         true
     }
 
+    /// Bytes of executable code (`code`).
+    pub fn code_bytes(&self) -> u64 {
+        self.code.iter().map(|r| r.end - r.start).sum()
+    }
+
     pub fn symbol(&self, name: &str) -> Option<&Symbol> {
         self.symbols.iter().find(|s| s.name == name)
     }

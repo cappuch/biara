@@ -108,6 +108,12 @@ pub struct Session {
     reused: usize,
     resolved: usize,
     reused_resolutions: usize,
+    /// Functions whose resolution worker exited this session: not tried
+    /// again, as a later round's graph for them is only larger.
+    failed_resolutions: BTreeSet<u64>,
+    /// Functions whose resolution needed a worker on its own: later rounds
+    /// send them there at once, not first to a pooled worker to run out.
+    large_resolutions: BTreeSet<u64>,
 }
 impl Session {
     pub fn open(
@@ -135,6 +141,7 @@ impl Session {
         options.binary = options.binary.canonicalize()?;
         options.libtcg = options.libtcg.canonicalize()?;
         let variant = postcard::to_stdvec(&(
+            biara_lift::RECOVERY_STATE_VERSION,
             entries,
             resolve.cfg.os,
             resolve.cfg.max_blocks,
@@ -179,6 +186,8 @@ impl Session {
             reused: 0,
             resolved: 0,
             reused_resolutions: 0,
+            failed_resolutions: BTreeSet::new(),
+            large_resolutions: BTreeSet::new(),
         })
     }
     pub fn lib(&self) -> Arc<Mutex<Libtcg>> {
@@ -215,19 +224,21 @@ impl Session {
     pub fn set_progress(&mut self, observer: ProgressObserver) {
         self.progress = Some(observer);
     }
+    fn worker_config(&self) -> Config {
+        Config {
+            binary: self.store.snapshot.clone(),
+            library: self.options.libtcg.clone(),
+            cpu: self.options.cpu.clone(),
+            binary_hash: self.store.binary_hash.clone(),
+            library_hash: self.store.library_hash.clone(),
+            parent: std::process::id(),
+        }
+    }
     fn pool(&mut self) -> Result<&mut Pool, Error> {
         if self.pool.is_none() {
-            let config = Config {
-                binary: self.store.snapshot.clone(),
-                library: self.options.libtcg.clone(),
-                cpu: self.options.cpu.clone(),
-                binary_hash: self.store.binary_hash.clone(),
-                library_hash: self.store.library_hash.clone(),
-                parent: std::process::id(),
-            };
             self.pool = Some(Pool::new(
                 &self.options.executable,
-                &config,
+                &self.worker_config(),
                 self.options.workers,
                 self.worker_budget(),
             )?);
@@ -292,7 +303,10 @@ impl Session {
                 // Same abort-not-fact contract as resolution: worker/IPC/DB
                 // errors propagate with durable checkpoints intact.
                 let (index, response) = self.pool()?.receive()?;
-                let Response::Translate(results) = response else {
+                let Some(Response::Translate(results)) = response else {
+                    if response.is_none() {
+                        return Err(Error::Engine("analysis worker exited".into()));
+                    }
                     return Err(Error::Engine("unexpected translation response".into()));
                 };
                 let group = in_flight
@@ -400,36 +414,59 @@ impl Session {
         let mut results = BTreeMap::new();
         let mut in_flight = Vec::with_capacity(count);
         let mut active = 0;
+        // Jobs whose worker exited, or that needed a worker alone before: run
+        // alone, with every worker's share.
+        let mut alone = Vec::new();
         for index in 0..count {
-            let job =
-                self.fill_resolution_slot(index, &mut entries, cfg, max_entries, &mut results)?;
+            let job = self.fill_resolution_slot(
+                index,
+                &mut entries,
+                cfg,
+                max_entries,
+                &mut results,
+                &mut alone,
+            )?;
             active += usize::from(job.is_some());
             in_flight.push(job);
         }
         while active != 0 {
-            // Worker/IPC/storage failures abort here with prior checkpoints
-            // intact (resumable); they never become TranslationFailure facts or
-            // a published finished graph.
+            // IPC/storage failures abort here with prior checkpoints intact
+            // (resumable); they never become TranslationFailure facts or a
+            // published finished graph. A worker that exits loses only its job.
             let (index, response) = self.pool()?.receive()?;
-            let Response::Resolve(artifact) = response else {
-                return Err(Error::Engine("unexpected resolution response".into()));
-            };
-            let (entry, key) = in_flight
+            let (entry, key, view) = in_flight
                 .get_mut(index)
                 .and_then(Option::take)
                 .ok_or_else(|| Error::Engine("unexpected resolution index".into()))?;
-            let bytes = postcard::to_stdvec(&artifact)?;
-            self.store
-                .put("resolve", [(key.as_str(), bytes.as_slice())])?;
-            self.resolved += 1;
-            results.insert(entry, artifact);
-            let job =
-                self.fill_resolution_slot(index, &mut entries, cfg, max_entries, &mut results)?;
+            match response {
+                Some(Response::Resolve(artifact)) => {
+                    let bytes = postcard::to_stdvec(&artifact)?;
+                    self.store
+                        .put("resolve", [(key.as_str(), bytes.as_slice())])?;
+                    self.resolved += 1;
+                    results.insert(entry, artifact);
+                }
+                // Most likely a function too large for one worker's share.
+                None => {
+                    self.pool()?.respawn(index)?;
+                    alone.push((entry, key, view));
+                }
+                Some(_) => return Err(Error::Engine("unexpected resolution response".into())),
+            }
+            let job = self.fill_resolution_slot(
+                index,
+                &mut entries,
+                cfg,
+                max_entries,
+                &mut results,
+                &mut alone,
+            )?;
             if job.is_none() {
                 active -= 1;
             }
             in_flight[index] = job;
         }
+        self.resolve_alone(alone, max_entries, &mut results)?;
         // Commit completion-order artifacts, but merge facts in entry order.
         for (_, artifact) in results {
             merge(&mut combined, artifact);
@@ -447,7 +484,8 @@ impl Session {
         cfg: &biara_cfg::Cfg,
         max_entries: u64,
         results: &mut BTreeMap<u64, ResolutionArtifact>,
-    ) -> Result<Option<(u64, String)>, Error> {
+        alone: &mut Vec<(u64, String, Vec<u8>)>,
+    ) -> Result<Option<(u64, String, Vec<u8>)>, Error> {
         for entry in entries {
             let selected = BTreeSet::from([entry]);
             let view = biara_lift::resolution_view(cfg, &selected);
@@ -461,19 +499,107 @@ impl Session {
             if let Some(result) = self.store.get(&key)? {
                 results.insert(entry, postcard::from_bytes(&result)?);
                 self.reused_resolutions += 1;
+            } else if self.failed_resolutions.contains(&entry) {
+                results.insert(
+                    entry,
+                    ResolutionArtifact {
+                        targets: BTreeMap::new(),
+                        calls: Default::default(),
+                    },
+                );
+            } else if self.large_resolutions.contains(&entry) {
+                alone.push((entry, key, bytes));
             } else {
                 self.pool()?.send(
                     index,
                     &Request::Resolve {
-                        cfg: bytes,
+                        cfg: bytes.clone(),
                         entries: selected,
                         max_entries,
                     },
                 )?;
-                return Ok(Some((entry, key)));
+                return Ok(Some((entry, key, bytes)));
             }
         }
         Ok(None)
+    }
+    /// Run resolution jobs whose pooled worker exited one at a time on a
+    /// single worker holding the whole worker half of the budget: the pool is
+    /// stopped meanwhile, so the budget still holds. A job that fails even
+    /// then leaves its function's indirect targets unresolved (limitations of
+    /// the graph already) and is not tried again this session. Nothing is
+    /// stored for it, so a run with more memory tries it again.
+    fn resolve_alone(
+        &mut self,
+        jobs: Vec<(u64, String, Vec<u8>)>,
+        max_entries: u64,
+        results: &mut BTreeMap<u64, ResolutionArtifact>,
+    ) -> Result<(), Error> {
+        if jobs.is_empty() {
+            return Ok(());
+        }
+        let budget = self.options.memory_budget / 2;
+        let mut solo = None;
+        if self.options.workers > 1 {
+            self.pool = None;
+            solo = Some(Pool::new(
+                &self.options.executable,
+                &self.worker_config(),
+                1,
+                budget,
+            )?);
+        }
+        for (entry, key, view) in jobs {
+            let response = match solo.as_mut() {
+                Some(solo) => {
+                    if self.large_resolutions.insert(entry) {
+                        eprintln!(
+                            "analysis: the worker resolving {entry:#x} exited; retrying it alone with {} MiB",
+                            budget >> 20
+                        );
+                    }
+                    solo.send(
+                        0,
+                        &Request::Resolve {
+                            cfg: view,
+                            entries: BTreeSet::from([entry]),
+                            max_entries,
+                        },
+                    )?;
+                    let (_, response) = solo.receive()?;
+                    if response.is_none() {
+                        solo.respawn(0)?;
+                    }
+                    response
+                }
+                None => None,
+            };
+            match response {
+                Some(Response::Resolve(artifact)) => {
+                    let bytes = postcard::to_stdvec(&artifact)?;
+                    self.store
+                        .put("resolve", [(key.as_str(), bytes.as_slice())])?;
+                    self.resolved += 1;
+                    results.insert(entry, artifact);
+                }
+                None => {
+                    eprintln!(
+                        "analysis: the worker resolving {entry:#x} exited (out of memory or a crash); \
+                         its indirect targets stay unresolved"
+                    );
+                    self.failed_resolutions.insert(entry);
+                    results.insert(
+                        entry,
+                        ResolutionArtifact {
+                            targets: BTreeMap::new(),
+                            calls: Default::default(),
+                        },
+                    );
+                }
+                Some(_) => return Err(Error::Engine("unexpected resolution response".into())),
+            }
+        }
+        Ok(())
     }
 }
 /// Copy a consistent, portable snapshot of the job database to `destination`.

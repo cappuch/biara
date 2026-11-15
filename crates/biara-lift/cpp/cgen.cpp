@@ -60,6 +60,8 @@
 #include "llvm-c/Types.h"
 #include "layouts.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/PostDominators.h"
@@ -77,14 +79,18 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <array>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 using namespace llvm;
@@ -482,19 +488,21 @@ class Emitter {
   // Per-statement record JSON rebuilt for each packaged function body.
   std::string StatementJson;
   Function *F = nullptr;
-  std::map<const Value *, std::string> Names;
-  std::map<const Value *, std::string> Originals; // architectural/register hint kept
-  std::set<std::string> Taken;
+  std::unordered_map<const Value *, std::string> Names;
+  std::unordered_map<const Value *, std::string> Originals; // architectural/register hint kept
+  std::unordered_set<std::string> Taken;
   // Reservations only grow within a function: collision suffixes never
   // become available again, so don't rescan them for every call result.
-  std::map<std::string, unsigned> NextSuffix;
-  std::set<Instruction *> Inline;
+  std::unordered_map<std::string, unsigned> NextSuffix;
+  std::unordered_set<Instruction *> Inline;
+  // Values sharing their group representative's C variable (`coalesce`).
+  std::unordered_map<const Value *, Instruction *> Canon;
   std::vector<Instruction *> *Refs = nullptr;
   std::set<uint64_t> *PcsOut = nullptr; // surviving PCs of the current Stmt
   bool *LostOut = nullptr; // folded contributor without surviving PC
-  std::map<BasicBlock *, unsigned> Order;
-  std::set<BasicBlock *> Targeted;
-  std::map<const Value *, std::string> NameEvidence;
+  std::unordered_map<BasicBlock *, unsigned> Order;
+  std::unordered_set<BasicBlock *> Targeted;
+  std::unordered_map<const Value *, std::string> NameEvidence;
   uint64_t StatementCount = 0, MappedCount = 0, MaxDepth = 0, TempCount = 0;
   bool Packaging = false;
 public:
@@ -796,12 +804,35 @@ public:
     return "(" + To + ")" + E;
   }
 
+  // An unsigned constant without a suffix. Every operation it meets has an
+  // operand, parameter or destination of the full width (prototyped calls,
+  // assignments, casts, comparisons and arithmetic against a typed value), so
+  // C's conversions give it that width; the exceptions take `suffixed`: the
+  // left operand of a shift, and variadic arguments (`callArgs`).
   std::string lit(const APInt &V) {
     unsigned Bits = V.getBitWidth();
     if (Bits == 1)
       return V.isOne() ? "true" : "false";
+    if (Bits > 64)
+      return suffixed(V);
+    uint64_t X = V.getZExtValue();
+    // An all-ones word is `-1` once converted; narrower types promote to
+    // `int` first, where `-1` stays negative, so they spell the value.
+    if (V.isAllOnes() && container(Bits) >= 32)
+      return "-1";
+    return X <= 1000 ? std::to_string(X) : hex(X);
+  }
+
+  // `lit` with the type in the literal (`1ull`, `5u`): where nothing else
+  // gives the operation its width.
+  std::string suffixed(const APInt &V) {
+    unsigned Bits = V.getBitWidth();
+    if (Bits == 1)
+      return lit(V);
     if (Bits > 64) {
       APInt Hi = V.lshr(64).trunc(64), Lo = V.trunc(64);
+      if (Hi.isZero())
+        return "((biara_u128)" + suffixed(Lo) + ")";
       return "(((biara_u128)" + hex(Hi.getZExtValue()) + "ull << 64) | " + hex(Lo.getZExtValue()) +
              "ull)";
     }
@@ -812,18 +843,20 @@ public:
     return S + (container(Bits) == 64 ? "ull" : "u");
   }
 
-  // `lit`, but for a signed C type (`2`, not `2u`; `-1ll`, not `-1ull`).
+  // `lit`, but for a signed C type (`2`, not `2u`; `-1`, not `0xff...`).
   std::string slit(const APInt &V) {
     unsigned Bits = V.getBitWidth();
     if (Bits > 64)
       return lit(V);
     if (V.isAllOnes())
-      return std::string("-1") + (container(Bits) == 64 ? "ll" : "");
+      return "-1";
     int64_t X = V.getSExtValue();
-    std::string S = X < 0 ? std::to_string(X)
-                    : (uint64_t)X <= 1000 ? std::to_string(X)
-                                       : hex((uint64_t)X);
-    return S + (container(Bits) == 64 ? "ll" : "");
+    // `-9223372036854775808` would negate a literal no signed type holds.
+    if (X == INT64_MIN)
+      return "(-0x7fffffffffffffff - 1)";
+    return X < 0 ? std::to_string(X)
+           : (uint64_t)X <= 1000 ? std::to_string(X)
+                                : hex((uint64_t)X);
   }
 
   std::string name(const Value *V) { return Names.at(V); }
@@ -970,7 +1003,7 @@ public:
     if (!B.Root) {
       if (auto D = dataAt((uint64_t)B.Off, Bytes))
         return deref(D->name, (uint64_t)B.Off - D->addr, *D, Bytes, Raw);
-      return {"*(" + Raw + " *)" + hex((uint64_t)B.Off) + "ull", Raw};
+      return {"*(" + Raw + " *)" + hex((uint64_t)B.Off), Raw};
     }
     if (const Layout *L = T.layoutOf(B.Root)) {
       // Layout evidence may belong to an integer address expression. Its
@@ -1083,6 +1116,10 @@ public:
     if (auto *A = dyn_cast<Argument>(V))
       return name(A);
     if (auto *CE = dyn_cast<ConstantExpr>(V)) {
+      // A constant address is one cast: `((T)0x1000)`.
+      if (auto *K = dyn_cast<ConstantInt>(CE->getOperand(0));
+          K && CE->getOpcode() == Instruction::IntToPtr)
+        return "(" + conv(lit(K->getValue()), cty(K->getType()), ctyOf(V)) + ")";
       Instruction *I = CE->getAsInstruction();
       // Materializing a constant expression loses its inferred callback or
       // layout type; preserve the original value's C representation.
@@ -1220,12 +1257,33 @@ public:
     return true;
   }
 
+  // How many parameters `signature(Fn)` declares before its `...`, or
+  // UINT_MAX without one.
+  unsigned fixedParams(Function &Fn) {
+    if (auto *P = prototype(&Fn))
+      return P->Variadic ? P->Count : UINT_MAX;
+    if (Fn.isDeclaration())
+      if (auto It = Protos.find(Fn.getName().str()); It != Protos.end())
+        return It->second.ellipsis ? std::max<uint32_t>(It->second.nargs, 1) : UINT_MAX;
+    if (Fn.isVarArg() && Fn.arg_empty())
+      return unknownArity(Fn) ? 1 : UINT_MAX;
+    return Fn.isVarArg() ? Fn.arg_size() : UINT_MAX;
+  }
+
   std::string callArgs(CallBase &CB, Function *Callee) {
     std::string S;
+    unsigned Fixed = Callee ? fixedParams(*Callee) : UINT_MAX;
     for (unsigned K = 0; K < CB.arg_size(); ++K) {
       if (K)
         S += ", ";
       Value *A = CB.getArgOperand(K);
+      // Past the declared parameters nothing converts an argument: a
+      // constant carries its type (`5ull`, not an `int`).
+      if (auto *C = dyn_cast<ConstantInt>(A);
+          C && K >= Fixed && C->getBitWidth() <= 64 && !strParam(CB, Callee, K)) {
+        S += suffixed(C->getValue()) + symComment(A) + strComment(A);
+        continue;
+      }
       std::string To = Callee && !Callee->isDeclaration() && K < Callee->arg_size()
                            ? ctyOf(Callee->getArg(K))
                        : Callee && K < Callee->arg_size() ? cty(Callee->getArg(K)->getType())
@@ -1277,6 +1335,12 @@ public:
         B = ConstantInt::get(B->getType(), 0);
         Pred = Pred == CmpInst::ICMP_UGE ? CmpInst::ICMP_UGT : CmpInst::ICMP_SGT;
       }
+    // A sign test: `x > -1` is `x >= 0`, `x <= -1` is `x < 0`.
+    if ((Pred == CmpInst::ICMP_SGT || Pred == CmpInst::ICMP_SLE) && B->getType()->isIntegerTy())
+      if (auto *K = dyn_cast<ConstantInt>(B); K && K->isMinusOne()) {
+        B = ConstantInt::get(B->getType(), 0);
+        Pred = Pred == CmpInst::ICMP_SGT ? CmpInst::ICMP_SGE : CmpInst::ICMP_SLT;
+      }
     std::string Op;
     switch (Pred) {
     case CmpInst::ICMP_EQ:
@@ -1314,6 +1378,19 @@ public:
     return Sg ? sval(A) + " " + Op + " " + sval(B) : ival(A) + " " + Op + " " + ival(B);
   }
 
+  // The left operand `A` (spelled `X`) of a shift, which alone sets the
+  // shift's type: a constant carries its suffix (`1ull << n`), and a select
+  // of constants is cast to the operation's type.
+  std::string shifted(Value *A, const std::string &X) {
+    if (auto *C = dyn_cast<ConstantInt>(A))
+      return suffixed(C->getValue());
+    if (auto *S = dyn_cast<SelectInst>(A); S && Inline.count(S) &&
+                                           isa<Constant>(S->getTrueValue()) &&
+                                           isa<Constant>(S->getFalseValue()))
+      return "(" + cty(A->getType()) + ")(" + X + ")";
+    return X;
+  }
+
   // Expression of a pure instruction (or a call), without its assignment.
   std::string expr(Instruction *I) {
     capturePC(I);
@@ -1328,7 +1405,7 @@ public:
            Bin->getOpcode()==Instruction::Xor) && Bits!=1) {
         auto Mask=[](Value *V,std::string &Text) {
           if (auto *C=dyn_cast<ConstantInt>(V); C && C->getBitWidth()<=64)
-            Text=hex(C->getZExtValue())+(container(C->getBitWidth())==64 ? "ull" : "u");
+            Text=hex(C->getZExtValue());
         };
         Mask(A,X);
         Mask(B,Y);
@@ -1343,9 +1420,9 @@ public:
       case Instruction::Mul:
         return wrap(Wide + X + " * " + Y, Bits);
       case Instruction::Shl:
-        return wrap(Wide + X + " << " + Y, Bits);
+        return wrap(Wide + shifted(A, X) + " << " + Y, Bits);
       case Instruction::LShr:
-        return X + " >> " + Y;
+        return shifted(A, X) + " >> " + Y;
       case Instruction::AShr:
         return wrap("(" + uintTy(Bits) + ")(" + sval(A) + " >> " + Y + ")", Bits);
       case Instruction::UDiv:
@@ -1705,6 +1782,160 @@ public:
     return !isPtrTy(ctyOf(&I)) || cty(I.getType()) == ctyOf(&I);
   }
 
+  // ---- copy coalescing ------------------------------------------------
+  //
+  // A phi is a variable assigned on each incoming edge. Where an incoming
+  // value's live range does not overlap the phi's (or any value already
+  // sharing its variable), the two share one variable and that copy goes.
+
+  Instruction *canon(Instruction *I) {
+    auto It = Canon.find(I);
+    return It == Canon.end() ? I : It->second;
+  }
+
+  // Where `V` is read: an instruction, or a null one for the end of a block
+  // (a phi's incoming edge). A folded user reads where it is printed.
+  void readSites(Value *V, std::vector<std::pair<BasicBlock *, Instruction *>> &Out,
+                 unsigned Depth = 0) {
+    for (Use &U : V->uses()) {
+      auto *I = dyn_cast<Instruction>(U.getUser());
+      if (!I)
+        continue;
+      if (auto *P = dyn_cast<PHINode>(I))
+        Out.push_back({P->getIncomingBlock(U), nullptr});
+      else if (Inline.count(I) && Depth < 16)
+        readSites(I, Out, Depth + 1);
+      else
+        Out.push_back({I->getParent(), I});
+    }
+  }
+
+  // Whether `V` is read after the point just past `At` in `BB` (`BB`'s start,
+  // after its phis, when `At` is null).
+  bool liveAt(Instruction *V, BasicBlock *BB, Instruction *At) {
+    BasicBlock *D = V->getParent();
+    if (D == BB) {
+      if (!isa<PHINode>(V) && (!At || isa<PHINode>(At) || !V->comesBefore(At)))
+        return false;
+    } else if (!DT->dominates(D, BB)) {
+      return false;
+    }
+    const Live &L = live(V);
+    for (auto &[SB, SI] : L.Sites)
+      if (SB == BB && (!SI || !At || isa<PHINode>(At) || At->comesBefore(SI)))
+        return true;
+    // Further on, up to where `V` is defined again.
+    for (BasicBlock *S : successors(BB))
+      if (L.In.contains(S))
+        return true;
+    return false;
+  }
+
+  // Where `V` is read, and the blocks it is live into: those with a path to a
+  // read that does not pass its definition. Walked back from the reads once
+  // per value, so a query costs the value's live range, not the whole graph.
+  struct Live {
+    std::vector<std::pair<BasicBlock *, Instruction *>> Sites;
+    DenseSet<BasicBlock *> In;
+  };
+  DenseMap<Instruction *, std::unique_ptr<Live>> LiveOf;
+
+  const Live &live(Instruction *V) {
+    auto &Slot = LiveOf[V];
+    if (Slot)
+      return *Slot;
+    Slot = std::make_unique<Live>();
+    Live &L = *Slot;
+    readSites(V, L.Sites);
+    BasicBlock *D = V->getParent();
+    std::vector<BasicBlock *> Work;
+    for (auto &[SB, SI] : L.Sites)
+      if (SB != D && L.In.insert(SB).second)
+        Work.push_back(SB);
+    while (!Work.empty()) {
+      BasicBlock *B = Work.back();
+      Work.pop_back();
+      for (BasicBlock *P : predecessors(B))
+        if (P != D && L.In.insert(P).second)
+          Work.push_back(P);
+    }
+    return L;
+  }
+
+  // Whether `X` feeds a phi of `Phi`'s block other than `Phi`: the copies on
+  // an edge happen at once, so `X` must outlive every phi assigned there.
+  static bool feedsOtherPhi(Instruction *X, Instruction *Phi) {
+    if (!isa<PHINode>(Phi))
+      return false;
+    for (PHINode &Q : Phi->getParent()->phis())
+      if (&Q != Phi && is_contained(Q.incoming_values(), X))
+        return true;
+    return false;
+  }
+
+  bool interfere(Instruction *A, Instruction *B) {
+    if (isa<PHINode>(A) && isa<PHINode>(B) && A->getParent() == B->getParent())
+      return true;
+    if (feedsOtherPhi(A, B) || feedsOtherPhi(B, A))
+      return true;
+    auto at = [](Instruction *I) { return isa<PHINode>(I) ? nullptr : I; };
+    return liveAt(A, B->getParent(), at(B)) || liveAt(B, A->getParent(), at(A));
+  }
+
+  void coalesce(Function &Fn) {
+    std::map<Instruction *, std::vector<Instruction *>> Groups; // by representative
+    auto group = [&](Instruction *I) -> std::vector<Instruction *> & {
+      auto &G = Groups[canon(I)];
+      if (G.empty())
+        G.push_back(I);
+      return G;
+    };
+    for (BasicBlock &BB : Fn) {
+      // Loop headers keep their phis apart (`for` loops and induction
+      // variables print from them).
+      if (LI->isLoopHeader(&BB))
+        continue;
+      for (PHINode &P : BB.phis()) {
+        if (!Names.count(&P) || Inline.count(&P))
+          continue;
+        for (Value *In : P.incoming_values()) {
+          auto *X = dyn_cast<Instruction>(In);
+          if (!X || X == &P || !Names.count(X) || Inline.count(X) || isa<AllocaInst>(X) ||
+              ctyOf(X) != ctyOf(&P) || canon(X) == canon(&P))
+            continue;
+          if (auto *XP = dyn_cast<PHINode>(X); XP && XP->getParent() == &BB)
+            continue;
+          auto &A = group(&P), &B = group(X);
+          if (A.size() + B.size() > 64)
+            continue;
+          bool Clash = false;
+          for (Instruction *I : A) {
+            for (Instruction *J : B)
+              if ((Clash = interfere(I, J)))
+                break;
+            if (Clash)
+              break;
+          }
+          if (Clash)
+            continue;
+          Instruction *Rep = A.front();
+          std::vector<Instruction *> Merged = A;
+          Merged.insert(Merged.end(), B.begin(), B.end());
+          Groups.erase(canon(X));
+          Groups.erase(canon(&P));
+          for (Instruction *I : Merged)
+            Canon[I] = Rep;
+          Groups[Rep] = std::move(Merged);
+        }
+      }
+    }
+    // One name per group, the phi's: a producer's name (`f_result`) would
+    // be wrong on the other paths into it.
+    for (auto &[Rep, G] : Groups)
+      for (Instruction *I : G)
+        Names[I] = Names[Rep];
+  }
+
   std::string label(BasicBlock *BB) { return "L" + std::to_string(Order[BB]); }
 
   // Assignments to the phis of `To` for the edge from `From`.
@@ -1763,7 +1994,7 @@ public:
 
   std::vector<Stmt> Out;
   unsigned Depth = 1;
-  std::set<BasicBlock *> Emitted;
+  std::unordered_set<BasicBlock *> Emitted;
   std::vector<BasicBlock *> Pending;
   DominatorTree *DT = nullptr;
   PostDominatorTree *PDT = nullptr;
@@ -2068,9 +2299,22 @@ public:
         Falls |= F;
         --Depth;
       };
-      for (auto &Case : Sw->cases())
-        arm("case " + lit(Case.getCaseValue()->getValue()) + ":", Case.getCaseSuccessor());
-      arm("default:", Sw->getDefaultDest());
+      // A default that cannot be taken (a complete jump table) labels the
+      // last case's arm rather than an arm of its own.
+      bool NoDefault = isa<UnreachableInst>(Sw->getDefaultDest()->getFirstNonPHIOrDbg()) &&
+                       Sw->getNumCases() > 0;
+      unsigned Left = Sw->getNumCases();
+      for (auto &Case : Sw->cases()) {
+        std::string Label = "case " + lit(Case.getCaseValue()->getValue()) + ":";
+        if (--Left || !NoDefault) {
+          arm(Label, Case.getCaseSuccessor());
+          continue;
+        }
+        put(Label);
+        arm("default:", Case.getCaseSuccessor());
+      }
+      if (!NoDefault)
+        arm("default:", Sw->getDefaultDest());
       if (!Loops.empty())
         --Loops.back().Switches;
       put("}");
@@ -2292,6 +2536,9 @@ public:
     DT = &Dom;
     PDT = &PostDom;
     LI = &Loopy;
+    Canon.clear();
+    coalesce(Fn);
+    LiveOf.clear();
     Out.clear();
     Emitted.clear();
     Pending.clear();
@@ -2306,16 +2553,17 @@ public:
     }
 
     // Drop pure assignments nothing reads.
-    std::map<Instruction *, unsigned> Uses;
-    std::map<Instruction *, std::vector<Stmt *>> ByDef;
+    std::unordered_map<Instruction *, unsigned> Uses;
+    std::unordered_map<Instruction *, std::vector<Stmt *>> ByDef;
+    // A variable is read if any value sharing it is (`coalesce`).
     for (Stmt &S : Out) {
       for (Instruction *R : S.Refs)
-        ++Uses[R];
+        ++Uses[canon(R)];
       if (S.Def)
-        ByDef[S.Def].push_back(&S);
+        ByDef[canon(S.Def)].push_back(&S);
     }
     std::vector<Stmt *> Work;
-    std::set<Stmt *> Dead;
+    std::unordered_set<Stmt *> Dead;
     for (auto &[Def, Ss] : ByDef)
       if (!Uses[Def])
         Work.insert(Work.end(), Ss.begin(), Ss.end());
@@ -2325,8 +2573,8 @@ public:
       if (!Dead.insert(S).second)
         continue;
       for (Instruction *R : S->Refs)
-        if (--Uses[R] == 0)
-          for (Stmt *X : ByDef[R])
+        if (--Uses[canon(R)] == 0)
+          for (Stmt *X : ByDef[canon(R)])
             Work.push_back(X);
     }
 
@@ -2340,7 +2588,7 @@ public:
         continue;
       if (B.Text != "return " + name(A.Assigns) + ";" && B.Text != "return " + A.Rhs + ";")
         continue;
-      if (Uses[A.Assigns] != 1 && B.Text != "return " + A.Rhs + ";")
+      if (Uses[canon(A.Assigns)] != 1 && B.Text != "return " + A.Rhs + ";")
         continue;
       if (B.Text != "return " + A.Rhs + ";")
         B.Text = "return " + A.Rhs + ";";
@@ -2358,14 +2606,14 @@ public:
     for (Stmt &S : Out)
       if (!Dead.count(&S))
         for (Instruction *R : S.Refs)
-          ++Uses[R];
-    std::set<Instruction *> Assigned, Staged;
+          ++Uses[canon(R)];
+    std::unordered_set<Instruction *> Assigned, Staged;
     for (Stmt &S : Out)
       if (!Dead.count(&S) && S.Assigns)
-        (S.Staged ? Staged : Assigned).insert(S.Assigns);
+        (S.Staged ? Staged : Assigned).insert(canon(S.Assigns));
     std::string Locals;
     for (Instruction &I : instructions(Fn)) {
-      if (!Names.count(&I))
+      if (!Names.count(&I) || (Canon.count(&I) && canon(&I) != &I))
         continue;
       if (auto *A = dyn_cast<AllocaInst>(&I)) {
         auto L = T.Frames.find(A);
@@ -2740,6 +2988,13 @@ public:
         return *presentOf(*A,M.getContext()) < *presentOf(*B,M.getContext());
       return *entryOf(*A,M.getContext()) < *entryOf(*B,M.getContext());
     });
+    // Layouts by the name they print as, the first one in scan order winning.
+    StringMap<const biara_layouts::Layout *> LayoutNamed, FrameNamed;
+    for (auto &[C, L] : T.Layouts)
+      if (!L.Scalar)
+        LayoutNamed.try_emplace(StringRef(L.Name).drop_front(7), &L);
+    for (auto &[R, L] : T.Frames)
+      FrameNamed.try_emplace(StringRef(L.Name).drop_front(7), &L);
     for (Function *Fn : Functions) {
       size_t Before = Unsupported;
       std::string Body = function(*Fn);
@@ -2770,11 +3025,11 @@ public:
                       Id=="biara_u128" || Id=="biara_i128" || StringRef(Id).starts_with("biara_v");
           add(Type ? "type" : "helper",Id,Def);
         } else {
-          for (auto &[C,L] : T.Layouts)
-            if (!L.Scalar && StringRef(L.Name).drop_front(7) == Id) { Def=emitLayout(L); break; }
+          if (auto L = LayoutNamed.find(Id); L != LayoutNamed.end())
+            Def = emitLayout(*L->second);
           if (Def.empty())
-            for (auto &[R,L] : T.Frames)
-              if (StringRef(L.Name).drop_front(7) == Id) { Def=emitLayout(L); break; }
+            if (auto L = FrameNamed.find(Id); L != FrameNamed.end())
+              Def = emitLayout(*L->second);
           if (!Def.empty()) add("type",Id,Def);
         }
         if (!Def.empty())
@@ -2819,9 +3074,10 @@ public:
       Deps+="]";
       std::string NameJson="[";
       First=true;
+      std::set<std::string> Listed; // values sharing a variable list it once
       auto addName = [&](const Value *V) {
         auto N=Names.find(V);
-        if (N==Names.end() || !Text.Identifiers.count(N->second)) return;
+        if (N==Names.end() || !Text.Identifiers.count(N->second) || !Listed.insert(N->second).second) return;
         NameJson += (First ? "" : ",") + std::string("{\"name\":") + jsonStr(N->second) +
                     ",\"original\":" + jsonStr(Originals[V]) + ",\"evidence\":" + jsonStr(NameEvidence[V]) + "}";
         First=false;

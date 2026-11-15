@@ -46,6 +46,11 @@ fn build(name: &str) -> PathBuf {
 
 /// A runtime showing the analysed program, with the app's own hooks.
 fn runtime(name: &str) -> Runtime<App> {
+    runtime_with(name, None)
+}
+
+/// [`runtime`], recovering at most `max_blocks` blocks.
+fn runtime_with(name: &str, max_blocks: Option<usize>) -> Runtime<App> {
     let binary = build(name);
     let mut app = App::default();
     app.open_with(
@@ -53,6 +58,7 @@ fn runtime(name: &str) -> Runtime<App> {
         OpenOptions {
             database: Some(binary.with_extension("sqlite")),
             worker_exe: Some(PathBuf::from(env!("CARGO_BIN_EXE_biara-ui"))),
+            max_blocks,
             ..Default::default()
         },
     );
@@ -493,4 +499,41 @@ fn dialogs_are_drawn_over_the_window_not_beside_it() {
         press(&mut rt, Key::Escape);
         assert!(rt.state.overlay.mode.is_none(), "{label}: Escape closes it");
     }
+}
+
+#[test]
+fn an_analysis_stopped_at_its_block_limit_is_raised_from_the_status_bar() {
+    let mut rt = runtime_with("ui-limit", Some(4));
+    assert_eq!(rt.state.block_limit_reached(), Some(4));
+    let (x, y) = rt
+        .find("raise-limit")
+        .expect("the status bar offers to raise the limit");
+    rt.pointer_down(x, y);
+    rt.pointer_up(x, y);
+    settle(&mut rt);
+    assert_eq!(rt.state.overlay.mode, Some(Mode::BlockLimit));
+    assert_eq!(
+        rt.state.overlay.input.text, "8",
+        "twice the limit it stopped at"
+    );
+    press(&mut rt, Key::Backspace);
+    type_text(&mut rt, "lots");
+    press(&mut rt, Key::Enter);
+    assert!(rt.state.overlay.error.is_some(), "not a number");
+    assert_eq!(rt.state.block_limit(), 4);
+    for _ in 0..4 {
+        press(&mut rt, Key::Backspace);
+    }
+    type_text(&mut rt, "1M");
+    press(&mut rt, Key::Enter);
+    assert_eq!(rt.state.overlay.mode, None);
+    assert_eq!(rt.state.block_limit(), 1_000_000);
+    wait_ready(&mut rt);
+    assert_eq!(
+        rt.state.block_limit_reached(),
+        None,
+        "analysed again, whole"
+    );
+    assert!(rt.state.index.functions.iter().any(|f| f.name == "target"));
+    assert!(rt.find("raise-limit").is_none());
 }

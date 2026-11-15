@@ -447,20 +447,26 @@ extern "C" size_t biara_index_switches(LLVMModuleRef MRef, biara_index_read_fn R
     for (Instruction &I : instructions(F))
       if (auto *Sw = dyn_cast<SwitchInst>(&I))
         Switches.push_back(Sw);
-    // Fresh analyses per switch: rewriting one changes what LazyValueInfo
-    // knows on the edges of the others. Then a guard that a dominating `if`
-    // bounds (found once the switch is on its index) kills a fully-covered
-    // default.
-     for (SwitchInst *Sw : Switches) {
-       if (Sw->getParent() == nullptr)
-         continue;
-       unscale(*Sw);
-       PassBuilder PB;
-       FunctionAnalysisManager FAM;
-       PB.registerFunctionAnalyses(FAM);
-       LazyValueInfo &LVI = FAM.getResult<LazyValueAnalysis>(F);
-       N += index(*Sw, LVI, F.getDataLayout(), Read, Ctx);
-     }
+    // LazyValueInfo starts over after every rewrite: one changes what it
+    // knows on the edges of the others. Until then it holds, and a rewrite
+    // adds no assumptions, so the assumption cache it reads stays valid:
+    // a function with thousands of switches stays linear. Then a guard that
+    // a dominating `if` bounds (found once the switch is on its index) kills
+    // a fully-covered default.
+    PassBuilder PB;
+    FunctionAnalysisManager FAM;
+    PB.registerFunctionAnalyses(FAM);
+    LazyValueInfo &LVI = FAM.getResult<LazyValueAnalysis>(F);
+    for (SwitchInst *Sw : Switches) {
+      if (Sw->getParent() == nullptr)
+        continue;
+      if (unscale(*Sw))
+        LVI.clear();
+      if (index(*Sw, LVI, F.getDataLayout(), Read, Ctx)) {
+        ++N;
+        LVI.clear();
+      }
+    }
     Switches.clear();
     for (Instruction &I : instructions(F))
       if (auto *Sw = dyn_cast<SwitchInst>(&I))

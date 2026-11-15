@@ -12,6 +12,7 @@
 // and RAUW across argument types.
 
 #include "llvm-c/Types.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
@@ -20,8 +21,10 @@
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/MDBuilder.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Operator.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 
 #include <algorithm>
@@ -119,6 +122,9 @@ struct BiaraConv {
   uint32_t sys_ret;
   uint64_t env_size;
   uint64_t margin; // bytes of CPU state before env (negative offsets)
+  // Unknown indirect targets first try the lifted functions
+  // (`biara_call_at`); otherwise they are only called through the pointer.
+  uint32_t dispatch;
 };
 
 // What one `call` of the lifted module stands for.
@@ -142,6 +148,12 @@ struct BiaraHelper {
   uint32_t nreads;
   const uint32_t *writes;
   uint32_t nwrites;
+  // When env itself is every pointer argument: the registers its bitcode
+  // reads and writes (null `env_reads`: not known).
+  const uint32_t *env_reads;
+  uint32_t nenv_reads;
+  const uint32_t *env_writes;
+  uint32_t nenv_writes;
 };
 } // extern "C"
 
@@ -165,6 +177,9 @@ struct Former {
   // The lowering's promote alloca per register (its slot before ABI form);
   // sync stores load from these, so they set nothing either.
   std::vector<AllocaInst *> Promote;
+  // Registers whose env home the function being rewritten addresses. The
+  // CPU state is the only copy of the others, so helpers need no sync.
+  std::vector<bool> Touched;
   // One shared dispatcher: no per-call-site expansion of all functions.
   Function *Dispatch = nullptr;
 
@@ -531,6 +546,8 @@ struct Former {
     }
     // Register homes become the register's slot; stores to the state
     // before env (icount and I/O flags) go.
+    Touched.assign(Regs.size(), false);
+    Touched[Cv.sp] = Touched[Cv.pc] = true;
     std::vector<User *> Users(EnvArg->user_begin(), EnvArg->user_end());
     for (User *U : Users) {
       if (auto *G = dyn_cast<GetElementPtrInst>(U)) {
@@ -539,6 +556,7 @@ struct Former {
           continue;
         int64_t O = Off->getSExtValue();
         if (auto It = RegAt.find(O); It != RegAt.end()) {
+          Touched[It->second] = true;
           G->replaceAllUsesWith(Slot[It->second]);
           G->eraseFromParent();
         } else if (O < 0) {
@@ -548,11 +566,15 @@ struct Former {
               St->eraseFromParent();
         }
       } else if (auto *L = dyn_cast<LoadInst>(U)) {
-        if (auto It = RegAt.find(0); It != RegAt.end())
+        if (auto It = RegAt.find(0); It != RegAt.end()) {
+          Touched[It->second] = true;
           L->setOperand(0, Slot[It->second]);
+        }
       } else if (auto *St = dyn_cast<StoreInst>(U); St && St->getPointerOperand() == EnvArg) {
-        if (auto It = RegAt.find(0); It != RegAt.end())
+        if (auto It = RegAt.find(0); It != RegAt.end()) {
+          Touched[It->second] = true;
           St->setOperand(1, Slot[It->second]);
+        }
       }
     }
 
@@ -661,6 +683,27 @@ struct Former {
     return true;
   }
 
+  // The store of return address `Ret` before call `CB`: back from the call
+  // to the previous call, also through blocks with a single predecessor.
+  static StoreInst *pushedReturn(CallBase &CB, uint64_t Ret) {
+    Instruction *I = CB.getPrevNode();
+    for (BasicBlock *BB = CB.getParent();;) {
+      for (; I; I = I->getPrevNode()) {
+        if (isa<CallBase>(I))
+          return nullptr;
+        if (auto *St = dyn_cast<StoreInst>(I)) {
+          auto *K = dyn_cast<ConstantInt>(St->getValueOperand());
+          if (K && K->getBitWidth() == 64 && K->getZExtValue() == Ret)
+            return St;
+        }
+      }
+      BB = BB->getSinglePredecessor();
+      if (!BB)
+        return nullptr;
+      I = BB->getTerminator()->getPrevNode();
+    }
+  }
+
   void invoke(IRBuilder<> &B, const BiaraSig &T,
               const std::vector<AllocaInst *> &Slot, Value *Sp, uint64_t Ret) {
     Function *Fn = NewOf[unwrap<Function>(T.fn)];
@@ -690,16 +733,11 @@ struct Former {
     const BiaraCall *C = Rec == Calls.end() ? nullptr : Rec->second;
     uint64_t Ret = C ? C->ret : 0;
     // The return address a call pushes is only read by the callee's
-    // return, which ABI form replaces.
+    // return, which ABI form replaces. A resolved indirect call is a switch
+    // over its targets, so the push can sit in the switching block.
     if (Ret && Cv.pop > 0)
-      for (Instruction *I = CB.getPrevNode(); I && !isa<CallBase>(I); I = I->getPrevNode())
-        if (auto *St = dyn_cast<StoreInst>(I)) {
-          auto *K = dyn_cast<ConstantInt>(St->getValueOperand());
-          if (K && K->getBitWidth() == 64 && K->getZExtValue() == Ret) {
-            St->eraseFromParent();
-            break;
-          }
-        }
+      if (StoreInst *St = pushedReturn(CB, Ret))
+        St->eraseFromParent();
     Value *Sp = B.CreateLoad(regTy(Cv.sp), Slot[Cv.sp], "sp");
     if (Callee && Sigs.count(Callee) && (!C || C->kind == BIARA_CALL_DIRECT)) {
       invoke(B, *Sigs[Callee], Slot, Sp, Ret);
@@ -710,6 +748,17 @@ struct Former {
       // Known guest targets are called through their exact native types;
       // only external addresses use the unresolved raw-register ABI.
       uint32_t Arity = C->arity == UINT32_MAX ? inferArity(CB, Slot, Conv, S) : C->arity;
+      if (C->kind == BIARA_CALL_INDIRECT && !Dispatch) {
+        Value *Target = B.CreateZExtOrTrunc(
+            B.CreateLoad(regTy(Cv.pc), Slot[Cv.pc], "target"), i64());
+        std::vector<Type *> Params(std::min<size_t>(Arity, Conv.size()), i64());
+        FunctionCallee Fn(FunctionType::get(i64(), Params, false),
+                          B.CreateIntToPtr(Target, B.getPtrTy()));
+        writeSlot(B, Slot, Cv.ret, callUnknown(B, Fn, Slot, Conv, Arity));
+        resumed(B, Slot, Sp, Ret);
+        CB.eraseFromParent();
+        return true;
+      }
       if (C->kind == BIARA_CALL_INDIRECT) {
         Value *Target = B.CreateZExtOrTrunc(
             B.CreateLoad(regTy(Cv.pc), Slot[Cv.pc], "target"), i64());
@@ -781,6 +830,16 @@ struct Former {
     std::vector<uint32_t> Reads = H.listed ? std::vector<uint32_t>(H.reads, H.reads + H.nreads) : All;
     std::vector<uint32_t> Writes =
         H.listed ? std::vector<uint32_t>(H.writes, H.writes + H.nwrites) : All;
+    bool EnvOnly = H.env_reads != nullptr;
+    for (Value *A : CB.args())
+      EnvOnly &= !A->getType()->isPointerTy() || A == EnvArg;
+    if (EnvOnly) {
+      Reads.assign(H.env_reads, H.env_reads + H.nenv_reads);
+      Writes.assign(H.env_writes, H.env_writes + H.nenv_writes);
+    }
+    auto Untouched = [&](uint32_t R) { return !Touched[R]; };
+    Reads.erase(std::remove_if(Reads.begin(), Reads.end(), Untouched), Reads.end());
+    Writes.erase(std::remove_if(Writes.begin(), Writes.end(), Untouched), Writes.end());
     if (SeesEnv && (H.mode & BIARA_HELPER_READS))
       for (uint32_t R : Reads)
         if (!fp(R))
@@ -795,6 +854,71 @@ struct Former {
   }
 };
 } // namespace
+
+// Whether integer `V` may be computed from the address of `Cpu` (TCG code
+// indexing env, `add_ptr tmp, env, idx`, lifts to integer arithmetic).
+static bool fromCpu(const Value *V, const GlobalVariable *Cpu,
+                    SmallPtrSetImpl<const Value *> &Seen, unsigned Depth = 0) {
+  if (!Seen.insert(V).second)
+    return false;
+  if (Depth > 16)
+    return true;
+  auto *U = dyn_cast<User>(V);
+  if (!U || isa<LoadInst>(V) || isa<CallBase>(V) || isa<GlobalValue>(V))
+    return false;
+  if (isa<PtrToIntOperator>(U))
+    return getUnderlyingObject(U->getOperand(0)) == Cpu;
+  for (const Value *O : U->operands())
+    if (O->getType()->isIntOrIntVectorTy() && fromCpu(O, Cpu, Seen, Depth + 1))
+      return true;
+  return false;
+}
+
+// Lifted code cannot address the CPU state except through env: env was a
+// `noalias` parameter, and guest pointers are guest addresses. As a global,
+// `biara_cpu` loses that, and every store through a guest address would keep
+// each register write-back and reload around helpers alive. Accesses to
+// `biara_cpu` get one alias scope; accesses through guest addresses and
+// frames are `noalias` to it. Calls stay barriers: helpers and callees still
+// see the state through env.
+static void separateCpu(Module &M, GlobalVariable *Cpu) {
+  MDBuilder Build(M.getContext());
+  MDNode *Domain = Build.createAnonymousAliasScopeDomain("biara");
+  MDNode *Scope = MDNode::get(M.getContext(),
+                              {Build.createAnonymousAliasScope(Domain, "biara_cpu")});
+  for (Function &F : M)
+    for (Instruction &I : instructions(F)) {
+      SmallVector<Value *, 2> Pointers;
+      if (auto *L = dyn_cast<LoadInst>(&I))
+        Pointers.push_back(L->getPointerOperand());
+      else if (auto *S = dyn_cast<StoreInst>(&I))
+        Pointers.push_back(S->getPointerOperand());
+      else if (auto *T = dyn_cast<MemTransferInst>(&I))
+        Pointers.append({T->getRawDest(), T->getRawSource()});
+      else if (auto *Set = dyn_cast<MemSetInst>(&I))
+        Pointers.push_back(Set->getRawDest());
+      else
+        continue;
+      SmallVector<const Value *, 4> Objects;
+      for (Value *P : Pointers)
+        getUnderlyingObjects(P, Objects);
+      size_t InCpu = std::count(Objects.begin(), Objects.end(), Cpu);
+      bool Computed = false;
+      for (const Value *O : Objects)
+        if (auto *Cast = dyn_cast<IntToPtrInst>(O)) {
+          SmallPtrSet<const Value *, 16> Seen;
+          Computed |= fromCpu(Cast->getOperand(0), Cpu, Seen);
+        } else if (auto *CE = dyn_cast<ConstantExpr>(O);
+                   CE && CE->getOpcode() == Instruction::IntToPtr) {
+          SmallPtrSet<const Value *, 16> Seen;
+          Computed |= fromCpu(CE->getOperand(0), Cpu, Seen);
+        }
+      if (InCpu == Objects.size())
+        I.setMetadata(LLVMContext::MD_alias_scope, Scope);
+      else if (InCpu == 0 && !Computed)
+        I.setMetadata(LLVMContext::MD_noalias, Scope);
+    }
+}
 
 // Rewrite `M` into ABI form; the old functions in `Drop` (and the bodies of
 // the rewritten ones) are deleted. Returns 0, or 1 with `*Err` set
@@ -828,17 +952,20 @@ extern "C" int biara_abi_form(LLVMModuleRef MRef, const BiaraConv *Cv, const Bia
       Type::getInt8Ty(M.getContext()), F.Cpu,
       ConstantInt::get(Type::getInt64Ty(M.getContext()), Cv->margin));
 
-  F.Dispatch = Function::Create(
-      FunctionType::get(Type::getInt1Ty(M.getContext()),
-                        {Type::getInt64Ty(M.getContext())}, false),
-      GlobalValue::ExternalLinkage, "biara_call_at", M);
-  F.Dispatch->getArg(0)->setName("addr");
-  // Kept a plain switch on the address (no range tricks) for the C.
-  F.Dispatch->addFnAttr(Attribute::OptimizeNone);
-  F.Dispatch->addFnAttr(Attribute::NoInline);
+  if (Cv->dispatch) {
+    F.Dispatch = Function::Create(
+        FunctionType::get(Type::getInt1Ty(M.getContext()),
+                          {Type::getInt64Ty(M.getContext())}, false),
+        GlobalValue::ExternalLinkage, "biara_call_at", M);
+    F.Dispatch->getArg(0)->setName("addr");
+    // Kept a plain switch on the address (no range tricks) for the C.
+    F.Dispatch->addFnAttr(Attribute::OptimizeNone);
+    F.Dispatch->addFnAttr(Attribute::NoInline);
+  }
   for (size_t I = 0; I < NSigs; ++I)
     F.declare(Sigs[I]);
-  F.dispatcher(Sigs, NSigs);
+  if (F.Dispatch)
+    F.dispatcher(Sigs, NSigs);
   std::string E;
   for (size_t I = 0; I < NSigs; ++I)
     if (!F.form(Sigs[I], E)) {
@@ -859,6 +986,7 @@ extern "C" int biara_abi_form(LLVMModuleRef MRef, const BiaraConv *Cv, const Bia
     D->replaceAllUsesWith(PoisonValue::get(D->getType()));
     D->eraseFromParent();
   }
+  separateCpu(M, F.Cpu);
   return 0;
 }
 

@@ -338,11 +338,29 @@ pub struct Options {
     pub function_starts: BTreeSet<u64>,
 }
 
+/// Translation blocks recovered before stopping when the code size is not
+/// known, and the least [`block_budget`] allows.
+pub const DEFAULT_MAX_BLOCKS: usize = 1_000_000;
+
+/// Bytes of executable code per block that [`block_budget`] allows for. Real
+/// programs average 14 to 28 (ls, bash, glibc, a 27 MB Rust executable), so
+/// the budget only stops runaway recovery, not recovery of real code.
+pub const BUDGET_BYTES_PER_BLOCK: u64 = 4;
+
+/// The block budget for a program with `code_bytes` of executable code: one
+/// block per [`BUDGET_BYTES_PER_BLOCK`] bytes, at least [`DEFAULT_MAX_BLOCKS`].
+/// Past it, functions end at the blocks that did not fit.
+pub fn block_budget(code_bytes: u64) -> usize {
+    usize::try_from(code_bytes / BUDGET_BYTES_PER_BLOCK)
+        .unwrap_or(usize::MAX)
+        .max(DEFAULT_MAX_BLOCKS)
+}
+
 impl Default for Options {
     fn default() -> Self {
         Self {
             os: "linux",
-            max_blocks: 100_000,
+            max_blocks: DEFAULT_MAX_BLOCKS,
             jump_tables: BTreeMap::new(),
             incomplete_jump_tables: BTreeSet::new(),
             indirect_calls: BTreeMap::new(),

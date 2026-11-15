@@ -83,6 +83,9 @@ pub struct ContextInfo {
     pub insn_start_words: u32,
     /// sizeof(CPUArchState); `env`-relative offsets index into it.
     pub env_size: usize,
+    /// The helpers' bitcode, `helpers-<arch>.bc` beside the library, if
+    /// present (`scripts/build-libtcg.sh` builds both).
+    pub helpers: Option<PathBuf>,
 }
 
 impl ContextInfo {
@@ -208,8 +211,11 @@ impl Libtcg {
         if raw_info.pc_global < 0 {
             return Err(Error::NoPcGlobal(path.to_owned()));
         }
+        let arch = unsafe { cstr(raw_info.arch) }.unwrap_or_default();
+        let helpers = path.with_file_name(format!("helpers-{arch}.bc"));
         let info = ContextInfo {
-            arch: unsafe { cstr(raw_info.arch) }.unwrap_or_default(),
+            helpers: helpers.is_file().then_some(helpers),
+            arch,
             cpu_model: unsafe { cstr(raw_info.cpu_model) }.unwrap_or_default(),
             guest_bits: raw_info.guest_bits,
             globals,

@@ -63,6 +63,8 @@ pub(crate) struct Targets<'m, 'ctx> {
     pub syscall: FunctionValue<'ctx>,
     /// Resolved indirect-jump targets by jumping block (`Cfg::jump_tables`).
     pub tables: &'m BTreeMap<u64, BTreeSet<u64>>,
+    /// Jumping blocks whose `tables` entry may miss destinations.
+    pub incomplete_tables: &'m BTreeSet<u64>,
     /// Recovered callees by calling block, with residual unknown status.
     pub indirect_calls: &'m BTreeMap<u64, biara_cfg::IndirectTargets>,
     pub imports: &'m BTreeMap<u64, String>,
@@ -91,6 +93,15 @@ pub(crate) struct Targets<'m, 'ctx> {
     /// The stack pointer global and what returning from a callee adds to
     /// its value at the call (the return address it pops).
     pub sp: (TempId, i64),
+}
+
+impl Targets<'_, '_> {
+    /// Whether an indirect transfer whose recovered destinations are `complete`
+    /// needs no path for an unknown one: every destination got a case. Modules
+    /// for target recovery keep the path, so their markers see every value.
+    fn exhaustive(&self, complete: bool, all_cased: bool) -> bool {
+        complete && all_cased && self.target_marker.is_none()
+    }
 }
 
 /// A TCG global kept in an alloca for the duration of a function.
@@ -371,6 +382,13 @@ impl<'a, 'ctx> Lowering<'a, 'ctx> {
         self.b.build_switch(pc, unknown, &cases)?;
         self.tag()?;
         self.b.position_at_end(unknown);
+        if t.exhaustive(resolved.complete, cases.len() == resolved.targets.len()) {
+            self.b.build_unreachable()?;
+            self.tag()?;
+            self.b.position_at_end(joined);
+            self.join_dirty();
+            return self.resume(ret);
+        }
         self.join_dirty();
         self.call_out(t.dispatch, t.abis.map(|_| t.convention_kept))?;
         self.b.build_unconditional_branch(joined)?;
@@ -381,9 +399,9 @@ impl<'a, 'ctx> Lowering<'a, 'ctx> {
     }
 
     /// `switch (pc)` over the block's resolved jump-table targets; anything
-    /// else goes through `biara.dispatch` and returns. Jumps through a
-    /// constant pointer slot (GOT) are filled in at load time and are not
-    /// announced to the table analysis.
+    /// else goes through `biara.dispatch` and returns, unless the table is
+    /// complete. Jumps through a constant pointer slot (GOT) are filled in at
+    /// load time and are not announced to the table analysis.
     fn indirect_jump(&mut self, announce: bool) -> R<()> {
         let t = self.targets;
         let pc = self.read(self.pc_temp)?;
@@ -392,7 +410,8 @@ impl<'a, 'ctx> Lowering<'a, 'ctx> {
             self.b.build_call(marker, &[pc.into(), site.into()], "")?;
         }
         let mut cases = Vec::new();
-        for &dst in t.tables.get(&self.block.pc).into_iter().flatten() {
+        let table = t.tables.get(&self.block.pc);
+        for &dst in table.into_iter().flatten() {
             let bb = match (t.blocks.get(&dst), t.functions.get(&dst)) {
                 (Some(&bb), _) => bb,
                 (None, Some(&f)) => {
@@ -419,6 +438,12 @@ impl<'a, 'ctx> Lowering<'a, 'ctx> {
         self.b.build_switch(pc, unknown, &cases)?;
         self.tag()?;
         self.b.position_at_end(unknown);
+        let complete = table.is_some() && !t.incomplete_tables.contains(&self.block.pc);
+        if t.exhaustive(complete, cases.len() == table.map_or(0, |t| t.len())) {
+            self.b.build_unreachable()?;
+            self.tag()?;
+            return Ok(());
+        }
         self.sync_out()?;
         self.b.build_call(t.dispatch, &[self.env.into()], "")?;
         if let Some(marker) = t.return_marker {

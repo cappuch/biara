@@ -172,3 +172,128 @@ __attribute__((noreturn,used)) void _start(void) {
         }
     }
 }
+
+/// A switch without a bounds check (unreachable default) has an index range
+/// wider than its table (`& 7` for five cases, a whole byte for `state_b`), so
+/// enumeration reads past the table into the next function's. Those entries
+/// are not this switch's cases: they must not join its function.
+#[test]
+fn unbounded_tables_stay_in_their_function() {
+    let dir = tmp().join("indirect-unbounded");
+    fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("states.c");
+    let binary = dir.join("program");
+    fs::write(
+        &source,
+        r#"
+__attribute__((noinline,used)) long state_a(const unsigned char *s, long x) {
+    switch (*s & 7) {
+    case 0: x = x * 3 + 1; break;
+    case 1: x = x ^ 0x55; break;
+    case 2: x = x - 17; break;
+    case 3: x = x << 3; break;
+    case 4: x = x / 7; break;
+    default: __builtin_unreachable();
+    }
+    return x + s[1];
+}
+__attribute__((noinline,used)) long state_b(const unsigned char *s, long x) {
+    switch (*s) {
+    case 0: x = x * 5 + 2; break;
+    case 1: x = x ^ 0x99; break;
+    case 2: x = x - 23; break;
+    case 3: x = x << 5; break;
+    case 4: x = x / 9; break;
+    default: __builtin_unreachable();
+    }
+    return x + s[2];
+}
+__attribute__((noinline,used)) long twice(long x) { return 2 * x; }
+__attribute__((noinline,used)) long negate(long x) { return -x; }
+static long (*const handlers[])(long) = {twice, negate};
+__attribute__((noinline,used)) long dispatch(const unsigned char *s, long x) {
+    long (*h)(long) = handlers[*s & 1];
+    __asm__ volatile("" : "+r"(h));
+    return h(x);
+}
+__attribute__((noreturn,used)) void _start(void) {
+    static const unsigned char a[] = {2, 1}, b[] = {3, 0, 4}, c[] = {1};
+    long value = state_a(a, 20) + state_b(b, 1) + dispatch(c, 7);
+    __asm__ volatile("syscall"::"a"(60L),"D"(value == 33 ? 0L : 1L):"rcx","r11","memory");
+    __builtin_unreachable();
+}
+"#,
+    )
+    .unwrap();
+    let output = Command::new(env!("BIARA_CLANG"))
+        .args([
+            "--target=x86_64-linux-gnu".to_owned(),
+            "-O2".to_owned(),
+            format!("--ld-path={}", linker().display()),
+        ])
+        .args([
+            "-ffreestanding",
+            "-nostdlib",
+            "-fno-pie",
+            "-static",
+            "-funwind-tables",
+        ])
+        .arg(&source)
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(Command::new(&binary).status().unwrap().success());
+    let image = Image::load(&binary).unwrap();
+    let body = |name: &str| {
+        let symbol = image.symbol(name).unwrap();
+        symbol.addr..symbol.addr + symbol.size
+    };
+    let (a, b) = (body("state_a"), body("state_b"));
+    let lib = Libtcg::load(&Libtcg::find("x86_64").unwrap(), None).unwrap();
+    let cfg = recover_program(&mut lib.lock(), &image);
+    let jump_site = |entry: u64| {
+        *cfg.functions[&entry]
+            .blocks
+            .iter()
+            .find(|&&pc| {
+                cfg.blocks[&pc]
+                    .exits
+                    .iter()
+                    .any(|e| matches!(e.kind, ExitKind::IndirectJump { .. }))
+            })
+            .expect("an indirect jump")
+    };
+    let function = &cfg.functions[&a.start];
+    let site = jump_site(a.start);
+    let targets = &cfg.jump_tables[&site];
+    assert_eq!(
+        targets.iter().filter(|t| a.contains(t)).count(),
+        5,
+        "the five cases: {targets:x?}"
+    );
+    // Past the table: other functions' entries at most (tail calls, which
+    // keep bodies apart), never a place inside another function.
+    let starts = image.function_starts();
+    assert!(
+        targets.iter().all(|t| a.contains(t) || starts.contains(t)),
+        "{targets:x?}"
+    );
+    assert!(
+        function.blocks.iter().all(|pc| !b.contains(pc)),
+        "state_b's code joined state_a"
+    );
+    // Read past its end, the table cannot be shown to have only these.
+    assert!(cfg.incomplete_jump_tables.contains(&site));
+    // Other functions' entries are what a tail call through a table reaches.
+    let tail = jump_site(body("dispatch").start);
+    assert_eq!(
+        cfg.jump_tables[&tail],
+        BTreeSet::from([body("twice").start, body("negate").start])
+    );
+}

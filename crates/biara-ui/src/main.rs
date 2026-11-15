@@ -1,3 +1,10 @@
+// jemalloc for the whole process, LLVM included: decompiling a huge function
+// spends much of its time allocating, and glibc's allocator slows sharply as
+// memory fragments.
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 fn main() {
     // The analysis engine runs its worker pool as copies of this executable.
     let mut args = std::env::args().skip(1);

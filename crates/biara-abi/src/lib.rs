@@ -511,6 +511,9 @@ enum Val {
     Entry(TempId, i64),
     /// What callee `.0` left in register `.1`.
     Ret(u64, TempId),
+    /// What the indirect call ending block `.0` left in register `.1`: the
+    /// result of whichever recovered target ran.
+    SiteRet(u64, TempId),
     /// Untyped bits from an incoming SIMD lane, plus byte displacement.
     FpEntry(u32, u32),
     /// Untyped bits a direct callee returned in a SIMD lane.
@@ -559,6 +562,8 @@ impl State {
 struct Facts {
     uses: BTreeSet<TempId>,
     ret_uses: BTreeSet<(u64, TempId)>,
+    /// `Val::SiteRet` reads: every target of the call site returns there.
+    site_ret_uses: BTreeSet<(u64, TempId)>,
     slots: BTreeMap<i64, u32>,
     stack_args: BTreeSet<i64>,
     /// Argument registers still holding their entry value at a call to
@@ -613,6 +618,9 @@ impl Facts {
             }
             Val::Ret(c, r) => {
                 self.ret_uses.insert((c, r));
+            }
+            Val::SiteRet(site, r) => {
+                self.site_ret_uses.insert((site, r));
             }
             Val::FpEntry(lane, _) => {
                 self.fp_raw_args.insert(lane);
@@ -1027,9 +1035,14 @@ impl<'a> Ctx<'a> {
             ret_class,
             analysis: AbiStatus::default(),
         };
+        let mut ret_uses = facts.ret_uses;
+        for (site, r) in facts.site_ret_uses {
+            let targets = self.cfg.indirect_calls.get(&site).into_iter();
+            ret_uses.extend(targets.flat_map(|ts| &ts.targets).map(|&t| (t, r)));
+        }
         Learned {
             abi,
-            ret_uses: facts.ret_uses,
+            ret_uses,
             passthrough: facts.passthrough,
             call_writes: facts.call_writes,
             fp_ret_uses: facts.fp_ret_uses,
@@ -1589,22 +1602,40 @@ impl<'a> Ctx<'a> {
                 // The callee address itself is computed from our state.
                 facts.use_val(st.regs[self.pc as usize]);
                 if local(ret) {
-                    if let Some(targets) = self.cfg.indirect_calls.get(&bb.pc()) {
-                        for &target in &targets.targets {
-                            if self.cfg.functions.get(&target).is_some_and(|f| !f.returns) {
-                                continue;
-                            }
-                            let after = self.call(f.entry, Some(target), st.clone(), abis, facts);
-                            outs.push(Out::Block(ret, after));
+                    // One state for every way the call can come back. A
+                    // register each recovered target returns in stays theirs
+                    // (`SiteRet`) through the join, so reading it demands
+                    // the result from all of them.
+                    let site = self.cfg.indirect_calls.get(&bb.pc());
+                    let mut joined: Option<State> = None;
+                    let mut theirs: Option<Vec<bool>> = None;
+                    for &target in site.into_iter().flat_map(|ts| &ts.targets) {
+                        if self.cfg.functions.get(&target).is_some_and(|f| !f.returns) {
+                            continue;
+                        }
+                        let after = self.call(f.entry, Some(target), st.clone(), abis, facts);
+                        let returned = theirs.get_or_insert_with(|| vec![true; after.regs.len()]);
+                        for (r, v) in after.regs.iter().enumerate() {
+                            returned[r] &= *v == Val::Ret(target, r as TempId);
+                        }
+                        match &mut joined {
+                            Some(j) => _ = j.join(&after),
+                            None => joined = Some(after),
                         }
                     }
-                    if self
-                        .cfg
-                        .indirect_calls
-                        .get(&bb.pc())
-                        .is_none_or(|ts| !ts.complete)
-                    {
+                    if site.is_none_or(|ts| !ts.complete) {
                         let after = self.call(f.entry, None, st, abis, facts);
+                        match &mut joined {
+                            Some(j) => _ = j.join(&after),
+                            None => joined = Some(after),
+                        }
+                    }
+                    if let Some(mut after) = joined {
+                        for (r, v) in after.regs.iter_mut().enumerate() {
+                            if theirs.as_ref().is_some_and(|t| t[r]) && *v == Val::Unknown {
+                                *v = Val::SiteRet(bb.pc(), r as TempId);
+                            }
+                        }
                         outs.push(Out::Block(ret, after));
                     }
                 }

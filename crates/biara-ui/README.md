@@ -41,6 +41,15 @@ either spelling finds the symbol. A name you give with rename always wins, and t
 annotations only ever hold raw names and your own. "Toggle demangled names" in the command
 palette (`Ctrl+K`) switches to raw linker names and back.
 
+### Block limit
+
+Recovery stops after 1,000,000 translation blocks, which covers programs up to tens of MB of
+code. When it stops there, the status bar says so and offers "Raise limit…", which opens the
+block-limit dialog (also "Set the block limit…" in the command palette) with twice the limit
+filled in. It takes `2000000`, `2_000_000` or `2M`. A new limit analyses the open binary again,
+reusing what the store already translated. The limit lasts until the window closes;
+`--max-blocks N` sets it from the command line.
+
 ## Keys
 
 | Key | Action |
@@ -79,7 +88,7 @@ Names you give are saved in the engine's annotation format under
 ## Command line and headless checks
 
 ```text
-biara-ui [BINARY] [--sync] [--goto ADDR|NAME] [--tab listing|graph|pseudo|hex]
+biara-ui [BINARY] [--sync] [--goto ADDR|NAME] [--tab listing|graph|pseudo|hex] [--max-blocks N]
 ```
 
 `--sync` waits for analysis before the first frame. Rune's headless tooling then works as for

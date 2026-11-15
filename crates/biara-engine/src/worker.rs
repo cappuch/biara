@@ -189,9 +189,20 @@ struct Process {
     input: BufWriter<ChildStdin>,
     reader: Option<JoinHandle<()>>,
 }
+/// What a worker's reader thread reports.
+enum Event {
+    Response(Response),
+    /// The worker closed its output: it exited (out of memory, or a crash).
+    Exited,
+    Error(Error),
+}
 pub(crate) struct Pool {
     processes: Vec<Process>,
-    output: mpsc::Receiver<(usize, Result<Response, Error>)>,
+    events: mpsc::Sender<(usize, Event)>,
+    output: mpsc::Receiver<(usize, Event)>,
+    executable: PathBuf,
+    config: String,
+    worker_budget: u64,
 }
 impl Pool {
     /// Spawn `count` workers, each inheriting an address-space cap of
@@ -210,89 +221,103 @@ impl Pool {
         if count == 0 {
             return Err(Error::Engine("worker budget must be nonzero".into()));
         }
-        let (sender, output) = mpsc::channel();
+        let (events, output) = mpsc::channel();
         let mut pool = Self {
             processes: Vec::with_capacity(count),
+            events,
             output,
+            executable: executable.to_owned(),
+            config: serde_json::to_string(config)?,
+            worker_budget,
         };
-        let config = serde_json::to_string(config)?;
         for index in 0..count {
-            let mut child = Command::new(executable);
-            child
-                .arg("__worker")
-                .arg(&config)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::inherit());
-            #[cfg(unix)]
-            {
-                use std::os::unix::process::CommandExt;
-                // Inherit the coordinator's process group: the service supervisor
-                // isolates the coordinator once, and group RSS/kill then covers
-                // the whole job. A per-worker process_group(0) would escape
-                // supervision and orphan workers on coordinator SIGKILL.
-                unsafe {
-                    child.pre_exec(move || {
-                        let limit = libc::rlimit {
-                            rlim_cur: worker_budget as libc::rlim_t,
-                            rlim_max: worker_budget as libc::rlim_t,
-                        };
-                        if libc::setrlimit(libc::RLIMIT_AS, &limit) != 0 {
-                            return Err(std::io::Error::last_os_error());
-                        }
-                        let core = libc::rlimit {
-                            rlim_cur: 0,
-                            rlim_max: 0,
-                        };
-                        if libc::setrlimit(libc::RLIMIT_CORE, &core) != 0 {
-                            return Err(std::io::Error::last_os_error());
-                        }
-                        Ok(())
-                    });
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = worker_budget;
-            }
-            let mut child = child.spawn()?;
-            let input = child
-                .stdin
-                .take()
-                .ok_or_else(|| Error::Engine("worker stdin unavailable".into()))?;
-            let stdout = child
-                .stdout
-                .take()
-                .ok_or_else(|| Error::Engine("worker stdout unavailable".into()))?;
-            let sender = sender.clone();
-            let reader = thread::spawn(move || {
-                let mut input = BufReader::new(stdout);
-                loop {
-                    match read_frame::<Response>(&mut input) {
-                        Ok(Some(response)) => {
-                            if sender.send((index, Ok(response))).is_err() {
-                                break;
-                            }
-                        }
-                        Ok(None) => {
-                            let _ = sender
-                                .send((index, Err(Error::Engine("analysis worker exited".into()))));
-                            break;
-                        }
-                        Err(error) => {
-                            let _ = sender.send((index, Err(error)));
-                            break;
-                        }
-                    }
-                }
-            });
-            pool.processes.push(Process {
-                child,
-                input: BufWriter::new(input),
-                reader: Some(reader),
-            });
+            let process = pool.spawn(index)?;
+            pool.processes.push(process);
         }
         Ok(pool)
+    }
+    fn spawn(&self, index: usize) -> Result<Process, Error> {
+        let mut child = Command::new(&self.executable);
+        child
+            .arg("__worker")
+            .arg(&self.config)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            let worker_budget = self.worker_budget;
+            // Inherit the coordinator's process group: the service supervisor
+            // isolates the coordinator once, and group RSS/kill then covers
+            // the whole job. A per-worker process_group(0) would escape
+            // supervision and orphan workers on coordinator SIGKILL.
+            unsafe {
+                child.pre_exec(move || {
+                    let limit = libc::rlimit {
+                        rlim_cur: worker_budget as libc::rlim_t,
+                        rlim_max: worker_budget as libc::rlim_t,
+                    };
+                    if libc::setrlimit(libc::RLIMIT_AS, &limit) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    let core = libc::rlimit {
+                        rlim_cur: 0,
+                        rlim_max: 0,
+                    };
+                    if libc::setrlimit(libc::RLIMIT_CORE, &core) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+        let mut child = child.spawn()?;
+        let input = child
+            .stdin
+            .take()
+            .ok_or_else(|| Error::Engine("worker stdin unavailable".into()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| Error::Engine("worker stdout unavailable".into()))?;
+        let sender = self.events.clone();
+        let reader = thread::spawn(move || {
+            let mut input = BufReader::new(stdout);
+            loop {
+                let event = match read_frame::<Response>(&mut input) {
+                    Ok(Some(response)) => Event::Response(response),
+                    Ok(None) => Event::Exited,
+                    Err(error) => Event::Error(error),
+                };
+                let last = !matches!(event, Event::Response(_));
+                if sender.send((index, event)).is_err() || last {
+                    break;
+                }
+            }
+        });
+        Ok(Process {
+            child,
+            input: BufWriter::new(input),
+            reader: Some(reader),
+        })
+    }
+    /// Replace worker `index`, which exited, with a fresh one.
+    pub fn respawn(&mut self, index: usize) -> Result<(), Error> {
+        let fresh = self.spawn(index)?;
+        let Process {
+            mut child,
+            input,
+            reader,
+        } = std::mem::replace(&mut self.processes[index], fresh);
+        // Close its input first: anything still reading it then ends too.
+        drop(input);
+        let _ = child.kill();
+        let _ = child.wait();
+        if let Some(reader) = reader {
+            let _ = reader.join();
+        }
+        Ok(())
     }
     pub fn len(&self) -> usize {
         self.processes.len()
@@ -300,16 +325,18 @@ impl Pool {
     pub fn send(&mut self, index: usize, request: &Request) -> Result<(), Error> {
         write_frame(&mut self.processes[index].input, request)
     }
-    pub fn receive(&self) -> Result<(usize, Response), Error> {
-        let (index, response) = self
+    /// The next response, by worker; `None` when that worker exited instead.
+    pub fn receive(&self) -> Result<(usize, Option<Response>), Error> {
+        let (index, event) = self
             .output
             .recv()
             .map_err(|_| Error::Engine("worker channel closed".into()))?;
-        let response = response?;
-        if let Response::Failed(message) = response {
-            return Err(Error::Engine(message));
+        match event {
+            Event::Response(Response::Failed(message)) => Err(Error::Engine(message)),
+            Event::Response(response) => Ok((index, Some(response))),
+            Event::Exited => Ok((index, None)),
+            Event::Error(error) => Err(error),
         }
-        Ok((index, response))
     }
 }
 impl Drop for Pool {

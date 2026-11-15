@@ -31,9 +31,10 @@ pub(crate) struct QualityArgs {
     reference: PathBuf,
     /// Stripped copy of the same executable, at the same mapped addresses.
     candidate: PathBuf,
-    /// Stop after this many translation blocks per executable.
-    #[arg(long, default_value_t = 1_000_000)]
-    max_blocks: usize,
+    /// Stop after this many translation blocks per executable. Default: one
+    /// per 4 bytes of its executable code, at least 1,000,000.
+    #[arg(long)]
+    max_blocks: Option<usize>,
     /// QEMU CPU model.
     #[arg(long)]
     cpu: Option<String>,
@@ -495,7 +496,7 @@ pub(crate) fn run(args: QualityArgs) -> Result<()> {
         reference: &args.reference,
         candidate: &args.candidate,
         architecture: reference.arch,
-        max_blocks_per_image: args.max_blocks,
+        max_blocks_per_image: reference_cfg.recovery.block_limit,
         cpu: args.cpu.as_deref(),
         oracle_scope: OracleScope {
             functions: "defined executable function-symbol addresses in the reference; aliases deduplicated by address",

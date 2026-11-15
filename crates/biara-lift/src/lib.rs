@@ -37,6 +37,7 @@ mod call_memory;
 mod calls;
 mod concurrency;
 mod decompile;
+mod helper_effects;
 mod integer;
 pub mod layouts;
 mod lower;
@@ -62,8 +63,8 @@ pub use layouts::{
 pub use packages::{DebugName, DebugObject};
 pub use signatures::{AbiResult, AbiTy, FuncSig, RetClass, summarize};
 pub use tables::{
-    RecoveryBackend, RecoverySnapshot, RecoveryState, ResolutionArtifact, ResolveOptions,
-    SiteResolution, analyze_resolution, recover_resolving, resolution_view,
+    RECOVERY_STATE_VERSION, RecoveryBackend, RecoverySnapshot, RecoveryState, ResolutionArtifact,
+    ResolveOptions, SiteResolution, analyze_resolution, recover_resolving, resolution_view,
 };
 pub mod annotations;
 use std::{
@@ -359,6 +360,7 @@ fn lift_with<'ctx>(
             dispatch,
             syscall,
             tables: &cfg.jump_tables,
+            incomplete_tables: &cfg.incomplete_jump_tables,
             indirect_calls: &cfg.indirect_calls,
             imports: &cfg.imports,
             target_marker,

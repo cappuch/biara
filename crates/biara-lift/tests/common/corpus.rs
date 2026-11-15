@@ -200,6 +200,20 @@ pub fn t_tramp(a: u64, b: u64) -> u64 {
     t_arith(b, a).wrapping_add(1)
 }
 
+pub fn t_live(a: u64, b: u64) -> u64 {
+    let mix = |v: u64| v.wrapping_mul(7).wrapping_add(1);
+    let x = mix(a);
+    let r = if b & 1 != 0 { x } else { mix(b) };
+    r.wrapping_mul(3).wrapping_add(x)
+}
+
+pub fn t_swap(a: u64, b: u64) -> u64 {
+    let mix = |v: u64| v.wrapping_mul(7).wrapping_add(1);
+    let (x, y) = (mix(a), mix(b));
+    let (p, q) = if b & 1 != 0 { (x, y) } else { (y, x) };
+    p.wrapping_mul(3).wrapping_add(q)
+}
+
 pub fn t_structs(a: u64, b: u64) -> u64 {
     let walk = (a ^ b)
         .wrapping_mul(7)
@@ -232,6 +246,8 @@ pub const FUNCTIONS: &[(&str, Ref)] = &[
     ("t_tail", t_tail),
     ("t_structs", t_structs),
     ("t_tramp", t_tramp),
+    ("t_live", t_live),
+    ("t_swap", t_swap),
 ];
 
 /// Map the image's segments at their addresses (read-write: lifted code

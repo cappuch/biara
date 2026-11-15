@@ -7,7 +7,11 @@
 //!    arguments, returning its return registers. Registers are locals, the
 //!    stack frame is a local array; direct calls pass arguments, imports and
 //!    pointers are called with the convention's argument registers, system
-//!    calls go to `biara_syscall`. Established floating-point/vector lanes
+//!    calls go to `biara_syscall`. An indirect call whose targets are all
+//!    recovered calls them directly. Otherwise, in executable C
+//!    (`prepare_c`), it first tries the lifted functions (`biara_call_at`);
+//!    in C for reading (`prepare_c_selected`), it is one call through the
+//!    pointer. Established floating-point/vector lanes
 //!    become typed ABI parameters/results; untyped or conflicting bit traffic
 //!    retains raw words. Helper-visible state remains in `biara_cpu`, with
 //!    bit-preserving transfers between that state and typed ABI slots.
@@ -16,7 +20,10 @@
 //!    recovery CFG, ABI tables, and libtcg guard.
 //! 3. Function-local optimisation (no inlining): registers and frame slots
 //!    that never escape become SSA values; flag computations no caller
-//!    reads disappear.
+//!    reads disappear. QEMU helpers that compute one flag from an operation
+//!    argument (`ArchSpec::specialized_helpers`) are inlined from the helper
+//!    bitcode where that operation is constant by then, so
+//!    `helper_cc_compute_nz(x, _, CC_OP_LOGICQ)` reads as `x`.
 //!    Jump tables become switches on their index (cpp/index_switches.cpp).
 //!    Guest strings and import shapes are recovered from constant guest
 //!    memory. `PreparedC::transform` does this; the image may go away
@@ -167,6 +174,12 @@ struct HelperRole {
     nreads: u32,
     writes: *const u32,
     nwrites: u32,
+    /// The registers it reads and writes when env itself is its only pointer
+    /// argument, from its bitcode (`helper_effects`); null when not known.
+    env_reads: *const u32,
+    nenv_reads: u32,
+    env_writes: *const u32,
+    nenv_writes: u32,
 }
 
 #[repr(C)]
@@ -182,6 +195,9 @@ struct Conv {
     sys_ret: u32,
     env_size: u64,
     margin: u64,
+    /// Indirect calls to unknown targets first try the lifted functions
+    /// (`biara_call_at`); otherwise they only call through the pointer.
+    dispatch: u32,
 }
 
 #[repr(C)]
@@ -236,6 +252,14 @@ unsafe extern "C" {
     fn biara_fold_frames(module: *mut c_void) -> usize;
     fn biara_div_sugar(module: *mut c_void) -> usize;
     fn biara_dup_returns(module: *mut c_void) -> usize;
+    fn biara_specialize_helpers(
+        module: *mut c_void,
+        path: *const c_char,
+        names: *const *const c_char,
+        selectors: *const u32,
+        n: usize,
+        err: *mut *mut c_char,
+    ) -> std::ffi::c_long;
     fn biara_index_switches(module: *mut c_void, read: ReadFn, ctx: *mut c_void) -> usize;
     fn biara_parallel_function_passes(
         module: *mut c_void,
@@ -460,6 +484,15 @@ struct Summaries {
     fns: Vec<(u64, String)>,
     entries: BTreeMap<u64, String>,
     guest_bits: u32,
+    specialize: Option<Specialize>,
+}
+
+/// QEMU helpers to inline where their operation argument is constant
+/// (`ArchSpec::specialized_helpers`), and the bitcode that defines them.
+struct Specialize {
+    bitcode: CString,
+    symbols: Vec<CString>,
+    selectors: Vec<u32>,
 }
 
 /// C decompilation after lifting and the ABI form, but before the
@@ -497,7 +530,8 @@ pub struct TransformedC<'ctx> {
 }
 
 /// Shared core of [`prepare_c`] and [`prepare_c_selected`]: compute unique
-/// names over `entries`, lift with `analysis`, and lower to ABI form.
+/// names over `entries`, lift with `analysis`, and lower to ABI form, with
+/// unknown indirect calls trying the lifted functions when `dispatch`.
 /// `entries` selects the functions that get bodies; when `None`, every
 /// function of `cfg` is lowered. Callers pass `&cfg.functions.keys()`
 /// themselves only via [`prepare_c`]; [`prepare_c_selected`] passes the
@@ -515,6 +549,7 @@ fn prepare_c_with<'ctx>(
     banner: &str,
     data: &BTreeMap<u64, (String, u64)>,
     analysis: Option<crate::Analysis<'_>>,
+    dispatch: bool,
 ) -> Result<PreparedC<'ctx>, Error> {
     let spec = cfg.spec(&info.arch)?;
     // Unique names (symbols repeat across static functions): C needs them,
@@ -1190,6 +1225,29 @@ fn prepare_c_with<'ctx>(
         })
         .collect::<Result<_, Error>>()?;
     let none = (others.clone(), others.clone());
+    let helper_symbols: Vec<String> = cfg.helpers().map(|h| h.symbol()).collect();
+    let effects = crate::helper_effects::effects(info, helper_symbols.iter().map(String::as_str))?;
+    // Non-register globals narrowed to what the helper's bitcode touches.
+    let narrowed = |listed: &(Vec<u32>, Vec<u32>), access: &crate::helper_effects::Access| {
+        let keep = |r: &u32, bits: &[bool]| {
+            !others.contains(r) || bits.get(reg_ids[*r as usize] as usize).is_none_or(|&b| b)
+        };
+        (
+            listed
+                .0
+                .iter()
+                .copied()
+                .filter(|r| keep(r, &access.reads))
+                .collect::<Vec<u32>>(),
+            listed
+                .1
+                .iter()
+                .copied()
+                .filter(|r| keep(r, &access.writes))
+                .collect::<Vec<u32>>(),
+        )
+    };
+    let mut env_only: Vec<Option<(Vec<u32>, Vec<u32>)>> = Vec::new();
     let mut helper_syms: Vec<CString> = Vec::new();
     let mut roles = Vec::new();
     for h in cfg.helpers() {
@@ -1201,6 +1259,10 @@ fn prepare_c_with<'ctx>(
         let regs = listed
             .get(h.name.as_str())
             .or(spec.helper_regs_complete.then_some(&none));
+        env_only.push(
+            regs.zip(effects.get(&h.symbol()))
+                .map(|(r, a)| narrowed(r, a)),
+        );
         helper_syms.push(CString::new(h.symbol()).unwrap());
         let pure = h.flags & call_flags::NO_SIDE_EFFECTS != 0;
         roles.push((
@@ -1213,7 +1275,8 @@ fn prepare_c_with<'ctx>(
     let helpers: Vec<HelperRole> = helper_syms
         .iter()
         .zip(&roles)
-        .map(|(s, &(mode, regs))| HelperRole {
+        .zip(&env_only)
+        .map(|((s, &(mode, regs)), env)| HelperRole {
             symbol: s.as_ptr(),
             mode,
             listed: u32::from(regs.is_some()),
@@ -1221,6 +1284,10 @@ fn prepare_c_with<'ctx>(
             nreads: regs.map_or(0, |r| r.0.len() as u32),
             writes: regs.map_or(std::ptr::null(), |r| r.1.as_ptr()),
             nwrites: regs.map_or(0, |r| r.1.len() as u32),
+            env_reads: env.as_ref().map_or(std::ptr::null(), |r| r.0.as_ptr()),
+            nenv_reads: env.as_ref().map_or(0, |r| r.0.len() as u32),
+            env_writes: env.as_ref().map_or(std::ptr::null(), |r| r.1.as_ptr()),
+            nenv_writes: env.as_ref().map_or(0, |r| r.1.len() as u32),
         })
         .collect();
 
@@ -1246,6 +1313,7 @@ fn prepare_c_with<'ctx>(
         sys_ret: by_name(spec.syscall.results[0])?,
         env_size: info.env_size as u64,
         margin: MARGIN,
+        dispatch: u32::from(dispatch),
     };
     let mut err = std::ptr::null_mut();
     let failed = unsafe {
@@ -1433,13 +1501,28 @@ fn prepare_c_with<'ctx>(
             fns,
             entries,
             guest_bits: info.guest_bits,
+            specialize: info
+                .helpers
+                .as_ref()
+                .filter(|_| !spec.specialized_helpers.is_empty())
+                .map(|path| Specialize {
+                    bitcode: CString::new(path.as_os_str().as_encoded_bytes()).unwrap(),
+                    symbols: spec
+                        .specialized_helpers
+                        .iter()
+                        .map(|(name, _)| CString::new(format!("helper_{name}")).unwrap())
+                        .collect(),
+                    selectors: spec.specialized_helpers.iter().map(|&(_, i)| i).collect(),
+                }),
         },
     })
 }
 
-/// Lift every function of `cfg` and put it in ABI form. The returned
-/// stage owns its module and compact summaries only; drop `cfg`, `abis`,
-/// and the libtcg guard before the expensive `transform`/`render`.
+/// Lift every function of `cfg` and put it in ABI form, as C that compiles
+/// and runs: an indirect call to an unrecovered target first tries the lifted
+/// functions (`biara_call_at`). The returned stage owns its module and compact
+/// summaries only; drop `cfg`, `abis`, and the libtcg guard before the
+/// expensive `transform`/`render`.
 #[allow(clippy::too_many_arguments)]
 pub fn prepare_c<'ctx>(
     cx: &'ctx Context,
@@ -1451,13 +1534,17 @@ pub fn prepare_c<'ctx>(
     banner: &str,
     data: &BTreeMap<u64, (String, u64)>,
 ) -> Result<PreparedC<'ctx>, Error> {
-    prepare_c_with(cx, machine, info, cfg, abis, name_of, banner, data, None)
+    prepare_c_with(
+        cx, machine, info, cfg, abis, name_of, banner, data, None, true,
+    )
 }
 
 /// Lower only `selection` (plus directly referenced callees/stubs, as
 /// declarations with recovered signatures) before/after the shared ABI
-/// lowering. Unknown addresses resolve nowhere and are skipped; a
-/// full-CFG selection lowers identically to [`prepare_c`].
+/// lowering. Unknown addresses resolve nowhere and are skipped. This is the
+/// form for reading: an indirect call to an unrecovered target is one call
+/// through the pointer, without [`prepare_c`]'s dispatch to lifted
+/// functions; otherwise a full-CFG selection lowers as [`prepare_c`] does.
 #[allow(clippy::too_many_arguments)]
 pub fn prepare_c_selected<'ctx>(
     cx: &'ctx Context,
@@ -1473,7 +1560,9 @@ pub fn prepare_c_selected<'ctx>(
     if selection.iter().all(|e| cfg.functions.contains_key(e))
         && selection.len() == cfg.functions.len()
     {
-        return prepare_c_with(cx, machine, info, cfg, abis, name_of, banner, data, None);
+        return prepare_c_with(
+            cx, machine, info, cfg, abis, name_of, banner, data, None, false,
+        );
     }
     let view = crate::resolution_view(cfg, selection);
     let view_abis: BTreeMap<u64, FunctionAbi> = view
@@ -1514,6 +1603,7 @@ pub fn prepare_c_selected<'ctx>(
             only: &known,
             target_markers: false,
         }),
+        false,
     )
 }
 impl<'ctx> PreparedC<'ctx> {
@@ -1546,7 +1636,7 @@ impl<'ctx> PreparedC<'ctx> {
         options: DecompileOptions,
     ) -> Result<TransformedC<'ctx>, Error> {
         let PreparedC { module, summaries } = self;
-        simplify(&module, machine, options)?;
+        simplify(&module, machine, options, summaries.specialize.as_ref())?;
         // Jump tables: switch on the index rather than on code addresses.
         let indexed = unsafe {
             biara_index_switches(
@@ -1556,10 +1646,13 @@ impl<'ctx> PreparedC<'ctx> {
             )
         };
         if indexed > 0 {
+            // A complete table's switch has no default; with two
+            // destinations it reads as an `if` (`switch-range-to-icmp`).
             function_passes(
                 &module,
                 machine,
-                c"function(simplifycfg,instcombine<no-verify-fixpoint>,adce,simplifycfg)",
+                c"function(simplifycfg<switch-range-to-icmp>,instcombine<no-verify-fixpoint>,adce,\
+                 simplifycfg<switch-range-to-icmp>)",
                 options,
             )?;
         }
@@ -2302,6 +2395,31 @@ fn apply_global_renames(
     Ok(())
 }
 
+/// Inline the `specialize` helpers at calls whose operation argument is
+/// constant (cpp/specialize.cpp); the others stay calls.
+fn specialize_helpers(module: &Module<'_>, specialize: &Specialize) -> Result<usize, Error> {
+    let names: Vec<*const c_char> = specialize.symbols.iter().map(|s| s.as_ptr()).collect();
+    let mut error = std::ptr::null_mut();
+    let inlined = unsafe {
+        biara_specialize_helpers(
+            module.as_mut_ptr().cast(),
+            specialize.bitcode.as_ptr(),
+            names.as_ptr(),
+            specialize.selectors.as_ptr(),
+            names.len(),
+            &mut error,
+        )
+    };
+    if inlined < 0 {
+        let message = unsafe { CStr::from_ptr(error) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { libc_free(error.cast()) };
+        return Err(Error::Llvm(message));
+    }
+    Ok(inlined as usize)
+}
+
 unsafe extern "C" {
     #[link_name = "free"]
     fn libc_free(p: *mut c_void);
@@ -2342,11 +2460,13 @@ fn function_passes(
 
 /// Function-local cleanup of the ABI form: promote registers, fold the
 /// frame address arithmetic into the frame allocas (until nothing new
-/// folds), then the usual scalar pipeline; no inlining.
+/// folds), inline `specialize` helpers whose operation is now constant,
+/// then the usual scalar pipeline; no other inlining.
 fn simplify(
     module: &Module<'_>,
     machine: &TargetMachine,
     options: DecompileOptions,
+    specialize: Option<&Specialize>,
 ) -> Result<(), Error> {
     let run = |p: &CStr| function_passes(module, machine, p, options);
     for _ in 0..4 {
@@ -2356,6 +2476,10 @@ fn simplify(
         if folded == 0 {
             break;
         }
+    }
+    // x86 condition codes: `helper_cc_compute_nz(x, _, CC_OP_LOGICQ)` is `x`.
+    if let Some(specialize) = specialize {
+        specialize_helpers(module, specialize)?;
     }
     run(
         c"function(sroa,instcombine<no-verify-fixpoint>,simplifycfg,gvn,dse,adce,\

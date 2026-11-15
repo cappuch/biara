@@ -2385,6 +2385,7 @@ mod tests {
             env_global: 0,
             insn_start_words: 1,
             env_size: 0,
+            helpers: None,
         }
     }
 

@@ -430,3 +430,169 @@ __asm__(".text\n.globl frame\n.type frame,@function\nframe:\n"
         }
     }
 }
+
+/// Recover `binary` from its function symbols with workers started from
+/// `worker`; the graph, or the engine's error.
+fn recover_with_worker(
+    binary: &Path,
+    database: &Path,
+    worker: &Path,
+    workers: usize,
+) -> Result<biara_cfg::Cfg, String> {
+    let image = Image::load(binary).unwrap();
+    let entries: Vec<u64> = image.function_starts().into_iter().collect();
+    let opts = biara_lift::ResolveOptions {
+        cfg: biara_cfg::Options {
+            os: image.os,
+            imports: image.imports.clone(),
+            function_starts: image.function_starts(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut session = biara_engine::Session::open(
+        biara_engine::Options {
+            binary: binary.to_owned(),
+            libtcg: biara_tcg::Libtcg::find(image.arch).unwrap(),
+            cpu: None,
+            database: Some(database.to_owned()),
+            workers,
+            memory_budget: 4 << 30,
+            executable: worker.to_owned(),
+        },
+        &entries,
+        &opts,
+    )
+    .map_err(|e| e.to_string())?;
+    let cfg = biara_lift::recover_resolving(
+        &mut session,
+        &biara_lift::analysis_machine().unwrap(),
+        &|pc| image.code_at(pc),
+        &|addr, buf| image.read_const(addr, buf),
+        &entries,
+        opts,
+    )
+    .map_err(|e| e.to_string())?;
+    session.finish(&cfg).map_err(|e| e.to_string())?;
+    Ok(cfg)
+}
+
+#[test]
+fn a_worker_dying_in_one_resolution_is_retried_alone_then_left_unresolved() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("engine-worker-exit-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("program.c");
+    let binary = dir.join("program");
+    fs::write(
+        &source,
+        r#"
+#define KEEP __attribute__((noinline, used))
+KEEP long one(long v) { __asm__ volatile("" : "+r"(v)); return v + 1; }
+KEEP long two(long v) { __asm__ volatile("" : "+r"(v)); return v * 2; }
+extern long (*const ops[2])(long);
+__asm__(".section .rodata\n.balign 8\n.globl ops\nops: .quad one, two\n.text\n");
+KEEP long pick(unsigned long i, long v) { return ops[i & 1](v) + 3; }
+int main(int argc, char **argv) { (void)argv; return pick(argc, 2) == 0; }
+"#,
+    )
+    .unwrap();
+    let built = Command::new(env!("BIARA_CLANG"))
+        .args(["-O2", "-fno-builtin", "-fno-pie", "-no-pie", "-fuse-ld=bfd"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .unwrap();
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let image = Image::load(&binary).unwrap();
+    let pick = image.symbol("pick").unwrap().addr;
+    let site = |cfg: &biara_cfg::Cfg| {
+        cfg.functions[&pick]
+            .blocks
+            .iter()
+            .copied()
+            .find(|pc| {
+                cfg.blocks[pc]
+                    .exits
+                    .iter()
+                    .any(|x| matches!(x.kind, biara_cfg::ExitKind::IndirectCall { .. }))
+            })
+            .expect("pick calls through the table")
+    };
+
+    // With the real worker, the call through the table resolves to both entries.
+    let real = Path::new(env!("CARGO_BIN_EXE_biara"));
+    let cfg = recover_with_worker(&binary, &dir.join("real.sqlite"), real, 2).unwrap();
+    let targets = &cfg.indirect_calls[&site(&cfg)].targets;
+    assert_eq!(targets.len(), 2, "{targets:?}");
+
+    // The real worker, killed at a resolution request (frame tag 1) when
+    // `guard` holds: as if out of memory.
+    let worker = |name: &str, guard: &str| {
+        let path = dir.join(name);
+        fs::write(
+            &path,
+            format!(
+                r#"#!/bin/sh
+# The real worker (exec'd, so the coordinator stays its parent), killed by
+# the filter feeding it at a resolution request (frame tag 1) if the guard
+# holds. The filter takes stdin explicitly: a background list otherwise
+# reads /dev/null.
+fifo="$(mktemp -u)"
+mkfifo "$fifo"
+(
+    exec 3> "$fifo"
+    while :; do
+        length=$(dd bs=1 count=4 2>/dev/null | od -An -tu4 | tr -d ' ')
+        [ -n "$length" ] || exit 0
+        tag=$(dd bs=1 count=1 2>/dev/null | od -An -tu1 | tr -d ' ')
+        if [ "$tag" = 1 ] && {guard}; then
+            kill -9 $$
+            exit 0
+        fi
+        {{ printf "$(printf '\\%03o' $((length & 255)) $((length >> 8 & 255)) $((length >> 16 & 255)) $((length >> 24 & 255)) "$tag")"
+           dd bs=1 count=$((length - 1)) 2>/dev/null; }} >&3
+    done
+) <&0 >/dev/null &
+exec "{real}" "$1" "$2" < "$fifo"
+"#,
+                real = real.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    };
+
+    // Two workers in 4 GiB get 1 GiB each; alone, one gets both shares. A job
+    // that needs more than a share (here: dies under a 2 GB address-space
+    // cap) is resolved by the retry on its own.
+    let starved = worker("starved-worker", r#"[ "$(ulimit -v)" -lt 2000000 ]"#);
+    let cfg = recover_with_worker(&binary, &dir.join("starved.sqlite"), &starved, 2).unwrap();
+    let targets = &cfg.indirect_calls[&site(&cfg)].targets;
+    assert_eq!(targets.len(), 2, "{targets:?}");
+
+    // A worker that dies at every resolution request, alone too, costs only
+    // those results: recovery completes without them.
+    let dying = worker("dying-worker", "true");
+    let cfg = recover_with_worker(&binary, &dir.join("dying.sqlite"), &dying, 2).unwrap();
+    let site = site(&cfg);
+    assert!(
+        cfg.indirect_calls
+            .get(&site)
+            .is_none_or(|t| t.targets.is_empty()),
+        "{:?}",
+        cfg.indirect_calls.get(&site)
+    );
+    assert!(
+        cfg.issues()
+            .any(|i| i == biara_cfg::CfgIssue::UnknownIndirectCall { address: site }),
+        "the unresolved call is reported"
+    );
+}

@@ -275,3 +275,40 @@ T t_tramp(u64 a, u64 b)
 {
     return tramp(b, a) + 1;
 }
+
+/* `x` is still read after the join that merges it with the other path's
+ * value: one C variable for both would lose it on that path. */
+static __attribute__((noinline)) u64 mix(u64 v)
+{
+    return v * 7 + 1;
+}
+
+T t_live(u64 a, u64 b)
+{
+    u64 x = mix(a);
+    u64 r = (b & 1) ? x : mix(b);
+    return r * 3 + x;
+}
+
+/* Two values cross over at a join: the copies on an edge happen at once. */
+static volatile u64 trail;
+
+static __attribute__((noinline)) void note(u64 v)
+{
+    trail = v;
+}
+
+T t_swap(u64 a, u64 b)
+{
+    u64 x = mix(a), y = mix(b), p, q;
+    if (b & 1) {
+        p = x;
+        q = y;
+        note(1);
+    } else {
+        p = y;
+        q = x;
+        note(2);
+    }
+    return p * 3 + q;
+}

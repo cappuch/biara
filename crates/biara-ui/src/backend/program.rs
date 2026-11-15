@@ -161,7 +161,6 @@ impl Index {
                     .or_insert(entry);
             }
         }
-        let mut callers: HashMap<u64, u32> = HashMap::new();
         for block in cfg.blocks.values() {
             let site = block.insns.last().copied().unwrap_or(block.pc());
             let function = index.owners.get(&block.pc()).copied().unwrap_or(0);
@@ -176,7 +175,6 @@ impl Index {
                                 kind: XrefKind::Call,
                             },
                         );
-                        *callers.entry(target).or_default() += 1;
                     }
                     ExitKind::IndirectCall {
                         slot: Some(slot), ..
@@ -209,8 +207,7 @@ impl Index {
             index.scan_constants(image, block, function);
         }
         for xs in index.xrefs.values_mut() {
-            xs.sort();
-            xs.dedup();
+            one_per_instruction(xs);
         }
         for (&entry, f) in &cfg.functions {
             let blocks: Vec<_> = f.blocks.iter().filter_map(|b| cfg.blocks.get(b)).collect();
@@ -229,7 +226,11 @@ impl Index {
                 blocks: f.blocks.len() as u32,
                 insns,
                 calls: f.calls.len() as u32,
-                callers: callers.get(&entry).copied().unwrap_or(0),
+                callers: index
+                    .xrefs_to(entry)
+                    .iter()
+                    .filter(|x| x.kind == XrefKind::Call)
+                    .count() as u32,
                 returns: f.returns,
                 kind: if stub.is_some() {
                     FunctionKind::Stub
@@ -474,6 +475,14 @@ fn entry(addr: u64, bytes: &[u8], wide: bool) -> StringEntry {
     }
 }
 
+/// One reference per instruction and kind, in address order. Blocks of several functions can
+/// end at the same instruction (recovery keeps a function's own block through a tail it
+/// shares with another); the lowest function keeps the reference, as it keeps the block.
+fn one_per_instruction(xs: &mut Vec<Xref>) {
+    xs.sort_by_key(|x| (x.from, x.kind, x.function));
+    xs.dedup_by_key(|x| (x.from, x.kind));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -518,5 +527,30 @@ mod tests {
         let e = entry(0, &long, false);
         assert_eq!(e.bytes as usize, long.len());
         assert!(e.text.ends_with('…') && e.text.chars().count() == STRING_CAP + 1);
+    }
+
+    #[test]
+    fn an_instruction_ending_several_functions_blocks_is_one_reference() {
+        let x = |from, function, kind| Xref {
+            from,
+            function,
+            kind,
+        };
+        let mut xs = vec![
+            x(0x30, 0x20, XrefKind::Call),
+            x(0x30, 0x10, XrefKind::Data),
+            x(0x30, 0x10, XrefKind::Call),
+            x(0x40, 0x10, XrefKind::Call),
+            x(0x30, 0x20, XrefKind::Call),
+        ];
+        one_per_instruction(&mut xs);
+        assert_eq!(
+            xs,
+            [
+                x(0x30, 0x10, XrefKind::Call),
+                x(0x30, 0x10, XrefKind::Data),
+                x(0x40, 0x10, XrefKind::Call),
+            ]
+        );
     }
 }

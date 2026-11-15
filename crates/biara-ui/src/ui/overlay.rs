@@ -1,6 +1,6 @@
-//! Modal dialogs: go to anything, the command palette, and rename.
+//! Modal dialogs: go to anything, the command palette, rename and the block limit.
 //!
-//! One overlay serves all three. It owns a text field, a ranked list of results and a
+//! One overlay serves them all. It owns a text field, a ranked list of results and a
 //! selection; what a result does depends on the mode.
 
 use rune::{Color, El, FileDialogOptions, Key, KeyEvent, TextEdit, Tx, col, el, row, text};
@@ -8,13 +8,18 @@ use rune_kit::TextInput;
 
 use crate::backend::NameKind;
 
-use super::{App, MainTab, bottom::BottomTab, parse_addr, theme::*, widgets};
+use super::{App, MainTab, bottom::BottomTab, parse_addr, parse_count, theme::*, widgets};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     Goto,
     Commands,
-    Rename { addr: u64, kind: NameKind },
+    Rename {
+        addr: u64,
+        kind: NameKind,
+    },
+    /// How many blocks recovery may reach; changing it analyses the binary again.
+    BlockLimit,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,10 +34,11 @@ pub enum Command {
     Xrefs,
     Output,
     ToggleDemangle,
+    BlockLimit,
 }
 
 impl Command {
-    const ALL: [(Command, &'static str, &'static str); 13] = [
+    const ALL: [(Command, &'static str, &'static str); 14] = [
         (Command::Goto, "Go to address or name…", "G"),
         (Command::Rename, "Rename the current symbol…", "N"),
         (Command::OpenFile, "Open binary…", "Ctrl+O"),
@@ -50,6 +56,7 @@ impl Command {
         (Command::Xrefs, "Show cross-references", "X"),
         (Command::Output, "Show output", ""),
         (Command::ToggleDemangle, "Toggle demangled names", ""),
+        (Command::BlockLimit, "Set the block limit…", ""),
     ];
 }
 
@@ -93,6 +100,11 @@ const MAX_HITS: usize = 14;
 pub fn open(app: &mut App, mode: Mode) {
     let initial = match mode {
         Mode::Rename { addr, .. } => app.name_of(addr).unwrap_or_default(),
+        // Stopped at the limit: offer twice it, the usual next step.
+        Mode::BlockLimit => app
+            .block_limit_reached()
+            .map_or(app.block_limit(), |limit| limit.saturating_mul(2))
+            .to_string(),
         _ => String::new(),
     };
     app.overlay = State {
@@ -262,6 +274,16 @@ pub fn submit(app: &mut App, tx: &mut Tx) {
                 Err(e) => app.overlay.error = Some(e.to_string()),
             }
         }
+        Some(Mode::BlockLimit) => match parse_count(&app.overlay.input.text) {
+            Some(limit) => {
+                close(app);
+                app.set_block_limit(limit);
+            }
+            None => {
+                app.overlay.error =
+                    Some("Enter a positive number of blocks, such as 2000000 or 2M".into())
+            }
+        },
         Some(_) => {
             let Some(hit) = app.overlay.hits.get(app.overlay.selected).cloned() else {
                 return;
@@ -303,6 +325,7 @@ pub fn command(app: &mut App, c: Command, tx: &mut Tx) {
         Command::Xrefs => app.bottom_tab = BottomTab::Xrefs,
         Command::Output => app.bottom_tab = BottomTab::Output,
         Command::ToggleDemangle => app.toggle_demangle(),
+        Command::BlockLimit => open(app, Mode::BlockLimit),
     }
 }
 
@@ -377,6 +400,13 @@ pub fn view(app: &App) -> Option<El> {
         Mode::Goto => ("Go to", "Address, function, import or string".to_owned()),
         Mode::Commands => ("Commands", "Type a command".to_owned()),
         Mode::Rename { addr, .. } => ("Rename", format!("New name for {}", app.label(addr))),
+        Mode::BlockLimit => (
+            "Block limit",
+            format!(
+                "Blocks to recover before stopping (now {})",
+                app.block_limit()
+            ),
+        ),
     };
     let input = TextInput::new(&app.overlay.input)
         .placeholder(placeholder)

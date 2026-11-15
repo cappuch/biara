@@ -19,6 +19,13 @@ mod parallelism;
 mod quality;
 mod service;
 
+// jemalloc for the whole process, LLVM included: decompiling a huge function
+// spends much of its time allocating, and glibc's allocator slows sharply as
+// memory fragments.
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 static PROCESS_STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -93,9 +100,10 @@ struct LiftArgs {
     /// function tables, unwind/function lists (ELF `.eh_frame`, PE `.pdata`,
     /// Mach-O `LC_FUNCTION_STARTS`) and code pointers.
     at: Vec<String>,
-    /// Stop after this many translation blocks.
-    #[arg(long, default_value_t = 1_000_000)]
-    max_blocks: usize,
+    /// Stop after this many translation blocks. Default: one per 4 bytes of
+    /// executable code, at least 1,000,000.
+    #[arg(long)]
+    max_blocks: Option<usize>,
     #[arg(long, value_enum, default_value_t = Emit::Llvm)]
     emit: Emit,
     /// LLVM optimisation level (default<O{N}> pipeline); 0 skips it.
@@ -614,9 +622,10 @@ struct DiffArgs {
     /// uncertain, added, removed. Default: all but same.
     #[arg(long, value_delimiter = ',')]
     show: Vec<String>,
-    /// Stop after this many translation blocks per binary.
-    #[arg(long, default_value_t = 1_000_000)]
-    max_blocks: usize,
+    /// Stop after this many translation blocks per binary. Default: one per
+    /// 4 bytes of its executable code, at least 1,000,000.
+    #[arg(long)]
+    max_blocks: Option<usize>,
     /// QEMU CPU model.
     #[arg(long)]
     cpu: Option<String>,
@@ -641,7 +650,8 @@ struct DiffArgs {
 /// the locked libtcg for its architecture.
 #[derive(Clone, Copy)]
 struct RecoveryBudget {
-    max_blocks: usize,
+    /// `None`: scaled to the code size (`biara_cfg::block_budget`).
+    max_blocks: Option<usize>,
     workers: usize,
     memory_bytes: u64,
 }
@@ -676,7 +686,9 @@ fn recover(
     let opts = biara_lift::ResolveOptions {
         cfg: biara_cfg::Options {
             os: image.os,
-            max_blocks: budget.max_blocks,
+            max_blocks: budget
+                .max_blocks
+                .unwrap_or_else(|| biara_cfg::block_budget(image.code_bytes())),
             imports: image.imports.clone(),
             discovery,
             function_starts: image.function_starts(),

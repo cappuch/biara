@@ -201,13 +201,19 @@ pub fn status_bar(app: &App) -> El {
             (p.warn, format!("{}{counts}", stage.label()))
         }
         Load::Failed(e) => (p.bad, e.lines().next().unwrap_or("failed").to_owned()),
-        Load::Ready => (
-            p.good,
-            format!(
-                "Analysis complete · {} functions",
-                app.index.functions.len()
-            ),
-        ),
+        Load::Ready => {
+            let functions = app.index.functions.len();
+            // Recovery stopped at its block limit: code past it is not analysed.
+            match app.block_limit_reached() {
+                Some(limit) => (
+                    p.warn,
+                    format!(
+                        "Analysis stopped at its limit of {limit} blocks · {functions} functions"
+                    ),
+                ),
+                None => (p.good, format!("Analysis complete · {functions} functions")),
+            }
+        }
     };
     let mut bar = row()
         .w_full()
@@ -217,8 +223,24 @@ pub fn status_bar(app: &App) -> El {
         .items_center()
         .fill(p.panel)
         .child(el().size(7.0, 7.0).radius(4.0).fill(dot))
-        .child(text(message).font(SMALL).color(p.muted))
-        .child(el().grow(1.0));
+        .child(text(message).font(SMALL).color(p.muted));
+    if matches!(app.load, Load::Ready) && app.block_limit_reached().is_some() {
+        bar = bar.child(
+            row()
+                .key("raise-limit")
+                .h(18.0)
+                .px(8.0)
+                .radius(4.0)
+                .items_center()
+                .fill(p.raised)
+                .hover(p.hover)
+                .on_press_tx(|s: &mut App, _tx| {
+                    super::overlay::open(s, super::overlay::Mode::BlockLimit)
+                })
+                .child(text("Raise limit…").font(SMALL_MEDIUM).color(p.text)),
+        );
+    }
+    bar = bar.child(el().grow(1.0));
     if matches!(app.load, Load::Ready) {
         let at = match app.function_of(app.cur) {
             Some(f) if f != app.cur => format!("{}+{:#x}", app.label(f), app.cur - f),
