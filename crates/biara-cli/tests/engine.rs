@@ -541,10 +541,11 @@ int main(int argc, char **argv) { (void)argv; return pick(argc, 2) == 0; }
                 r#"#!/bin/sh
 # The real worker (exec'd, so the coordinator stays its parent), killed by
 # the filter feeding it at a resolution request (frame tag 1) if the guard
-# holds. The filter takes stdin explicitly: a background list otherwise
-# reads /dev/null.
+# holds. The filter gets stdin through fd 4: a background list reads
+# /dev/null, and dash swaps that in before applying a `<&0` redirection.
 fifo="$(mktemp -u)"
 mkfifo "$fifo"
+exec 4<&0
 (
     exec 3> "$fifo"
     while :; do
@@ -558,7 +559,8 @@ mkfifo "$fifo"
         {{ printf "$(printf '\\%03o' $((length & 255)) $((length >> 8 & 255)) $((length >> 16 & 255)) $((length >> 24 & 255)) "$tag")"
            dd bs=1 count=$((length - 1)) 2>/dev/null; }} >&3
     done
-) <&0 >/dev/null &
+) <&4 4<&- >/dev/null &
+exec 4<&-
 exec "{real}" "$1" "$2" < "$fifo"
 "#,
                 real = real.display()
