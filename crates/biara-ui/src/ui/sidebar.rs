@@ -5,7 +5,7 @@ use std::borrow::Cow;
 use rune::{El, GrowthSpec, ScrollSpec, Tx, col, el, row, text};
 use rune_kit::TextInput;
 
-use crate::backend::Index;
+use biara_session::Index;
 
 use super::{App, code::row_key, theme::*, widgets};
 
@@ -226,7 +226,7 @@ fn function_row(s: &App, i: usize) -> El {
     let entry = f.entry;
     let current = s.function_of(s.cur) == Some(entry);
     let name = s.display_of(entry).unwrap_or_else(|| f.name.clone());
-    let stub = f.kind == crate::backend::FunctionKind::Stub;
+    let stub = f.kind == biara_session::FunctionKind::Stub;
     row()
         .w_full()
         .h(ROW)

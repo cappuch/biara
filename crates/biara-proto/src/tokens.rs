@@ -5,8 +5,8 @@
 //! Renames are client-side text substitutions over tokens carrying a
 //! [`SymbolRef`]: replacing the bytes of every token whose symbol matches
 //! yields the renamed body without re-rendering. Tokens without a symbol
-//! are never renamed, even when their text equals a symbol name (locals,
-//! parameters, comments and string literals stay untouched). Symbol
+//! are never renamed, even when their text equals a symbol name (member
+//! fields, comments and string literals stay untouched). Symbol
 //! identity is the referenced address, keyed by [`SymbolRef`]
 //! (functions/globals by address, types by layout id scoped to the
 //! referencing function record), never the current display text. The
@@ -39,6 +39,10 @@ pub enum SymbolRef {
     /// whose facts own the id (0 when the record predates scoped export);
     /// the rename map keys the full triple, never the bare layout id.
     Type { layout: u32, #[serde(default)] function: u64 },
+    /// A local or parameter of the record's own function, by the name the renderer emitted
+    /// for it (`arg0`, `value12`): unique within the record and never equal to a nonlocal
+    /// spelling. Member-field sides (`p->field`) are never locals.
+    Local { name: String },
 }
 
 /// What lexical class a [`Token`] is; serialized as its snake_case name
@@ -71,15 +75,16 @@ pub struct Token {
     /// `symbol`, never from position guessing.
     pub kind: TokenKind,
     /// Semantic reference, when the lexer attributed this token to a
-    /// known symbol. `None` for locals, parameters, literals, comments,
-    /// keywords and punctuation: never rename targets.
+    /// known symbol or one of the record's locals. `None` for literals,
+    /// comments, keywords, punctuation and member fields: never rename targets.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub symbol: Option<SymbolRef>,
 }
 /// Substitute renamed symbols into `body` using `tokens`.
 ///
-/// Every token carrying `SymbolRef::Function { address }` (or
-/// `SymbolRef::Global { address }`) whose [`SymbolRef`] is in `renames`
+/// Every token carrying `SymbolRef::Function { address }`,
+/// `SymbolRef::Global { address }` or `SymbolRef::Local { name }` whose [`SymbolRef`] is in
+/// `renames`
 /// is replaced by the mapped text; all other bytes (including unreferenced
 /// tokens whose text happens to match) are kept verbatim. The map is
 /// keyed by [`SymbolRef`] itself: a function address and a global image
@@ -117,7 +122,7 @@ pub fn substitute(
         // that still parses as in-range must not silently substitute the
         // wrong identifier: renamed symbol spans must slice exactly one
         // identifier (no mid-identifier boundaries on either side).
-        if let Some(symbol @ (SymbolRef::Function { .. } | SymbolRef::Global { .. })) = &token.symbol {
+        if let Some(symbol @ (SymbolRef::Function { .. } | SymbolRef::Global { .. } | SymbolRef::Local { .. })) = &token.symbol {
             if renames.contains_key(symbol) {
                 let span = &body[start..end];
                 if span.is_empty() || !span.chars().all(|c| c.is_alphanumeric() || c == '_') {
@@ -132,7 +137,7 @@ pub fn substitute(
             }
         }
         let replacement: Option<&String> = match &token.symbol {
-            Some(symbol @ (SymbolRef::Function { .. } | SymbolRef::Global { .. })) => renames.get(symbol),
+            Some(symbol @ (SymbolRef::Function { .. } | SymbolRef::Global { .. } | SymbolRef::Local { .. })) => renames.get(symbol),
             _ => None,
         };
         match replacement {

@@ -22,7 +22,7 @@ cache, so a library that took 20 s to analyse the first time opens in about 4 s.
 | --- | --- |
 | Disassembly | Every recovered instruction in address order, with function headers, labels with the jumps that reach them, string and symbol annotations, and clickable targets. |
 | Graph | The current function's basic blocks as boxes of disassembly. Green is a taken branch, red a branch not taken, blue plain flow, amber a jump-table case. The current block is outlined. Pan by dragging or scrolling; zoom with Ctrl+scroll or a pinch. |
-| Pseudocode | The decompiler's C. Calls and globals link to their targets; renames apply by address without decompiling again; clicking an identifier highlights every use. |
+| Pseudocode | The decompiler's C. Calls and globals link to their targets; renames of functions, globals and locals apply at draw time without decompiling again, while struct field and signature changes decompile the function again; clicking an identifier highlights every use. Comments show at the end of the line their addresses produced. |
 | Hex | The mapped image as 16-byte rows. Works before analysis finishes. |
 
 The sidebar lists functions, imports, strings and segments, each filterable. The bottom panel
@@ -55,8 +55,10 @@ reusing what the store already translated. The limit lasts until the window clos
 | Key | Action |
 | --- | --- |
 | `G` | Go to an address, function, import or string |
-| `N` | Rename the symbol under the cursor |
+| `N` | Rename the symbol under the cursor, the highlighted local or parameter, or the highlighted struct field in the pseudocode |
 | `X` | Show cross-references |
+| `;` | Add, edit or clear the comment at the cursor |
+| `Y` | Edit the current function's C signature |
 | `Space` | Toggle disassembly and graph |
 | `F5` | Toggle pseudocode |
 | `Up` / `Down` | Move the cursor (disassembly rows, hex rows) |
@@ -65,12 +67,17 @@ reusing what the store already translated. The limit lasts until the window clos
 | `Ctrl+K` | Command palette |
 | `Ctrl+O` | Open a binary |
 
-Names you give are saved in the engine's annotation format under
-`$XDG_DATA_HOME/biara/names/`, so `biara lift --annotations <file>` reads them.
+Names, local names, signatures, declared structs and comments are saved in the engine's
+annotation format under `$XDG_DATA_HOME/biara/names/<binary>-<hash>.json`, so
+`biara lift --annotations <file>` reads them and `biara mcp` can write them while the window
+is open. The window watches that file: changes made by another process appear without
+reopening the binary, and a changed signature or struct declaration decompiles the shown
+function again.
 
 ## Layout of the code
 
-- `src/backend/` has no UI dependency and runs under `cargo test`.
+- `biara-session` (a separate crate, no UI dependency, runs under `cargo test`) owns the
+  models and the background work:
   - `recovery`: opens a binary on a thread and reports stages as events. The engine's worker
     processes are copies of this executable (`main` answers `__worker`).
   - `program`: the recovered program and its indexes (functions, cross-references in both
@@ -80,7 +87,8 @@ Names you give are saved in the engine's annotation format under
     placement, orthogonal routing).
   - `disasm`: `iced-x86` and `yaxpeax-arm`, normalised to coloured spans with flow and targets.
   - `decomp`: a background decompiler, newest request first, results cached.
-  - `names`: user renames.
+  - `notes`: names for functions, data and locals, signatures and comments, in the engine's
+    annotation format; shared safely between the window and `biara mcp`.
   - `demangle`: Itanium, MSVC and Rust names, in a short and a full form.
 - `src/ui/` is the window: state and navigation in `mod.rs`, one module per view, and the
   shell widgets. Views are plain functions of `&App`.
@@ -113,7 +121,10 @@ and a scripted file dialog.
 
 - Mach-O has not been exercised in the UI.
 - The graph view shows functions of up to 1,500 blocks; larger ones use the other views.
-- Renames apply to functions and named data, not to local variables or struct fields.
+- Renames apply to functions, named data, pseudocode locals and parameters, and struct fields.
+  A recovered struct is named for good by giving its name in a signature that types a
+  parameter `struct name *`; its fields can then be renamed. Declared structs are kept in the
+  annotation file with the signature.
 - Demangled names are for reading: they are not valid C identifiers, and rename still takes
   plain identifiers. Rust's legacy scheme is covered by unit tests and an asm-labelled symbol;
   the current rustc only writes v0.

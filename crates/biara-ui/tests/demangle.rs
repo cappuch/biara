@@ -6,10 +6,8 @@
 
 use std::{path::PathBuf, process::Command};
 
-use biara_ui::{
-    backend::OpenOptions,
-    ui::{self, App, MainTab, overlay::Mode},
-};
+use biara_session::OpenOptions;
+use biara_ui::ui::{self, App, MainTab, overlay::Mode};
 use rune::{Env, Key, KeyEvent, Mods, Runtime};
 
 /// Freestanding C++ (no standard library): a namespaced const method, a template instance and,
@@ -387,7 +385,7 @@ fn a_users_rename_wins_over_the_demangled_name() {
         None,
         "a renamed function has no demangled header"
     );
-    let _ = std::fs::remove_file(rt.state.names.path().unwrap());
+    let _ = std::fs::remove_file(rt.state.notes.path().unwrap());
 }
 
 #[test]

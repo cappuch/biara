@@ -1,8 +1,8 @@
 //! The workbench window: state, navigation and the shell around the views.
 //!
 //! One [`App`] owns everything the window shows. The analysis runs on background threads
-//! (see `backend`) and reports through a channel that [`poll`] drains before every frame, so
-//! the window never waits for the engine. Views are plain functions of `&App`.
+//! (see `biara_session`) and reports through a channel that [`poll`] drains before every frame,
+//! so the window never waits for the engine. Views are plain functions of `&App`.
 
 pub mod bottom;
 pub mod code;
@@ -23,7 +23,7 @@ use std::{
 use biara_loader::Image;
 use rune::{AppSpec, Cx, El, Key, KeyEvent, TextEdit, Tx, Waker, col, el, row};
 
-use crate::backend::{self, Arch, Decompiler, Event, Index, Names, Program, Stage};
+use biara_session::{Arch, Decompiler, Event, Index, Notes, Program, Stage};
 use theme::colors;
 
 pub use bottom::BottomTab;
@@ -77,7 +77,7 @@ pub struct App {
     events: Option<mpsc::Receiver<Event>>,
     pub path: Option<PathBuf>,
     /// How the engine is run; kept so dropping a second file opens it the same way.
-    pub open_options: backend::OpenOptions,
+    pub open_options: biara_session::OpenOptions,
     pub load: Load,
     pub arch: Option<Arch>,
     pub image: Option<Arc<Image>>,
@@ -85,7 +85,11 @@ pub struct App {
     pub index: Arc<Index>,
     pub program: Option<Arc<Program>>,
     pub decomp: Option<Decompiler>,
-    pub names: Names,
+    /// Names, local names, signatures and comments written about the open binary.
+    pub notes: Notes,
+    /// Watches the notes file for changes another process makes (the workbench and
+    /// `biara mcp` share it), for as long as this program is open.
+    notes_watch: Option<biara_session::notes::Watch>,
     /// Messages for the output panel, oldest first.
     pub log: Vec<String>,
 
@@ -123,14 +127,15 @@ impl Default for App {
             waker: Arc::default(),
             events: None,
             path: None,
-            open_options: backend::OpenOptions::default(),
+            open_options: biara_session::OpenOptions::default(),
             load: Load::Empty,
             arch: None,
             image: None,
             index: Arc::new(Index::default()),
             program: None,
             decomp: None,
-            names: Names::in_memory(),
+            notes: Notes::in_memory(),
+            notes_watch: None,
             log: Vec::new(),
             cur: 0,
             back: Vec::new(),
@@ -279,7 +284,7 @@ impl App {
     }
 
     /// [`App::open`] with explicit engine settings (tests point the workers at the built binary).
-    pub fn open_with(&mut self, path: PathBuf, options: backend::OpenOptions) {
+    pub fn open_with(&mut self, path: PathBuf, options: biara_session::OpenOptions) {
         let notify = self.notify();
         *self = App {
             waker: self.waker.clone(),
@@ -288,17 +293,20 @@ impl App {
             open_options: options.clone(),
             ..App::default()
         };
-        let (names, problem) = Names::load(&path);
-        self.names = names;
+        let (notes, problem) = Notes::load(&path);
+        if let Some(file) = notes.path() {
+            self.notes_watch = Some(biara_session::notes::watch(file.to_owned(), notify.clone()));
+        }
+        self.notes = notes;
         if let Some(p) = problem {
-            self.log.push(format!("names: {p}"));
+            self.log.push(format!("notes: {p}"));
         }
         self.load = Load::Opening {
             stage: Stage::Loading,
             functions: 0,
             blocks: 0,
         };
-        self.events = Some(backend::recovery::open(path.clone(), notify, options));
+        self.events = Some(biara_session::recovery::open(path.clone(), notify, options));
         self.path = Some(path);
     }
 
@@ -352,7 +360,7 @@ impl App {
             if let Some(entry) = self.pseudo.entry {
                 if matches!(
                     self.decomp.as_ref().map(|d| d.status(entry)),
-                    Some(crate::backend::decomp::Status::Failed(_)) | None
+                    Some(biara_session::decomp::Status::Failed(_)) | None
                 ) {
                     return;
                 }
@@ -419,7 +427,7 @@ impl App {
         }
     }
 
-    fn notify(&self) -> backend::Notify {
+    fn notify(&self) -> biara_session::Notify {
         let slot = self.waker.clone();
         Arc::new(move || {
             // Clone out of the lock: waking the window must not happen while holding it.
@@ -447,7 +455,7 @@ impl App {
 
     /// The name for `addr`: the user's, else the binary's.
     pub fn name_of(&self, addr: u64) -> Option<String> {
-        self.names
+        self.notes
             .get(addr)
             .map(str::to_owned)
             .or_else(|| self.index.base_name(addr).map(str::to_owned))
@@ -456,7 +464,7 @@ impl App {
     /// The name to print for `addr`: the user's, else the demangled form when that is on and
     /// the name is mangled (without parameters, for dense views), else the binary's.
     pub fn display_of(&self, addr: u64) -> Option<String> {
-        if let Some(n) = self.names.get(addr) {
+        if let Some(n) = self.notes.get(addr) {
             return Some(n.to_owned());
         }
         if self.demangle
@@ -471,7 +479,7 @@ impl App {
     /// demangled one, else `raw` itself (which can differ from the symbol's, being a C identifier).
     pub fn token_name(&self, addr: u64, raw: &str) -> String {
         let demangled = self.demangle.then(|| self.index.demangled(addr)).flatten();
-        match (self.names.get(addr), demangled) {
+        match (self.notes.get(addr), demangled) {
             (Some(user), _) => user.to_owned(),
             (None, Some(d)) => d.short.clone(),
             (None, None) => raw.to_owned(),
@@ -493,7 +501,7 @@ impl App {
         {
             return raw.to_owned();
         }
-        match crate::backend::demangle::demangle(callee) {
+        match biara_session::demangle::demangle(callee) {
             Some(d) => format!("{}_result{tail}", d.short),
             None => raw.to_owned(),
         }
@@ -502,7 +510,7 @@ impl App {
     /// The demangled name with parameters, if `addr` has a mangled name the user has not
     /// replaced and demangling is on. For places with room to spare.
     pub fn full_name_of(&self, addr: u64) -> Option<String> {
-        if !self.demangle || self.names.get(addr).is_some() {
+        if !self.demangle || self.notes.get(addr).is_some() {
             return None;
         }
         self.index.demangled(addr).map(|d| d.full.clone())
@@ -513,7 +521,7 @@ impl App {
     /// whether the user types what they see or what the linker wrote.
     pub fn search_names<'a>(&'a self, addr: u64, raw: &'a str) -> Vec<&'a str> {
         let mut names = vec![raw];
-        names.extend(self.names.get(addr));
+        names.extend(self.notes.get(addr));
         if let Some(d) = self.index.demangled(addr) {
             names.extend([d.short.as_str(), d.full.as_str()]);
         }
@@ -522,7 +530,7 @@ impl App {
 
     /// Changes whenever the way names print changes (a rename, the demangling switch).
     pub fn display_version(&self) -> u64 {
-        self.names
+        self.notes
             .version()
             .wrapping_mul(31)
             .wrapping_add(self.display_epoch)
@@ -643,25 +651,59 @@ impl App {
     /// view is on screen. True if what it shows changed.
     fn refresh_pseudo(&mut self) -> bool {
         let entry = self.function_of(self.cur);
-        let (status, completed) = match (&self.decomp, entry) {
+        let (status, completed, generation) = match (&self.decomp, entry) {
             (Some(d), Some(e)) => {
-                // A result the view already shows needs no request, even once the cache let it go.
+                let generation = d.generation();
+                let status = d.status(e);
+                // A result the view already shows needs no request, even once the cache let it
+                // go. A result from before a signature change is stale: decompile again.
+                let stale = self
+                    .pseudo
+                    .doc
+                    .as_ref()
+                    .is_some_and(|doc| doc.entry == e && self.pseudo.generation != generation);
+                let missing = self.pseudo.doc.as_ref().is_none_or(|doc| doc.entry != e);
                 if self.main_tab == MainTab::Pseudo
-                    && self.pseudo.doc.as_ref().is_none_or(|doc| doc.entry != e)
+                    && (missing || stale)
+                    && !matches!(status, biara_session::decomp::Status::Pending)
                 {
                     d.request(e);
                 }
-                (d.status(e), d.completed())
+                (status, d.completed(), generation)
             }
-            (Some(d), None) => (crate::backend::decomp::Status::None, d.completed()),
-            _ => (crate::backend::decomp::Status::None, 0),
+            (Some(d), None) => (
+                biara_session::decomp::Status::None,
+                d.completed(),
+                d.generation(),
+            ),
+            _ => (biara_session::decomp::Status::None, 0, 0),
         };
-        self.pseudo.sync(entry, status, completed)
+        let changed = self.pseudo.sync(entry, status, completed, generation);
+        changed | self.pseudo.refresh_comments(&self.notes)
     }
 }
 
 pub fn poll(app: &mut App, _clock: f64, tx: &mut Tx) -> bool {
     let mut changed = app.drain();
+    let types = app.notes.types_version();
+    match app.notes.reload_if_changed() {
+        Ok(true) => {
+            changed = true;
+            if app.notes.types_version() != types {
+                let annotations = app.notes.annotations();
+                if let Some(d) = &app.decomp
+                    && let Err(e) = d.set_types(annotations)
+                {
+                    app.log.push(format!("types: {e}"));
+                }
+            }
+        }
+        Ok(false) => {}
+        Err(e) => {
+            app.log.push(format!("notes: {e}"));
+            changed = true;
+        }
+    }
     if app.decomp.is_some() {
         changed |= app.refresh_pseudo();
     }
@@ -824,8 +866,8 @@ pub fn run() {
 
 /// Whether `target` names `f`: its raw name, or its demangled short or full form.
 fn app_names_match(
-    index: &crate::backend::Index,
-    f: &crate::backend::FunctionInfo,
+    index: &biara_session::Index,
+    f: &biara_session::FunctionInfo,
     target: &str,
 ) -> bool {
     f.name == target

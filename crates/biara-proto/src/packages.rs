@@ -109,3 +109,66 @@ pub struct ReadabilityMetrics {
     pub mapped_statements: u64,
     pub unsupported: u64,
 }
+
+/// Where address comments go in a rendered function: each lands on the first line (0-based,
+/// in the order given, which must be ascending) whose addresses include its address. A
+/// comment on the function's own `entry` that no line maps falls back to `signature_line`.
+/// Comments nothing maps are left out; several on one line keep address order.
+pub fn place_comments<'a, 'c>(
+    lines: impl IntoIterator<Item = (usize, &'a [u64])>,
+    entry: u64,
+    signature_line: Option<usize>,
+    comments: &'c std::collections::BTreeMap<u64, String>,
+) -> std::collections::BTreeMap<usize, Vec<(u64, &'c str)>> {
+    let mut placed = std::collections::BTreeMap::<usize, Vec<(u64, &'c str)>>::new();
+    if comments.is_empty() {
+        return placed;
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for (line, addresses) in lines {
+        for address in addresses {
+            if let Some(text) = comments.get(address)
+                && seen.insert(*address)
+            {
+                placed.entry(line).or_default().push((*address, text));
+            }
+        }
+    }
+    if let (Some(text), Some(line)) = (comments.get(&entry), signature_line)
+        && !seen.contains(&entry)
+    {
+        placed.entry(line).or_default().push((entry, text));
+    }
+    for notes in placed.values_mut() {
+        notes.sort_by_key(|&(address, _)| address);
+    }
+    placed
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn comments_land_on_the_first_line_mapped_to_their_address() {
+        let comments = BTreeMap::from([
+            (0x10, "entry".to_owned()),
+            (0x20, "twice".to_owned()),
+            (0x30, "nowhere".to_owned()),
+            (0x18, "first".to_owned()),
+        ]);
+        let lines: [(usize, &[u64]); 3] = [(3, &[0x20, 0x18]), (4, &[0x20]), (7, &[0x24])];
+        let placed = super::place_comments(lines, 0x10, Some(1), &comments);
+        assert_eq!(
+            placed,
+            BTreeMap::from([
+                (1, vec![(0x10, "entry")]),
+                (3, vec![(0x18, "first"), (0x20, "twice")]),
+            ])
+        );
+        // The entry falls back to the signature only when no line maps it.
+        let mapped: [(usize, &[u64]); 1] = [(5, &[0x10])];
+        let placed = super::place_comments(mapped, 0x10, Some(1), &comments);
+        assert_eq!(placed, BTreeMap::from([(5, vec![(0x10, "entry")])]));
+    }
+}

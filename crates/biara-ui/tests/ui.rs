@@ -5,10 +5,8 @@
 
 use std::{path::PathBuf, process::Command};
 
-use biara_ui::{
-    backend::OpenOptions,
-    ui::{self, App, MainTab, overlay::Mode},
-};
+use biara_session::OpenOptions;
+use biara_ui::ui::{self, App, MainTab, overlay::Mode};
 use rune::{Env, Key, KeyEvent, Mods, Runtime};
 
 const SOURCE: &str = r#"
@@ -23,11 +21,29 @@ __attribute__((noinline,used)) int message(void) { return puts("ui fixture strin
 int main(void) { return target(3) != 12; }
 "#;
 
+/// A function whose parameter 1 points at a four-field recovered struct: the layout analysis
+/// names it `s1` and its fields `f_0`, `f_8`, `f_10`, `f_18` until a signature declares it.
+const STRUCT_SOURCE: &str = r#"
+struct four { unsigned long a, b, c, d; };
+__attribute__((noinline,used)) unsigned long sum(unsigned long n, struct four *q) {
+    return n + q->a + q->b + q->c + q->d;
+}
+__attribute__((noinline,used)) unsigned long caller(void) {
+    struct four v = {1, 2, 3, 4};
+    return sum(5, &v);
+}
+int main(void) { return caller() != 15; }
+"#;
+
 fn build(name: &str) -> PathBuf {
+    build_source(name, SOURCE)
+}
+
+fn build_source(name: &str, source: &str) -> PathBuf {
     let dir =
         PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("program.c"), SOURCE).unwrap();
+    std::fs::write(dir.join("program.c"), source).unwrap();
     let binary = dir.join("program");
     let out = Command::new(env!("BIARA_CLANG"))
         .args(["-O1", "-fno-builtin", "-fno-pie", "-no-pie", "-fuse-ld=bfd"])
@@ -51,7 +67,15 @@ fn runtime(name: &str) -> Runtime<App> {
 
 /// [`runtime`], recovering at most `max_blocks` blocks.
 fn runtime_with(name: &str, max_blocks: Option<usize>) -> Runtime<App> {
-    let binary = build(name);
+    runtime_for(build(name), max_blocks)
+}
+
+/// A runtime for the fixture with a recovered struct parameter.
+fn runtime_struct(name: &str) -> Runtime<App> {
+    runtime_for(build_source(name, STRUCT_SOURCE), None)
+}
+
+fn runtime_for(binary: PathBuf, max_blocks: Option<usize>) -> Runtime<App> {
     let mut app = App::default();
     app.open_with(
         binary.clone(),
@@ -100,6 +124,46 @@ fn type_text(rt: &mut Runtime<App>, s: &str) {
         });
     }
     settle(rt);
+}
+
+/// Everything the window currently draws, one text per line. Only accessible names: widget
+/// keys are not drawn.
+fn drawn(rt: &Runtime<App>) -> String {
+    fn walk(v: &serde_json::Value, out: &mut Vec<String>) {
+        if let Some(name) = v.get("name").and_then(|n| n.as_str()) {
+            out.push(name.to_owned());
+        }
+        for child in v
+            .get("children")
+            .and_then(|c| c.as_array())
+            .into_iter()
+            .flatten()
+        {
+            walk(child, out);
+        }
+    }
+    let mut names = Vec::new();
+    walk(&rt.accessibility_json(), &mut names);
+    names.join("\n")
+}
+
+/// Run frames until the pseudocode for the viewed function arrives.
+fn wait_pseudo(rt: &mut Runtime<App>) {
+    for _ in 0..600 {
+        if rt
+            .state
+            .pseudo
+            .doc
+            .as_ref()
+            .is_some_and(|d| Some(d.entry) == rt.state.pseudo.entry)
+        {
+            settle(rt);
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        rt.frame(1.0 / 60.0);
+    }
+    panic!("pseudocode never arrived");
 }
 
 fn entry(rt: &Runtime<App>, name: &str) -> u64 {
@@ -185,14 +249,14 @@ fn rename_applies_everywhere_and_rejects_bad_names() {
         "a name with a space is refused"
     );
     assert!(rt.state.overlay.mode.is_some(), "and the dialog stays open");
-    assert_eq!(rt.state.names.get(leaf), None);
+    assert_eq!(rt.state.notes.get(leaf), None);
 
     for _ in 0..16 {
         press(&mut rt, Key::Backspace);
     }
     type_text(&mut rt, "scale_value");
     press(&mut rt, Key::Enter);
-    assert_eq!(rt.state.names.get(leaf), Some("scale_value"));
+    assert_eq!(rt.state.notes.get(leaf), Some("scale_value"));
     assert_eq!(rt.state.name_of(leaf).as_deref(), Some("scale_value"));
     assert_eq!(
         rt.state.label(leaf),
@@ -201,9 +265,363 @@ fn rename_applies_everywhere_and_rejects_bad_names() {
     );
     assert_eq!(rt.state.overlay.mode, None);
     // The saved file is the engine's own annotation format.
-    let saved = std::fs::read_to_string(rt.state.names.path().unwrap()).unwrap();
+    let saved = std::fs::read_to_string(rt.state.notes.path().unwrap()).unwrap();
     assert!(saved.contains("scale_value"), "{saved}");
-    let _ = std::fs::remove_file(rt.state.names.path().unwrap());
+    let _ = std::fs::remove_file(rt.state.notes.path().unwrap());
+}
+
+#[test]
+fn renaming_a_local_in_the_pseudocode_updates_every_use_and_saves_it() {
+    let mut rt = runtime("ui-local");
+    let target = entry(&rt, "target");
+    rt.state.cur = target;
+    press(&mut rt, Key::Function(5));
+    wait_pseudo(&mut rt);
+    // Click a local in the pseudocode: the click highlights it by its emitted name.
+    let candidates = rt.state.pseudo.doc.as_ref().unwrap().locals.clone();
+    let emitted = candidates
+        .iter()
+        .find(|name| rt.find(&format!("w{name}")).is_some())
+        .unwrap_or_else(|| panic!("none of {candidates:?} is on a mounted row"))
+        .clone();
+    let (x, y) = rt.find(&format!("w{emitted}")).unwrap();
+    rt.pointer_down(x, y);
+    rt.pointer_up(x, y);
+    settle(&mut rt);
+    assert_eq!(rt.state.pseudo.word.as_deref(), Some(emitted.as_str()));
+
+    press(&mut rt, Key::Text("n".into()));
+    assert!(
+        matches!(
+            &rt.state.overlay.mode,
+            Some(Mode::RenameLocal { function, local })
+                if *function == target && local == &emitted
+        ),
+        "{:?}",
+        rt.state.overlay.mode
+    );
+    assert_eq!(
+        rt.state.overlay.input.text, emitted,
+        "the dialog starts with the name the view shows"
+    );
+
+    // A name another identifier already uses in the document is refused.
+    for _ in 0..emitted.chars().count() {
+        press(&mut rt, Key::Backspace);
+    }
+    type_text(&mut rt, "leaf");
+    press(&mut rt, Key::Enter);
+    assert!(
+        rt.state.overlay.error.is_some(),
+        "leaf is the callee's identifier in this function"
+    );
+    assert!(rt.state.overlay.mode.is_some(), "and the dialog stays open");
+    assert_eq!(rt.state.notes.local(target, &emitted), None);
+
+    for _ in 0..4 {
+        press(&mut rt, Key::Backspace);
+    }
+    type_text(&mut rt, "renamed_value");
+    press(&mut rt, Key::Enter);
+    assert_eq!(
+        rt.state.notes.local(target, &emitted),
+        Some("renamed_value")
+    );
+    assert_eq!(rt.state.overlay.mode, None);
+    let ui = drawn(&rt);
+    assert!(ui.contains("renamed_value"), "{ui}");
+
+    // The annotation file holds the emitted-to-display map for the function.
+    let saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(rt.state.notes.path().unwrap()).unwrap())
+            .unwrap();
+    assert_eq!(
+        saved["functions"][target.to_string()]["locals"][&emitted],
+        "renamed_value",
+        "{saved}"
+    );
+    let _ = std::fs::remove_file(rt.state.notes.path().unwrap());
+}
+
+#[test]
+fn a_semicolon_comments_the_instruction_and_its_pseudocode_line() {
+    let mut rt = runtime("ui-comment");
+    let target = entry(&rt, "target");
+    rt.state.cur = target;
+    press(&mut rt, Key::Function(5));
+    wait_pseudo(&mut rt);
+    let doc = rt.state.pseudo.doc.clone().unwrap();
+    // A line the decompiler maps to an instruction the listing shows as an instruction.
+    let addr = (0..doc.lines.len())
+        .find_map(|line| {
+            doc.line_addresses(line).iter().copied().find(|&addr| {
+                rt.state
+                    .program
+                    .as_ref()
+                    .unwrap()
+                    .listing
+                    .heads
+                    .iter()
+                    .any(|h| h.addr == addr && h.kind == biara_session::HeadKind::Insn)
+            })
+        })
+        .expect("a pseudocode line mapped to an instruction");
+
+    // Show the listing at that instruction, then comment it with IDA's key.
+    rt.state.main_tab = MainTab::Listing;
+    settle(&mut rt);
+    press(&mut rt, Key::Text("g".into()));
+    type_text(&mut rt, &format!("{addr:#x}"));
+    press(&mut rt, Key::Enter);
+    assert_eq!(rt.state.cur, addr);
+    press(&mut rt, Key::Text(";".into()));
+    assert!(
+        matches!(rt.state.overlay.mode, Some(Mode::Comment { addr: at }) if at == addr),
+        "{:?}",
+        rt.state.overlay.mode
+    );
+    assert_eq!(rt.state.overlay.input.text, "", "no comment yet");
+    type_text(&mut rt, "first note");
+    press(&mut rt, Key::Enter);
+    assert_eq!(rt.state.notes.comment(addr), Some("first note"));
+    let ui = drawn(&rt);
+    assert!(ui.contains("; first note"), "the row shows it: {ui}");
+
+    // The decompiler reports the comment on the line that instruction produced.
+    press(&mut rt, Key::Function(5));
+    wait_pseudo(&mut rt);
+    let ui = drawn(&rt);
+    assert!(ui.contains("// first note"), "the line shows it: {ui}");
+    let _ = std::fs::remove_file(rt.state.notes.path().unwrap());
+}
+
+#[test]
+fn notes_written_by_another_process_show_up_after_poll() {
+    let mut rt = runtime("ui-external");
+    let leaf = entry(&rt, "leaf");
+    let path = rt.state.path.clone().unwrap();
+    let mut other = biara_session::Notes::load(&path).0;
+    other
+        .set(leaf, biara_session::NameKind::Function, "outside_leaf")
+        .unwrap();
+    for _ in 0..300 {
+        rt.frame(1.0 / 60.0);
+        if rt.state.notes.get(leaf) == Some("outside_leaf") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(
+        rt.state.notes.get(leaf),
+        Some("outside_leaf"),
+        "the watcher and poll took in the other process's write"
+    );
+    assert_eq!(rt.state.display_of(leaf).as_deref(), Some("outside_leaf"));
+    let _ = std::fs::remove_file(rt.state.notes.path().unwrap());
+}
+
+#[test]
+fn a_signature_change_is_saved_and_redecompiles_the_function() {
+    let mut rt = runtime("ui-signature");
+    let target = entry(&rt, "target");
+    rt.state.cur = target;
+    press(&mut rt, Key::Function(5));
+    wait_pseudo(&mut rt);
+    let before = rt.state.pseudo.doc.clone().unwrap();
+    press(&mut rt, Key::Text("y".into()));
+    assert!(
+        matches!(rt.state.overlay.mode, Some(Mode::Signature { function }) if function == target),
+        "{:?}",
+        rt.state.overlay.mode
+    );
+    assert_eq!(
+        rt.state.overlay.input.text, before.signature,
+        "the dialog starts with the shown signature"
+    );
+
+    for _ in 0..before.signature.chars().count() {
+        press(&mut rt, Key::Backspace);
+    }
+    // A signature the engine rejects is put back: the dialog stays, the notes keep nothing.
+    type_text(&mut rt, "not a signature");
+    press(&mut rt, Key::Enter);
+    assert!(
+        rt.state.overlay.error.is_some(),
+        "the engine's rejection is shown"
+    );
+    assert!(rt.state.overlay.mode.is_some(), "and the dialog stays open");
+    assert_eq!(rt.state.notes.signature(target), None, "nothing was saved");
+
+    for _ in 0.."not a signature".chars().count() {
+        press(&mut rt, Key::Backspace);
+    }
+    type_text(&mut rt, "int target(unsigned long)");
+    press(&mut rt, Key::Enter);
+    assert_eq!(rt.state.overlay.error, None, "{:?}", rt.state.overlay.error);
+    assert_eq!(
+        rt.state.notes.signature(target),
+        Some("int target(unsigned long)")
+    );
+
+    // The signature changes the C, so the view must fetch a new decompilation rather than
+    // keep showing the one made under the old calling convention.
+    for _ in 0..600 {
+        if rt
+            .state
+            .pseudo
+            .doc
+            .as_ref()
+            .is_some_and(|doc| !std::sync::Arc::ptr_eq(doc, &before))
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        rt.frame(1.0 / 60.0);
+    }
+    let after = rt.state.pseudo.doc.clone().unwrap();
+    assert!(
+        !std::sync::Arc::ptr_eq(&after, &before),
+        "the shown document was replaced"
+    );
+    assert!(
+        after.signature.contains("uint32_t target"),
+        "the declared return type is in the new C: {}",
+        after.signature
+    );
+    assert_ne!(
+        after.signature, before.signature,
+        "the signature actually changed"
+    );
+    let _ = std::fs::remove_file(rt.state.notes.path().unwrap());
+}
+
+#[test]
+fn a_struct_field_is_named_through_its_parameter_and_renamed() {
+    let mut rt = runtime_struct("ui-struct-field");
+    let sum = entry(&rt, "sum");
+    rt.state.cur = sum;
+    press(&mut rt, Key::Function(5));
+    wait_pseudo(&mut rt);
+    let before = rt.state.pseudo.doc.clone().unwrap();
+    let layout = before
+        .layouts
+        .iter()
+        .find(|layout| !layout.declared && layout.params.contains(&1))
+        .unwrap_or_else(|| panic!("no recovered struct at parameter 1: {:?}", before.layouts));
+    assert!(
+        layout.fields.iter().any(|field| field.name == "f_8"),
+        "the layout has a field at offset 8: {layout:?}"
+    );
+
+    // Click the `f_8` in `arg1->f_8`, then N: the struct is recovered, so the first dialog
+    // asks for the permanent name of the struct parameter 1 points at.
+    let (x, y) = rt.find("wf_8").expect("the field link is on a mounted row");
+    rt.pointer_down(x, y);
+    rt.pointer_up(x, y);
+    settle(&mut rt);
+    assert_eq!(rt.state.pseudo.word.as_deref(), Some("f_8"));
+    press(&mut rt, Key::Text("n".into()));
+    assert!(
+        matches!(
+            &rt.state.overlay.mode,
+            Some(Mode::NameStruct { function, layout, .. })
+                if *function == sum && layout.name == "s1"
+        ),
+        "{:?}",
+        rt.state.overlay.mode
+    );
+    assert_eq!(
+        rt.state.overlay.input.text, "",
+        "the dialog asks for the permanent struct name"
+    );
+    type_text(&mut rt, "four");
+    press(&mut rt, Key::Enter);
+    assert_eq!(rt.state.overlay.error, None, "{:?}", rt.state.overlay.error);
+    assert!(
+        matches!(
+            &rt.state.overlay.mode,
+            Some(Mode::RenameField { struct_name, offset, field })
+                if struct_name == "four" && *offset == 8 && field == "f_8"
+        ),
+        "{:?}",
+        rt.state.overlay.mode
+    );
+    assert_eq!(rt.state.overlay.input.text, "f_8");
+
+    for _ in 0..3 {
+        press(&mut rt, Key::Backspace);
+    }
+    type_text(&mut rt, "second");
+    press(&mut rt, Key::Enter);
+    assert_eq!(rt.state.overlay.error, None, "{:?}", rt.state.overlay.error);
+    assert_eq!(rt.state.overlay.mode, None);
+
+    // The declared signature makes the engine bind the struct, so a new decompilation has to
+    // arrive with the declared field name in place of the recovered one.
+    for _ in 0..600 {
+        if rt.state.pseudo.doc.as_ref().is_some_and(|doc| {
+            !std::sync::Arc::ptr_eq(doc, &before) && doc.signature.contains("struct four")
+        }) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        rt.frame(1.0 / 60.0);
+    }
+    let after = rt.state.pseudo.doc.clone().unwrap();
+    assert!(
+        !std::sync::Arc::ptr_eq(&after, &before),
+        "the view fetched a new decompilation"
+    );
+    assert!(
+        after.signature.contains("struct four"),
+        "the declared struct is in the signature: {}",
+        after.signature
+    );
+    let ui = drawn(&rt);
+    assert!(ui.contains("second"), "the new field name is drawn: {ui}");
+    assert!(
+        !ui.contains("f_8"),
+        "the recovered field name is gone: {ui}"
+    );
+
+    // Once the struct is declared, N on another field goes straight to the field dialog.
+    settle(&mut rt);
+    let (x, y) = rt.find("wf_0").expect("the other field link is mounted");
+    rt.pointer_down(x, y);
+    rt.pointer_up(x, y);
+    settle(&mut rt);
+    press(&mut rt, Key::Text("n".into()));
+    assert!(
+        matches!(
+            &rt.state.overlay.mode,
+            Some(Mode::RenameField { struct_name, offset, .. })
+                if struct_name == "four" && *offset == 0
+        ),
+        "{:?}",
+        rt.state.overlay.mode
+    );
+    press(&mut rt, Key::Escape);
+    assert_eq!(rt.state.overlay.mode, None);
+
+    let saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(rt.state.notes.path().unwrap()).unwrap())
+            .unwrap();
+    let fields = saved["structs"]["four"]["fields"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no struct four: {saved}"));
+    let field = fields
+        .iter()
+        .find(|field| field["offset"] == 8)
+        .unwrap_or_else(|| panic!("no field at 8: {saved}"));
+    assert_eq!(field["name"], "second", "{saved}");
+    let signature = saved["functions"][sum.to_string()]["signature"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no signature saved: {saved}"));
+    assert!(
+        signature.contains("struct four *"),
+        "the signature names the struct: {signature}"
+    );
+    let _ = std::fs::remove_file(rt.state.notes.path().unwrap());
 }
 
 #[test]
@@ -307,10 +725,10 @@ fn the_graph_shows_the_current_function_and_a_rename_relays_it_out() {
     let before = model.layout.width;
     let leaf = entry(&rt, "leaf");
     rt.state
-        .names
+        .notes
         .set(
             leaf,
-            biara_ui::backend::NameKind::Function,
+            biara_session::NameKind::Function,
             "an_extremely_long_descriptive_function_name_for_leaf",
         )
         .unwrap();
@@ -318,7 +736,7 @@ fn the_graph_shows_the_current_function_and_a_rename_relays_it_out() {
     settle(&mut rt);
     let after = rt.state.graph.model.clone().unwrap().layout.width;
     assert!(after > before, "{before} -> {after}");
-    let _ = std::fs::remove_file(rt.state.names.path().unwrap());
+    let _ = std::fs::remove_file(rt.state.notes.path().unwrap());
 }
 
 /// Frames until the app has finished opening `rt`'s binary.

@@ -3,7 +3,7 @@
 use biara_loader::Image;
 use rune::{Cursor, Drag, El, GrowthSpec, Phase, ScrollSpec, Tx, col, el, row, text};
 
-use crate::backend::{XrefKind, disasm};
+use biara_session::{XrefKind, disasm};
 
 use super::{App, theme::*, widgets};
 

@@ -10,7 +10,7 @@ use rune::{
     Drag, El, Live, MagnifyEvent, Phase, Shape, Tx, WheelEvent, canvas, col, el, row, text,
 };
 
-use crate::backend::{
+use biara_session::{
     FlowError, FlowGraph,
     graph::{self, EdgeKind, Layout, Size, Spacing},
 };
@@ -188,7 +188,7 @@ pub fn refresh(app: &mut App) -> bool {
         Err(FlowError::TooLarge(n)) => {
             app.graph.error = Some(format!(
                 "This function has {n} blocks; the graph view shows up to {}. Use the listing or pseudocode.",
-                crate::backend::flow::MAX_NODES
+                biara_session::flow::MAX_NODES
             ))
         }
         Err(FlowError::NotAFunction) => {

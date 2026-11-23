@@ -39,10 +39,15 @@ pub struct FunctionAnnotation {
     /// `void` parameters, empty `()` lists.
     #[serde(default)]
     pub signature: Option<String>,
+    /// Display names for the function's locals and parameters, keyed by the name the
+    /// decompiler emitted for them (`arg0`, `value12`, `read_result`), never by an earlier
+    /// rename. Both sides are C identifiers; two locals may not take the same name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub locals: BTreeMap<String, String>,
 }
 
 /// One named struct's declared layout: typed fields by byte offset.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StructField {
     /// Byte offset of the field within the struct.
@@ -71,7 +76,7 @@ fn default_field_type() -> String {
 /// with asserted provenance. Declared padding gaps are preserved; extra
 /// declared fields beyond the recovered extent ride along as asserted
 /// members.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StructAnnotation {
     /// Ordered field declarations; offsets must be non-overlapping and
@@ -100,6 +105,11 @@ pub struct Annotations {
     /// User-declared struct layouts, by struct name (without `struct`).
     #[serde(default)]
     pub structs: BTreeMap<String, StructAnnotation>,
+    /// One-line notes by guest address. Decompiled output appends each as `// note` to the
+    /// first line mapped to its address (the signature line for a function entry nothing
+    /// maps to); disassembly shows it beside the instruction.
+    #[serde(default, deserialize_with = "de_names", skip_serializing_if = "BTreeMap::is_empty")]
+    pub comments: BTreeMap<u64, String>,
 }
 
 fn de_functions<'de, D>(deserializer: D) -> Result<BTreeMap<u64, FunctionAnnotation>, D::Error>
@@ -127,7 +137,7 @@ where
         .map(|(key, value)| {
             key.parse::<u64>()
                 .map(|address| (address, value))
-                .map_err(|_| D::Error::custom(format!("invalid global address key {key:?}")))
+                .map_err(|_| D::Error::custom(format!("invalid address key {key:?}")))
         })
         .collect()
 }
@@ -138,6 +148,7 @@ impl Default for Annotations {
             functions: BTreeMap::new(),
             globals: BTreeMap::new(),
             structs: BTreeMap::new(),
+            comments: BTreeMap::new(),
         }
     }
 }
@@ -161,6 +172,29 @@ pub enum Error {
     OverlappingFields(String, i64),
     #[error("struct {0:?}: field {1:?} type {2:?} mismatches width {3}")]
     BadFieldType(String, String, String, u32),
+    #[error("function {0:#x}: local name {1:?} is not a C identifier")]
+    BadLocalName(u64, String),
+    #[error("function {0:#x}: two locals are named {1:?}")]
+    DuplicateLocal(u64, String),
+    #[error("comment at {0:#x} is empty or spans lines")]
+    BadComment(u64),
+}
+
+/// A C identifier that is not a keyword: what a renamed local or parameter must be.
+pub fn is_identifier(name: &str) -> bool {
+    const KEYWORDS: &[&str] = &[
+        "auto", "bool", "break", "case", "char", "const", "continue", "default", "do",
+        "double", "else", "enum", "extern", "false", "float", "for", "goto", "if", "inline",
+        "int", "long", "register", "restrict", "return", "short", "signed", "sizeof",
+        "static", "struct", "switch", "true", "typedef", "union", "unsigned", "void",
+        "volatile", "while", "_Bool",
+    ];
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !KEYWORDS.contains(&name)
 }
 
 /// Declared field types bind exactly to their widths: `u8/i8`→1,
@@ -228,6 +262,22 @@ impl Annotations {
             }
             if function.signature.as_deref().is_some_and(str::is_empty) {
                 return Err(Error::EmptySignature(address));
+            }
+            let mut taken = std::collections::BTreeSet::new();
+            for (emitted, name) in &function.locals {
+                for n in [emitted, name] {
+                    if !is_identifier(n) {
+                        return Err(Error::BadLocalName(address, n.clone()));
+                    }
+                }
+                if !taken.insert(name) {
+                    return Err(Error::DuplicateLocal(address, name.clone()));
+                }
+            }
+        }
+        for (&address, text) in &self.comments {
+            if text.trim().is_empty() || text.contains(['\n', '\r']) {
+                return Err(Error::BadComment(address));
             }
         }
         for (&address, name) in &self.globals {

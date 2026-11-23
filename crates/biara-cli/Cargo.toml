@@ -20,6 +20,7 @@ biara-loader.workspace = true
 biara-tcg.workspace = true
 biara-engine.workspace = true
 biara-proto.workspace = true
+biara-session.workspace = true
 blake3.workspace = true
 reqwest.workspace = true
 zstd.workspace = true

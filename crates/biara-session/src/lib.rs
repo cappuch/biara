@@ -8,17 +8,19 @@ pub mod disasm;
 pub mod flow;
 pub mod graph;
 pub mod listing;
-pub mod names;
+pub mod notes;
 pub mod program;
 pub mod recovery;
+pub mod types;
 
 pub use decomp::{Decompiled, Decompiler};
 pub use demangle::Demangled;
 pub use disasm::{Arch, Flow, Insn, Span, Tok};
 pub use flow::{FlowError, FlowGraph, FlowNode};
 pub use listing::{Head, HeadKind, Listing};
-pub use names::{NameKind, Names};
+pub use notes::{NameKind, Notes};
 pub use program::{
     FunctionInfo, FunctionKind, ImportEntry, Index, Program, StringEntry, Xref, XrefKind,
 };
 pub use recovery::{Event, Notify, OpenOptions, Stage};
+pub use types::{StructLayout, Types};

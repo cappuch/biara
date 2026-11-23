@@ -9,7 +9,7 @@ use std::sync::LazyLock;
 use rune::{Color, TextStyle, color::hex};
 use rune_kit::{Kit, PaletteSeed};
 
-use crate::backend::{Flow, Tok};
+use biara_session::{Flow, Tok};
 
 /// Every colour the views use.
 pub struct Colors {

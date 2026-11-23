@@ -119,6 +119,7 @@ biara lift  <BINARY> [ADDR|NAME...] --emit <KIND> [--format text|json|jsonl]
 biara diff  <OLD> <NEW>                # match functions between two builds by their code
 biara quality <REFERENCE> <CANDIDATE>  # function and edge recall vs. a symbol-bearing oracle
 biara worker [JOB.json]                # run one JSON job (for hosting the engine)
+biara mcp   [BINARY]                   # serve one binary to an AI agent over MCP/stdio
 ```
 
 `lift` takes optional start points (an address or a symbol); with none it analyses the whole
@@ -137,8 +138,62 @@ program from the entry point, symbols, exports and unwind tables.
 | `audit` | Non-constant format strings and writes past declared objects |
 
 Useful flags: `--database` (resume file), `--jobs`, `--memory-mib` (analysis budget, default
-4096), `--annotations` (your names, signatures and struct layouts, JSON or TOML), and
+4096), `--annotations` (your names, local names, signatures, struct layouts and comments, JSON or
+TOML; the workbench and `biara mcp` save this format), and
 `--format json|jsonl` for a versioned schema with numeric addresses.
+
+## MCP
+
+`biara mcp` serves one open binary to an AI agent over the Model Context Protocol's stdio
+transport: newline-delimited JSON-RPC 2.0 on stdout, diagnostics on stderr. It speaks the
+stateless 2026-07-28 revision (`server/discover`, the protocol version in every request's
+`_meta`, `resultType` and `serverInfo` on results) and the legacy `initialize` handshake of
+2025-11-25, 2025-06-18, 2025-03-26 and 2024-11-05, including `ping`.
+
+```sh
+biara mcp target/sample/sample
+```
+
+An MCP client launches it as a subprocess:
+
+```json
+{
+  "mcpServers": {
+    "biara": {
+      "command": "/path/to/biara",
+      "args": ["mcp", "/path/to/binary"]
+    }
+  }
+}
+```
+
+The binary is optional; the `open` tool switches to another one. Recovery runs in the
+background, and every tool that needs the program waits for it (`wait_seconds`, default 60,
+maximum 600) or returns the current stage so the agent can call again.
+
+| Tool | What it does |
+| --- | --- |
+| `status` | Binary, architecture, format, entry point, stage, counts, notes file |
+| `open` | Switch to another binary |
+| `list_functions`, `list_imports`, `list_strings`, `list_segments` | Paged tables |
+| `list_structs`, `struct_layouts` | Declared structs; the structs one function's pointers reach |
+| `function_info` | Names, size, frame, arguments, signature, locals, comments, callers, callees |
+| `decompile` | Pseudocode with your names and comments applied, paged by line |
+| `disassemble` | Instructions with symbol and comment annotations |
+| `xrefs_to`, `xrefs_from` | Cross-references, with the instruction text |
+| `read_bytes`, `search_bytes` | Hex dump and wildcard byte search |
+| `rename_function`, `rename_data`, `rename_local`, `set_comment` | Write names and comments |
+| `set_signature`, `declare_struct`, `struct_from_param`, `rename_field` | Declare function signatures, structs and field names |
+| `list_notes` | Everything written about the binary |
+
+Names, local renames and comments apply when a line is drawn, so they show up without
+re-analysis; a declared signature or struct re-decompiles affected functions. Recovered
+struct names (`s1`, `f_8`) live only for one decompile: `struct_from_param` declares a struct
+from the layout behind a parameter and types that parameter `struct name *`, and that
+signature is what binds the declaration to the code and makes its field names visible.
+Everything is saved in the same notes file the workbench uses, so a human editing in
+`biara-ui` and an agent in `biara mcp` see each other's changes. The protocol stream owns
+fd 1; fd 1 is pointed at stderr at startup so no engine or LLVM output can corrupt it.
 
 ## Desktop workbench
 
@@ -155,11 +210,12 @@ cargo run --release -p biara-ui                  # empty window: Open…, or dro
 | --- | --- |
 | Disassembly | Every recovered instruction, with function headers, labels with their incoming jumps, string and symbol annotations, clickable targets |
 | Graph | The function's basic blocks as boxes with typed edges (taken, not taken, plain, jump-table case); pan and zoom |
-| Pseudocode | Decompiled C; calls and globals link to their targets, renames apply instantly |
+| Pseudocode | Decompiled C; calls and globals link to their targets; renames (locals too) and comments apply instantly |
 | Hex | The mapped image as 16-byte rows; works before analysis finishes |
 
 The sidebar lists functions, imports, strings and segments, each filterable; the bottom panel
-shows cross-references. `G` goes to an address or name, `N` renames, `X` shows references,
+shows cross-references. `G` goes to an address or name, `N` renames, `;` comments, `Y` sets a
+signature, `X` shows references,
 `Space` flips between disassembly and graph, `F5` opens pseudocode, `Ctrl+K` opens a command
 palette. It stays at 0% CPU when idle. See [`crates/biara-ui/README.md`](crates/biara-ui/README.md)
 for every key, the architecture and the headless testing options.
@@ -194,7 +250,8 @@ bytes do pass through QEMU's frontends, so treat hostile input accordingly.)
 | `biara-engine` | Persistent, process-isolated recovery with a memory budget |
 | `biara-diff` | Function matching between two binaries |
 | `biara-proto` | Shared formats: annotations, job bundles, diff results |
-| `biara-cli` | The `biara` command |
+| `biara-session` | One open binary for interactive clients: background recovery, indexes, decompiler cache, notes |
+| `biara-cli` | The `biara` command, including the MCP server |
 | `biara-ui` | The desktop workbench, on [Rune](https://github.com/anomalyco/rune) |
 
 `libtcg/` and `patches/` hold the small patch that turns QEMU's translator into a library.
@@ -221,7 +278,8 @@ biara is young.
 
 - Mach-O loads on the command line but has not been exercised in the UI.
 - The graph view handles functions up to 1,500 blocks; larger ones use the other views.
-- Renames cover functions and named data, not locals or struct fields.
+- Struct fields can be renamed only in a struct some function parameter points at: naming
+  one declares it and types that parameter `struct name *` in the function's signature.
 - Recovery sometimes lifts a stray non-code byte (94 in all of glibc); the listing shows `db`.
 - The host is Linux x86-64; guests are x86-64 and AArch64.
 

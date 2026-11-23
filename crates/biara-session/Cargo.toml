@@ -1,0 +1,27 @@
+[package]
+name = "biara-session"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "One open binary for interactive clients: background recovery, indexes, decompilation and user notes"
+
+[dependencies]
+biara-abi.workspace = true
+biara-cfg.workspace = true
+biara-engine.workspace = true
+biara-lift.workspace = true
+biara-loader.workspace = true
+biara-proto.workspace = true
+biara-tcg.workspace = true
+anyhow.workspace = true
+parking_lot.workspace = true
+inkwell.workspace = true
+serde_json.workspace = true
+blake3.workspace = true
+iced-x86 = { version = "1.22", default-features = false, features = ["std", "decoder", "intel", "instr_info"] }
+cpp_demangle = "0.5"
+rustc-demangle = "0.1"
+msvc-demangler = "0.11"
+yaxpeax-arch = { version = "0.3", default-features = false, features = ["std"] }
+yaxpeax-arm = { version = "0.5", default-features = false, features = ["std"] }

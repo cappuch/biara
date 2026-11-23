@@ -14,8 +14,11 @@
 //! - any other table hit (call callee, declaration, plain global load,
 //!   address use `&g`, dereference `*g`, function value, cast/type use,
 //!   field-base `g->f`/`g.f` base side) references the table identity;
-//! - member field sides (after `->`/`.`), locals, parameters, keywords,
-//!   numbers, punctuation, comments and string contents carry no symbol.
+//! - the record's own locals and parameters (the renderer's `names` table)
+//!   reference [`biara_proto::tokens::SymbolRef::Local`] by emitted name;
+//! - member field sides (after `->`/`.`), keywords, numbers, punctuation,
+//!   comments and string contents carry no symbol.
+//!
 //! Locals/parameters were uniquified against the table at emission
 //! (colliding spellings suffixed), so table spellings are globally unique
 //! nonlocal names: a hit is a genuine symbol, and shadowing is impossible
@@ -108,6 +111,7 @@ pub fn lex(body: &str, signature: &str, symbols: &[LexSymbol]) -> Vec<Token> {
     let mut functions: BTreeMap<&str, u64> = BTreeMap::new();
     let mut globals: BTreeMap<&str, u64> = BTreeMap::new();
     let mut types: BTreeMap<&str, (u32, u64)> = BTreeMap::new();
+    let mut locals: BTreeMap<&str, &str> = BTreeMap::new();
     // Record scope for type symbols: the body's own function address
     // (first Function entry), so `SymbolRef::Type` encodes
     // `{function, layout}` explicitly.
@@ -130,6 +134,9 @@ pub fn lex(body: &str, signature: &str, symbols: &[LexSymbol]) -> Vec<Token> {
                     *function
                 };
                 types.entry(symbol.text.as_str()).or_insert((*layout, f));
+            }
+            SymbolRef::Local { name } => {
+                locals.entry(symbol.text.as_str()).or_insert(name.as_str());
             }
         }
     }
@@ -350,6 +357,11 @@ pub fn lex(body: &str, signature: &str, symbols: &[LexSymbol]) -> Vec<Token> {
                 // uses all attribute, with the referencing function
                 // scope encoded explicitly.
                 symbol = Some(SymbolRef::Type { layout, function });
+            } else if let Some(&name) = locals.get(token.text) {
+                // The record's own local or parameter: emitted names are unique within it.
+                symbol = Some(SymbolRef::Local {
+                    name: name.to_owned(),
+                });
             }
         }
         tokens.push(Token {

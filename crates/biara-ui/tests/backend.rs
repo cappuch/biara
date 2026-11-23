@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use biara_ui::backend::{self, Event, FunctionKind, Program, XrefKind, recovery};
+use biara_session::{Event, FunctionKind, Program, Types, XrefKind, recovery};
 
 const SOURCE: &str = r#"
 extern int puts(const char *);
@@ -56,7 +56,7 @@ fn build_with(name: &str, flags: &[&str]) -> PathBuf {
 /// Open `binary` and collect events until it is ready (or fails).
 fn recover(binary: PathBuf) -> (Vec<String>, Arc<Program>) {
     let (wake_tx, wake_rx) = mpsc::channel::<()>();
-    let notify: backend::Notify = Arc::new(move || {
+    let notify: biara_session::Notify = Arc::new(move || {
         let _ = wake_tx.send(());
     });
     let options = recovery::OpenOptions {
@@ -137,7 +137,7 @@ fn recovery_reports_stages_in_order_and_builds_the_function_table() {
 
 #[test]
 fn the_listing_covers_every_function_in_address_order() {
-    use biara_ui::backend::HeadKind;
+    use biara_session::HeadKind;
     let (_, program) = recover(build("backend-listing"));
     let heads = &program.listing.heads;
     assert!(
@@ -188,7 +188,7 @@ fn the_listing_covers_every_function_in_address_order() {
 #[test]
 fn the_decompiler_service_returns_navigable_pseudocode_and_caches_it() {
     use biara_proto::tokens::SymbolRef;
-    use biara_ui::backend::decomp::{Decompiler, Status};
+    use biara_session::decomp::{Decompiler, Status};
     let (_, program) = recover(build("backend-decomp"));
     let entry = |n: &str| {
         program
@@ -264,7 +264,7 @@ fn the_decompiler_service_returns_navigable_pseudocode_and_caches_it() {
 
 #[test]
 fn a_functions_flow_graph_has_typed_edges_and_lays_out_without_overlap() {
-    use biara_ui::backend::{FlowError, FlowGraph, graph};
+    use biara_session::{FlowError, FlowGraph, graph};
     let (_, program) = recover(build("backend-flow"));
     let target = program
         .index
@@ -349,7 +349,7 @@ fn a_functions_flow_graph_has_typed_edges_and_lays_out_without_overlap() {
 
 #[test]
 fn debug_information_names_parameters_in_the_pseudocode() {
-    use biara_ui::backend::decomp;
+    use biara_session::decomp;
     // Without debug info the parameter is `arg0`; with it, the source name.
     let (_, plain) = recover(build("backend-nodebug"));
     let target = plain
@@ -359,7 +359,7 @@ fn debug_information_names_parameters_in_the_pseudocode() {
         .find(|f| f.name == "target")
         .unwrap()
         .entry;
-    let before = decomp::decompile(&plain, target).unwrap();
+    let before = decomp::decompile(&plain, &Types::recovered(&plain), target).unwrap();
     assert!(before.signature.contains("arg0"), "{}", before.signature);
 
     let (_, program) = recover(build_with("backend-debug", &["-g"]));
@@ -370,7 +370,7 @@ fn debug_information_names_parameters_in_the_pseudocode() {
         .find(|f| f.name == "target")
         .unwrap()
         .entry;
-    let after = decomp::decompile(&program, target).unwrap();
+    let after = decomp::decompile(&program, &Types::recovered(&program), target).unwrap();
     assert!(
         after.signature.contains(" n)") || after.signature.contains(" n,"),
         "the source name `n` should replace arg0: {}",
@@ -439,7 +439,7 @@ fn scale_report() {
         std::env::var("BIARA_UI_BIG").unwrap_or_else(|_| "/usr/lib64/libc.so.6".into()),
     );
     let (wake_tx, wake_rx) = mpsc::channel::<()>();
-    let notify: backend::Notify = Arc::new(move || {
+    let notify: biara_session::Notify = Arc::new(move || {
         let _ = wake_tx.send(());
     });
     let start = Instant::now();
@@ -499,7 +499,7 @@ fn scale_report() {
 /// decoder cannot read, a different length, or a direct branch that leaves recovered code.
 /// Returns how many were checked and what was wrong.
 fn listing_decode_problems(program: &Program) -> (usize, Vec<String>) {
-    use biara_ui::backend::{HeadKind, disasm};
+    use biara_session::{HeadKind, disasm};
     let (mut checked, mut problems) = (0, Vec::new());
     for head in program
         .listing
@@ -626,7 +626,7 @@ __asm__(".text\n.globl _start\n_start:\n bl guest_main\n mov x8, #93\n svc #0\n"
         String::from_utf8_lossy(&out.stderr)
     );
     let (_, program) = recover(bin);
-    assert_eq!(program.arch, biara_ui::backend::Arch::Aarch64);
+    assert_eq!(program.arch, biara_session::Arch::Aarch64);
     assert!(program.index.functions.iter().any(|f| f.name == "process"));
     assert_listing_decodes(&program);
 }
@@ -640,7 +640,7 @@ fn every_instruction_of_a_system_library_decodes() {
     );
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
     let (wake_tx, wake_rx) = mpsc::channel::<()>();
-    let notify: backend::Notify = Arc::new(move || {
+    let notify: biara_session::Notify = Arc::new(move || {
         let _ = wake_tx.send(());
     });
     let events = recovery::open(

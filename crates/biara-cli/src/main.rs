@@ -15,6 +15,7 @@ use parking_lot::Mutex;
 
 mod decomp;
 mod json;
+mod mcp;
 mod parallelism;
 mod quality;
 mod service;
@@ -54,6 +55,8 @@ enum Cmd {
     Diff(DiffArgs),
     /// Measure function/edge recall for identical mapped code against a symbol oracle.
     Quality(quality::QualityArgs),
+    /// Serve one binary to an AI agent over MCP (JSON-RPC 2.0 on stdio).
+    Mcp(mcp::McpArgs),
     #[command(name = "__worker", hide = true)]
     EngineWorker { config: String },
     /// Run a provider-independent JSON job from a file or stdin.
@@ -160,6 +163,7 @@ fn main() -> Result<()> {
         Cmd::Lift(a) => lift(a),
         Cmd::Diff(a) => diff(a),
         Cmd::Quality(a) => quality::run(a),
+        Cmd::Mcp(a) => mcp::run(a),
         Cmd::EngineWorker { config } => biara_engine::worker(&config).map_err(Into::into),
         Cmd::Worker(a) => service::worker(a),
         Cmd::Service { directory } => service::execute(&directory),

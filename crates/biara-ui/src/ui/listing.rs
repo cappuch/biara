@@ -4,7 +4,7 @@ use std::borrow::Cow;
 
 use rune::{El, GrowthSpec, ScrollSpec, Tx, col, el, row, text};
 
-use crate::backend::{HeadKind, Insn, XrefKind, disasm};
+use biara_session::{HeadKind, Insn, XrefKind, disasm};
 
 use super::{
     App,
@@ -143,7 +143,13 @@ fn build_row(s: &App, i: usize) -> El {
                 )
                 .child(text(hex).font(CODE).color(p.bytes).w(BYTES_W));
             if let Some(insn) = insn {
-                r = r.child(insn_line(s, &insn).build(CODE));
+                let mut line = insn_line(s, &insn);
+                if let Some(comment) = s.notes.comment(head.addr) {
+                    line.push(&format!("   ; {comment}"), p.comment);
+                }
+                r = r.child(line.build(CODE));
+            } else if let Some(comment) = s.notes.comment(head.addr) {
+                r = r.child(text(format!("; {comment}")).font(CODE).color(p.comment));
             }
             r
         }
@@ -191,7 +197,7 @@ pub fn insn_line(s: &App, insn: &Insn) -> Line {
     let mut line = Line::new();
     for span in &insn.spans {
         match (span.tok, span.target) {
-            (crate::backend::Tok::Target, Some(t)) => {
+            (biara_session::Tok::Target, Some(t)) => {
                 line.push_link(&s.label(t), p.target, format!("{t:x}"));
             }
             _ => {
@@ -203,7 +209,7 @@ pub fn insn_line(s: &App, insn: &Insn) -> Line {
     let pointed = insn.data_ref.or_else(|| {
         insn.spans
             .iter()
-            .filter(|sp| sp.tok == crate::backend::Tok::Number)
+            .filter(|sp| sp.tok == biara_session::Tok::Number)
             .filter_map(|sp| {
                 sp.text
                     .strip_prefix("0x")
@@ -238,7 +244,7 @@ pub fn reveal(app: &App, tx: &mut Tx) {
 /// cursor: spacing rows, and the header or label that share an address with an instruction,
 /// are passed over. `None` at either end.
 pub fn step(app: &App, delta: isize) -> Option<u64> {
-    use crate::backend::HeadKind;
+    use biara_session::HeadKind;
     let heads = &app.program.as_ref()?.listing.heads;
     let mut row = app.program.as_ref()?.listing.row_of(app.cur)? as isize;
     loop {

@@ -527,6 +527,8 @@ pub struct TransformedC<'ctx> {
     strings: Vec<(u64, String)>,
     protos: Vec<(String, u32, u64, bool)>,
     structs: BTreeMap<String, biara_proto::annotations::StructAnnotation>,
+    /// Local renames and comments, applied to each finished package.
+    notes: crate::notes::Notes,
 }
 
 /// Shared core of [`prepare_c`] and [`prepare_c_selected`]: compute unique
@@ -1681,6 +1683,7 @@ impl<'ctx> PreparedC<'ctx> {
         Ok(TransformedC {
             layouts: None,
             layout_debug_dirty: false,
+            notes: Default::default(),
             module,
             cpu: summaries.cpu,
             conv_args: summaries.conv_args,
@@ -1730,6 +1733,7 @@ unsafe extern "C" fn write_cb(ctx: *mut c_void, p: *const c_char, n: usize) -> i
 
 struct PackageState<'a> {
     consumer: &'a mut dyn FnMut(FunctionPackage) -> std::io::Result<()>,
+    notes: &'a crate::notes::Notes,
     err: Option<std::io::Error>,
 }
 unsafe extern "C" fn package_cb(ctx: *mut c_void, p: *const c_char, n: usize) -> i32 {
@@ -1747,7 +1751,7 @@ unsafe extern "C" fn package_cb(ctx: *mut c_void, p: *const c_char, n: usize) ->
         // Hostile spans (out-of-range/overlapping) surface as consumer
         // errors, never panics: `package_cb` returns nonzero and the
         // error reaches `visit_functions` as `Error::Io`.
-        let table: Vec<crate::tokens::LexSymbol> = match &package.symbols {
+        let mut table: Vec<crate::tokens::LexSymbol> = match &package.symbols {
             Some(native) => {
                 let mut table = Vec::with_capacity(
                     native.functions.len() + native.globals.len() + native.types.len(),
@@ -1777,7 +1781,18 @@ unsafe extern "C" fn package_cb(ctx: *mut c_void, p: *const c_char, n: usize) ->
             }
             None => fallback_symbols(&package),
         };
+        // The record's own locals and parameters, by the names the renderer emitted.
+        table.extend(package.names.iter().map(|n| crate::tokens::LexSymbol {
+            text: n.name.clone(),
+            symbol: biara_proto::tokens::SymbolRef::Local {
+                name: n.name.clone(),
+            },
+        }));
         package.tokens = crate::tokens::lex(&package.body, &package.signature, &table);
+        state
+            .notes
+            .apply(&mut package, &table)
+            .map_err(std::io::Error::other)?;
         (state.consumer)(package)
     }));
     match result {
@@ -2007,10 +2022,13 @@ impl<'ctx> TransformedC<'ctx> {
     /// scoped to the referencing function record). Identity derives from
     /// real LLVM/native entities at emission, never lexical guesses:
     /// declarations, plain global loads, address uses, calls/function
-    /// values, casts and type uses all attribute; member-field sides,
-    /// locals, parameters, keywords, numbers, comments and string contents
-    /// never do. Locals were suffixed against the table at emission, so a
-    /// rename substitution touches only genuine symbols.
+    /// values, casts and type uses all attribute; the record's locals and
+    /// parameters attribute as `Local` by emitted name; member-field sides,
+    /// keywords, numbers, comments and string contents never do. Locals
+    /// were suffixed against the table at emission, so a rename
+    /// substitution touches only genuine symbols. Local renames and
+    /// comments from [`TransformedC::apply_annotations`] are already
+    /// applied to the records passed to `consumer`.
     pub fn visit_functions(
         mut self,
         consumer: &mut dyn FnMut(FunctionPackage) -> std::io::Result<()>,
@@ -2019,8 +2037,10 @@ impl<'ctx> TransformedC<'ctx> {
         // renderer emits carries final spellings; tokens resolve in
         // `package_cb` against each record's own `symbols` table.
         self.layout_facts()?;
+        let notes = std::mem::take(&mut self.notes);
         let mut state = PackageState {
             consumer,
+            notes: &notes,
             err: None,
         };
         let result = self.emit(
@@ -2036,8 +2056,11 @@ impl<'ctx> TransformedC<'ctx> {
 
     /// Apply annotation display names: function renames (same contract as
     /// [`PreparedC::apply_annotations`]), global renames over the data
-    /// table, and struct display renames over the cached layout analysis.
-    /// Layout ids, sizes, offsets and bindings never move; struct
+    /// table, struct display renames over the cached layout analysis, and
+    /// local renames and address comments over each rendered record (see
+    /// [`TransformedC::visit_functions`]; a missing local or a name its body
+    /// already uses fails the visit). Layout ids, sizes, offsets and
+    /// bindings never move; struct
     /// declarations that cover no recovered layout leave output unchanged.
     pub fn apply_annotations(&mut self, annotations: &Annotations) -> Result<(), Error> {
         self.layout_debug_dirty = self.layout_debug_dirty
@@ -2046,6 +2069,7 @@ impl<'ctx> TransformedC<'ctx> {
         apply_renames(&self.module, &mut self.entries, &mut self.fns, annotations)?;
         apply_global_renames(&mut self.data, annotations)?;
         self.structs = annotations.structs.clone();
+        self.notes = crate::notes::Notes::new(annotations);
         Ok(())
     }
 
@@ -2522,6 +2546,7 @@ mod tests {
         let transformed = TransformedC {
             layouts: None,
             layout_debug_dirty: false,
+            notes: Default::default(),
             module,
             cpu: Vec::new(),
             conv_args: Vec::new(),
@@ -2569,6 +2594,7 @@ mod tests {
         TransformedC {
             layouts: None,
             layout_debug_dirty: false,
+            notes: Default::default(),
             module,
             cpu: Vec::new(),
             conv_args: Vec::new(),

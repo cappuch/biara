@@ -6,21 +6,30 @@
 //! functions decompiles the one you land on, not the nine you passed. Finished functions are
 //! cached for the session, the least recently asked for leaving once they hold more than
 //! [`CACHE_BYTES`]: one huge function's pseudocode takes hundreds of megabytes.
+//!
+//! Names (of functions, data and locals) and comments apply when a line is drawn or printed,
+//! from the tokens' identities, so changing them never decompiles again. Signatures and
+//! declared structs change the code itself: [`Decompiler::set_types`] drops every cached
+//! result.
 
 use std::{
-    collections::{BTreeSet, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     sync::Arc,
 };
 
 use biara_lift::DecompileOptions;
 use biara_proto::{
     FunctionPackage, PackageSymbols,
-    packages::PackageStatement,
-    tokens::{Token, TokenKind},
+    annotations::Annotations,
+    packages::{PackageStatement, place_comments},
+    tokens::{SymbolRef, Token, TokenKind},
 };
 use parking_lot::{Condvar, Mutex};
 
-use super::{Notify, Program};
+use super::{
+    Notify, Program,
+    types::{StructLayout, Types, layouts_of},
+};
 
 /// One decompiled function, as the pseudocode view shows it.
 #[derive(Clone, Debug)]
@@ -36,6 +45,13 @@ pub struct Decompiled {
     pub symbols: PackageSymbols,
     /// Where each line of `body` is, and which tokens are on it.
     pub lines: Vec<LineSpan>,
+    /// The names the decompiler gave the function's locals and parameters; tokens refer to
+    /// them as [`SymbolRef::Local`].
+    pub locals: Vec<String>,
+    /// The line (0-based) defining the function, if a token names its entry.
+    pub signature_line: Option<usize>,
+    /// The structs the function uses, recovered or declared.
+    pub layouts: Vec<StructLayout>,
     /// The guest instructions behind each line: line `i`'s are
     /// `addresses[address_ends[i - 1]..address_ends[i]]` (from 0 for the first line).
     addresses: Vec<u64>,
@@ -64,7 +80,6 @@ impl Decompiled {
         &self.body[l.start..l.end]
     }
 
-    /// Addresses of the instructions that produced line `i` (0-based), if known.
     /// Roughly the memory it holds.
     fn footprint(&self) -> usize {
         self.body.len()
@@ -72,13 +87,57 @@ impl Decompiled {
             + self.lines.len() * std::mem::size_of::<LineSpan>()
             + self.addresses.len() * 8
             + self.address_ends.len() * 4
+            + self.locals.iter().map(|l| l.len() + 24).sum::<usize>()
     }
 
+    /// Addresses of the instructions that produced line `i` (0-based), if known.
     pub fn line_addresses(&self, i: usize) -> &[u64] {
         let start = i
             .checked_sub(1)
             .map_or(0, |p| self.address_ends[p] as usize);
         &self.addresses[start..self.address_ends[i] as usize]
+    }
+
+    /// Which of `comments` show on which line (0-based): each on the first line mapped to its
+    /// address, a comment on the entry nothing maps on the signature line. Scans every line,
+    /// so callers cache it per document and comment set.
+    pub fn comment_lines<'c>(
+        &self,
+        comments: &'c BTreeMap<u64, String>,
+    ) -> BTreeMap<usize, Vec<(u64, &'c str)>> {
+        place_comments(
+            (0..self.lines.len()).map(|i| (i, self.line_addresses(i))),
+            self.entry,
+            self.signature_line,
+            comments,
+        )
+    }
+
+    /// Line `i` (0-based) as text, each token with a symbol spelled as `name` says (or as
+    /// emitted when it says `None`).
+    pub fn render_line(
+        &self,
+        i: usize,
+        name: &dyn Fn(&SymbolRef, &str) -> Option<String>,
+    ) -> String {
+        let l = &self.lines[i];
+        let mut out = String::with_capacity(l.end - l.start);
+        let mut at = l.start;
+        for t in self.line_tokens(i) {
+            let (start, end) = (t.start as usize, (t.end as usize).min(l.end));
+            let Some(symbol) = &t.symbol else { continue };
+            if start < at || end <= start {
+                continue;
+            }
+            let raw = &self.body[start..end];
+            if let Some(new) = name(symbol, raw) {
+                out.push_str(&self.body[at..start]);
+                out.push_str(&new);
+                at = end;
+            }
+        }
+        out.push_str(&self.body[at..l.end]);
+        out
     }
 }
 
@@ -138,6 +197,11 @@ impl From<FunctionPackage> for Decompiled {
         p.tokens.shrink_to_fit();
         let lines = index_lines(&p.body, &p.tokens);
         let (addresses, address_ends) = index_addresses(lines.len(), &p.statements);
+        let signature_line = p
+            .tokens
+            .iter()
+            .find(|t| matches!(t.symbol, Some(SymbolRef::Function { address }) if address == p.address))
+            .map(|t| bytecount_newlines(&p.body[..t.start as usize]));
         Decompiled {
             entry: p.address,
             name: p.name,
@@ -146,10 +210,17 @@ impl From<FunctionPackage> for Decompiled {
             tokens: p.tokens,
             symbols: p.symbols.unwrap_or_default(),
             lines,
+            locals: p.names.into_iter().map(|n| n.name).collect(),
+            signature_line,
+            layouts: Vec::new(),
             addresses,
             address_ends,
         }
     }
+}
+
+fn bytecount_newlines(s: &str) -> usize {
+    s.bytes().filter(|&b| b == b'\n').count()
 }
 
 /// Where a function's decompilation stands.
@@ -163,12 +234,13 @@ pub enum Status {
     Failed(Arc<str>),
 }
 
-/// Decompile `entry` now, on the calling thread.
-pub fn decompile(program: &Program, entry: u64) -> Result<Decompiled, String> {
-    run(program, entry).map_err(|e| format!("{e:#}"))
+/// Decompile `entry` now, on the calling thread, with `types` (recovery's, or what the notes
+/// declare).
+pub fn decompile(program: &Program, types: &Types, entry: u64) -> Result<Decompiled, String> {
+    run(program, types, entry).map_err(|e| format!("{e:#}"))
 }
 
-fn run(program: &Program, entry: u64) -> anyhow::Result<Decompiled> {
+fn run(program: &Program, types: &Types, entry: u64) -> anyhow::Result<Decompiled> {
     use anyhow::Context as _;
     let cx = inkwell::context::Context::create();
     let machine = biara_lift::analysis_machine()?;
@@ -192,7 +264,7 @@ fn run(program: &Program, entry: u64) -> anyhow::Result<Decompiled> {
             &machine,
             lib.info(),
             &program.cfg,
-            &program.abis,
+            &types.abis,
             &name_of,
             &banner,
             &program.image.data,
@@ -205,7 +277,14 @@ fn run(program: &Program, entry: u64) -> anyhow::Result<Decompiled> {
         DecompileOptions::default(),
     )?;
     transformed.apply_image_debug(&program.image);
+    if !types.structs.is_empty() {
+        transformed.apply_annotations(&Annotations {
+            structs: types.structs.clone(),
+            ..Annotations::default()
+        })?;
+    }
     transformed.select_functions(&[entry]);
+    let layouts = layouts_of(&transformed.layout_facts()?, entry, &types.structs);
     let mut found = None;
     transformed.visit_functions(&mut |package| {
         if package.address == entry {
@@ -213,14 +292,18 @@ fn run(program: &Program, entry: u64) -> anyhow::Result<Decompiled> {
         }
         Ok(())
     })?;
-    found
+    let mut doc = found
         .map(Decompiled::from)
-        .with_context(|| format!("no output for {entry:#x}"))
+        .with_context(|| format!("no output for {entry:#x}"))?;
+    doc.layouts = layouts;
+    Ok(doc)
 }
 
 struct Shared {
     queue: Mutex<Queue>,
     wake: Condvar,
+    /// What decompiles use: recovery's calling conventions, or the notes' declarations.
+    types: Mutex<Arc<Types>>,
 }
 
 /// How much finished pseudocode the cache keeps, beyond the latest result.
@@ -236,6 +319,8 @@ struct Queue {
     closed: bool,
     /// Results delivered so far; the UI compares it to know when to redraw.
     completed: u64,
+    /// Bumped when the declared types change; a result begun before is stale.
+    generation: u64,
 }
 
 impl Queue {
@@ -268,6 +353,7 @@ impl Queue {
 /// A background decompiler for one program.
 pub struct Decompiler {
     shared: Arc<Shared>,
+    program: Arc<Program>,
 }
 
 impl Decompiler {
@@ -275,13 +361,16 @@ impl Decompiler {
         let shared = Arc::new(Shared {
             queue: Mutex::new(Queue::default()),
             wake: Condvar::new(),
+            types: Mutex::new(Arc::new(Types::recovered(&program))),
         });
         let worker = shared.clone();
+        let worker_program = program.clone();
         std::thread::Builder::new()
             .name("biara-decompiler".into())
             .spawn(move || {
+                let program = worker_program;
                 loop {
-                    let entry = {
+                    let (entry, generation) = {
                         let mut q = worker.queue.lock();
                         loop {
                             if q.closed {
@@ -289,21 +378,50 @@ impl Decompiler {
                             }
                             // Newest first: the function you are looking at, not the ones you passed.
                             if let Some(e) = q.pending.pop_back() {
-                                break e;
+                                break (e, q.generation);
                             }
                             worker.wake.wait(&mut q);
                         }
                     };
-                    let status = match decompile(&program, entry) {
+                    let types = worker.types.lock().clone();
+                    let status = match decompile(&program, &types, entry) {
                         Ok(d) => Status::Done(Arc::new(d)),
                         Err(e) => Status::Failed(e.into()),
                     };
-                    worker.queue.lock().finish(entry, status, CACHE_BYTES);
+                    let mut q = worker.queue.lock();
+                    if q.generation == generation {
+                        q.finish(entry, status, CACHE_BYTES);
+                    } else if !q.pending.contains(&entry) {
+                        // The declared types changed while it ran: do it again.
+                        q.pending.push_back(entry);
+                        continue;
+                    }
+                    drop(q);
                     notify();
                 }
             })
             .expect("spawn decompiler thread");
-        Decompiler { shared }
+        Decompiler { shared, program }
+    }
+
+    /// Decompile from now on with the signatures and structs `annotations` declare, dropping
+    /// every cached result. When a signature does not fit its function, nothing changes and
+    /// the error says which.
+    pub fn set_types(&self, annotations: &Annotations) -> Result<(), String> {
+        let types = Types::declared(&self.program, annotations)?;
+        *self.shared.types.lock() = Arc::new(types);
+        let mut q = self.shared.queue.lock();
+        q.generation += 1;
+        q.done.retain(|_, s| matches!(s, Status::Pending));
+        q.kept.clear();
+        q.kept_bytes = 0;
+        q.completed += 1;
+        Ok(())
+    }
+
+    /// Bumped by [`Decompiler::set_types`]: a result fetched before is out of date.
+    pub fn generation(&self) -> u64 {
+        self.shared.queue.lock().generation
     }
 
     /// Ask for `entry`. Does nothing when it is cached or already queued; a queued request
@@ -366,6 +484,9 @@ mod tests {
             tokens: vec![],
             symbols: Default::default(),
             lines: vec![],
+            locals: vec![],
+            signature_line: None,
+            layouts: vec![],
             addresses: vec![],
             address_ends: vec![],
         }))
@@ -429,6 +550,9 @@ mod tests {
             tokens,
             symbols: Default::default(),
             lines,
+            locals: vec![],
+            signature_line: Some(0),
+            layouts: vec![],
             addresses,
             address_ends,
         };
@@ -445,5 +569,66 @@ mod tests {
         assert_eq!(d.line_addresses(1), [] as [u64; 0]);
         assert_eq!(d.line_addresses(2), [0x10, 0x14]);
         assert_eq!(d.line_addresses(4), [] as [u64; 0]);
+    }
+
+    #[test]
+    fn lines_print_with_names_and_take_their_comments() {
+        let body = "int f(int arg0)\n{\n    return g(arg0) + arg0x;\n}";
+        let sym = |start: u64, end: u64, symbol: SymbolRef| Token {
+            start,
+            end,
+            kind: TokenKind::Identifier,
+            symbol: Some(symbol),
+        };
+        let local = || SymbolRef::Local {
+            name: "arg0".into(),
+        };
+        let tokens = vec![
+            sym(4, 5, SymbolRef::Function { address: 0x10 }),
+            sym(10, 14, local()),
+            sym(29, 30, SymbolRef::Function { address: 0x20 }),
+            sym(31, 35, local()),
+            tok(39, 44),
+        ];
+        let lines = index_lines(body, &tokens);
+        let statement = |line: u64, addresses: Vec<u64>| PackageStatement {
+            id: String::new(),
+            line,
+            text: String::new(),
+            addresses,
+            provenance: String::new(),
+        };
+        let (addresses, address_ends) =
+            index_addresses(lines.len(), &[statement(3, vec![0x14, 0x18])]);
+        let d = Decompiled {
+            entry: 0x10,
+            name: "f".into(),
+            signature: String::new(),
+            body: body.into(),
+            tokens,
+            symbols: Default::default(),
+            lines,
+            locals: vec!["arg0".into()],
+            signature_line: Some(0),
+            layouts: vec![],
+            addresses,
+            address_ends,
+        };
+        let names = |s: &SymbolRef, _: &str| match s {
+            SymbolRef::Local { name } if name == "arg0" => Some("count".to_owned()),
+            SymbolRef::Function { address: 0x20 } => Some("helper".to_owned()),
+            _ => None,
+        };
+        assert_eq!(d.render_line(0, &names), "int f(int count)");
+        // `arg0x` has no symbol, so it stays even though it starts with a renamed name.
+        assert_eq!(
+            d.render_line(2, &names),
+            "    return helper(count) + arg0x;"
+        );
+        let comments = BTreeMap::from([(0x10, "entry".to_owned()), (0x18, "sum".to_owned())]);
+        assert_eq!(
+            d.comment_lines(&comments),
+            BTreeMap::from([(0, vec![(0x10, "entry")]), (2, vec![(0x18, "sum")])])
+        );
     }
 }

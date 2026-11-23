@@ -18,6 +18,7 @@ biara-lift = { path = "crates/biara-lift" }
 biara-diff = { path = "crates/biara-diff" }
 biara-engine = { path = "crates/biara-engine" }
 biara-proto = { path = "crates/biara-proto" }
+biara-session = { path = "crates/biara-session" }
 
 anyhow = "1.0.104"
 bindgen = "0.73.2"

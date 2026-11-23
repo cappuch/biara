@@ -42,6 +42,7 @@ mod integer;
 pub mod layouts;
 mod lower;
 mod memory;
+mod notes;
 pub mod output;
 mod packages;
 pub mod signatures;
