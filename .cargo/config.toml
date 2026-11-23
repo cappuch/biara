@@ -3,6 +3,9 @@
 [env]
 LLVM_SYS_231_PREFIX = { value = ".deps/llvm-sys-23.1.2", relative = true }
 LIBCLANG_PATH = { value = ".deps/llvm-23.1.2/lib", relative = true }
+# bindgen asks this clang for its built-in include directory (stddef.h); without it, it needs
+# a system clang on PATH.
+CLANG_PATH = { value = ".deps/llvm-23.1.2/bin/clang", relative = true }
 BIARA_LIBTCG_DIR = { value = ".deps/out", relative = true }
 # Cross-compiles the AArch64 test corpus (crates/biara-lift/tests/aarch64.rs).
 BIARA_CLANG = { value = ".deps/llvm-23.1.2/bin/clang", relative = true }

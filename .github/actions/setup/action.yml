@@ -1,0 +1,54 @@
+name: Toolchain
+description: >
+  Install the system packages, the Rust toolchain and the pinned LLVM, and build (or restore)
+  the libtcg lifters into .deps/out. .deps and target live on /mnt: the unpacked LLVM alone is
+  12 GB.
+
+runs:
+  using: composite
+  steps:
+    - name: System packages
+      shell: bash
+      run: |
+        sudo apt-get update -q
+        sudo apt-get install -q -y --no-install-recommends \
+          build-essential curl zstd xz-utils ninja-build pkg-config \
+          python3 python3-venv libglib2.0-dev \
+          zlib1g-dev libzstd-dev libxml2-dev liblzma-dev
+
+    - name: Rust
+      shell: bash
+      run: |
+        rustup toolchain install stable --profile minimal --no-self-update
+        rustup default stable
+        rustc --version
+
+    - name: Space on /mnt
+      shell: bash
+      run: |
+        sudo mkdir -p /mnt/deps /mnt/target
+        sudo chown "$USER" /mnt/deps /mnt/target
+        ln -sfn /mnt/deps .deps
+        ln -sfn /mnt/target target
+
+    - name: Cache downloads
+      uses: actions/cache@v4
+      with:
+        path: .deps/dl
+        key: deps-dl-${{ hashFiles('scripts/versions.sh') }}
+
+    - name: Fetch QEMU and LLVM
+      shell: bash
+      run: scripts/fetch-deps.sh
+
+    - name: Cache lifters
+      id: lifters
+      uses: actions/cache@v4
+      with:
+        path: .deps/out
+        key: libtcg-${{ runner.os }}-${{ hashFiles('scripts/**', 'patches/**', 'libtcg/**') }}
+
+    - name: Build lifters
+      if: steps.lifters.outputs.cache-hit != 'true'
+      shell: bash
+      run: scripts/build-libtcg.sh
