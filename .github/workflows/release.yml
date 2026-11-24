@@ -1,15 +1,23 @@
 name: Release
 
-# A `v*` tag builds the Linux x86-64 and macOS arm64 binaries with their lifters and publishes
-# them, with the GPL source of the lifters, as a GitHub release. A manual run builds the same
-# archives as workflow artifacts only.
+# Builds the Linux x86-64 and macOS arm64 archives (binaries with their lifters) for every push
+# and manual run. A branch's latest successful build replaces the assets of its rolling
+# pre-release `build-<branch>` (what scripts/install.sh downloads, without signing in); a `v*`
+# tag publishes a versioned release. Both carry the GPL source of the lifters.
 on:
   push:
+    branches: ['**']
     tags: ['v*']
   workflow_dispatch:
 
+# A newer commit on the same branch supersedes an unfinished build; tags always finish.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
 permissions:
-  contents: write
+  contents: read
+  actions: read # the macOS build polls this run's artifacts for the helper bitcode
 
 env:
   CARGO_TERM_COLOR: always
@@ -68,10 +76,10 @@ jobs:
           [[ $GITHUB_REF_TYPE == tag ]] || version=$(git rev-parse --short HEAD)
           name=biara-$version-${{ matrix.platform }}
           mkdir -p dist/$name
-          # biara-ui and `biara mcp` find the lifters next to the executable; `biara lift`
-          # takes BIARA_LIBTCG_DIR.
+          # biara and biara-ui find the lifters next to the executable; `biara update` runs
+          # the install script that came with it.
           cp target/release/biara target/release/biara-ui .deps/out/libtcg-*.$DSO \
-            .deps/out/helpers-*.bc dist/$name/
+            .deps/out/helpers-*.bc scripts/install.sh dist/$name/
           cp -R LICENSE THIRD_PARTY_NOTICES.md README.md licenses dist/$name/
           cp patches/README.md dist/$name/LIFTERS-LICENSE.md
 
@@ -116,18 +124,18 @@ jobs:
           fi
           ls -l dist
 
-      # The unpacked archive decompiles on its own: lifters, helpers and (macOS) the
-      # bundled libraries load from it.
+      # Installed by its install script, the archive decompiles on its own: lifters, helpers
+      # and (macOS) the bundled libraries load from it through the bin links.
       - name: Smoke-test the archive
         run: |
           tmp=$(mktemp -d)
-          tar -xJf dist/biara-*-${{ matrix.platform }}.tar.xz -C "$tmp"
-          app=$(echo "$tmp"/biara-*)
+          sh scripts/install.sh --archive dist/biara-*-${{ matrix.platform }}.tar.xz \
+            --home "$tmp/home" --bin "$tmp/bin" --no-modify-path
           printf '%s\n' '__attribute__((noinline)) long triple(long x) { return x * 3 + 1; }' \
             'void _start(void) { for (;;) triple(2); }' > "$tmp/guest.c"
           .deps/llvm-23.1.2/bin/clang --target=x86_64-linux-gnu -O1 -ffreestanding -nostdlib \
             -static -fuse-ld=lld "$tmp/guest.c" -o "$tmp/guest"
-          BIARA_LIBTCG_DIR=$app "$app/biara" lift "$tmp/guest" triple --emit decomp \
+          "$tmp/bin/biara" lift "$tmp/guest" triple --emit decomp \
             --database "$tmp/db.sqlite" | tee "$tmp/out.txt"
           grep -q triple "$tmp/out.txt"
 
@@ -137,11 +145,55 @@ jobs:
           path: dist/*.tar.xz
           if-no-files-found: error
 
+  branch:
+    name: Publish the branch build
+    needs: build
+    if: github.ref_type == 'branch'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - name: Update the rolling release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          # Keep in sync with scripts/install.sh.
+          tag=build-$(printf '%s' "$BRANCH" | tr -c 'A-Za-z0-9._-' '-')
+          # Stable asset names (the archives' directories keep the commit).
+          mkdir upload
+          for f in dist/*.tar.xz; do
+            cp "$f" "upload/$(basename "$f" | sed 's/^biara-[^-]*-/biara-/')"
+          done
+          (cd upload && sha256sum *.tar.xz > SHA256SUMS)
+          ls -l upload
+          notes="Latest successful build of \`$BRANCH\` ($GITHUB_SHA).
+
+          \`\`\`sh
+          curl -fsSL https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/scripts/install.sh | sh -s -- --branch $BRANCH
+          \`\`\`"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$tag" upload/* --clobber --repo "$GITHUB_REPOSITORY"
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/$tag" \
+              -f sha="$GITHUB_SHA" -F force=true > /dev/null
+            gh release edit "$tag" --notes "$notes" --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$tag" upload/* --target "$GITHUB_SHA" --prerelease --latest=false \
+              --title "Build of $BRANCH" --notes "$notes" --repo "$GITHUB_REPOSITORY"
+          fi
+
   publish:
     name: Publish
     needs: build
     if: github.ref_type == 'tag'
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v8
         with:
