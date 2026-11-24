@@ -1,0 +1,122 @@
+diff -r a/common-user/meson.build b/common-user/meson.build
+--- a/common-user/meson.build	2026-11-23 22:24:49.934943804 +0100
++++ b/common-user/meson.build	2026-11-23 22:24:49.937055165 +0100
+@@ -4,6 +4,10 @@
+ 
+ common_user_inc += include_directories('host/' / host_arch)
+ 
++if host_os != 'linux'
++  subdir_done()
++endif
++
+ user_ss.add(files(
+   'mmap-min-addr.c',
+   'probe-guest-base.c',
+diff -r a/configure b/configure
+--- a/configure	2026-11-23 22:24:49.933373896 +0100
++++ b/configure	2026-11-23 22:24:49.937152148 +0100
+@@ -793,7 +793,9 @@
+     if [ "$linux_user" != no ]; then
+         if [ "$host_os" = linux ]; then
+             linux_user=yes
+-        elif [ "$linux_user" = yes ]; then
++        elif [ "$linux_user" = yes ] && [ "$host_os" != darwin ]; then
++            # Elsewhere only libtcg is built from a linux-user target (see
++            # meson.build), never the emulator.
+             error_exit "linux-user not supported on this architecture"
+         fi
+         if [ "$linux_user" = "yes" ]; then
+diff -r a/gdbstub/user-target.c b/gdbstub/user-target.c
+--- a/gdbstub/user-target.c	2026-11-23 22:24:49.935895954 +0100
++++ b/gdbstub/user-target.c	2026-11-23 22:24:49.965801328 +0100
+@@ -13,7 +13,8 @@
+ #include "gdbstub/syscalls.h"
+ #include "qemu.h"
+ #include "internals.h"
+-#ifdef CONFIG_LINUX
++/* macOS builds the linux-user targets' translator too (libtcg). */
++#if defined(CONFIG_LINUX) || defined(CONFIG_DARWIN)
+ #include "linux-user/loader.h"
+ #include "linux-user/qemu.h"
+ #endif
+diff -r a/linux-user/meson.build b/linux-user/meson.build
+--- a/linux-user/meson.build	2026-11-23 22:24:49.934488550 +0100
++++ b/linux-user/meson.build	2026-11-23 22:24:49.937225103 +0100
+@@ -59,4 +59,6 @@
+ subdir('x86_64')
+ subdir('xtensa')
+ 
+-specific_ss.add_all(when: 'CONFIG_LINUX_USER', if_true: linux_user_ss)
++if host_os == 'linux'
++  specific_ss.add_all(when: 'CONFIG_LINUX_USER', if_true: linux_user_ss)
++endif
+diff -r a/linux-user/syscall_defs.h b/linux-user/syscall_defs.h
+--- a/linux-user/syscall_defs.h	2026-11-23 22:24:49.935429302 +0100
++++ b/linux-user/syscall_defs.h	2026-11-23 22:24:49.937330032 +0100
+@@ -9,7 +9,12 @@
+ 
+ #include "syscall_nr.h"
+ 
++#ifdef __APPLE__
++/* <sys/cdefs.h> defines __unused; the target structs use it as a field name. */
++#undef __unused
++#endif
+ 
++
+ /* socket operations for socketcall() */
+ #define TARGET_SYS_SOCKET       1         /* socket()              */
+ #define TARGET_SYS_BIND         2         /* bind()                */
+diff -r a/meson.build b/meson.build
+--- a/meson.build	2026-11-23 22:24:49.933897639 +0100
++++ b/meson.build	2026-11-23 22:24:49.937563611 +0100
+@@ -3286,7 +3286,7 @@
+ foreach target : target_dirs
+   config_target = { 'TARGET_NAME': target.split('-')[0] }
+   if target.endswith('linux-user')
+-    if host_os != 'linux'
++    if host_os not in ['linux', 'darwin']
+       if default_targets
+         continue
+       endif
+@@ -4314,11 +4314,13 @@
+     )
+     if 'CONFIG_LINUX_USER' in config_target
+       dir = base_dir / abi
+-      arch_srcs += files(
+-        dir / 'cpu_loop.c',
+-        dir / 'elfload.c',
+-        dir / 'signal.c',
+-      )
++      if host_os == 'linux'
++        arch_srcs += files(
++          dir / 'cpu_loop.c',
++          dir / 'elfload.c',
++          dir / 'signal.c',
++        )
++      endif
+       if config_target.has_key('TARGET_SYSTBL_ABI')
+         arch_srcs += \
+           syscall_nr_generators[abi].process(base_dir / abi / config_target['TARGET_SYSTBL'],
+@@ -4492,7 +4494,21 @@
+ 
+   # libtcg: the same objects as qemu-<target>, linked as a shared library
+   # exposing only the libtcg_* translation API (see libtcg/libtcg.h).
+-  if target_type == 'user' and 'CONFIG_LINUX_USER' in config_target
++  # On macOS the linux-user and common-user sources are not built (they
++  # need a Linux host); libtcg/user-stubs.c stands in for what the
++  # translator links against.
++  if target_type == 'user' and 'CONFIG_LINUX_USER' in config_target and host_os == 'darwin'
++    shared_library('tcg-' + target_name,
++                   files('libtcg/libtcg.c', 'libtcg/user-stubs.c'),
++                   c_args: c_args,
++                   include_directories: target_inc + include_directories('libtcg'),
++                   dependencies: arch_deps + [target_stubs],
++                   objects: lib.extract_all_objects(recursive: true),
++                   link_args: link_args + ['-Wl,-exported_symbol,_libtcg_*'],
++                   name_prefix: 'lib',
++                   build_by_default: true,
++                   install: false)
++  elif target_type == 'user' and 'CONFIG_LINUX_USER' in config_target
+     libtcg_ver = meson.current_source_dir() / 'libtcg' / 'libtcg.ver'
+     shared_module('tcg-' + target_name,
+                   files('libtcg/libtcg.c'),

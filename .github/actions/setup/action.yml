@@ -1,20 +1,45 @@
 name: Toolchain
 description: >
   Install the system packages, the Rust toolchain and the pinned LLVM, and build (or restore)
-  the libtcg lifters into .deps/out. .deps and target live on /mnt: the unpacked LLVM alone is
-  12 GB.
+  the libtcg lifters into .deps/out. On Linux, .deps and target live on /mnt: the unpacked LLVM
+  alone is 12 GB. macOS builds no helper bitcode: download it into .deps/out afterwards.
 
 runs:
   using: composite
   steps:
-    - name: System packages
+    - name: System packages (Linux)
+      if: runner.os == 'Linux'
       shell: bash
       run: |
         sudo apt-get update -q
         sudo apt-get install -q -y --no-install-recommends \
           build-essential curl zstd xz-utils ninja-build pkg-config \
-          python3 python3-venv libglib2.0-dev elfutils \
+          python3 python3-venv libglib2.0-dev \
           zlib1g-dev libzstd-dev libxml2-dev liblzma-dev libffi-dev libxkbcommon-dev
+
+    - name: System packages (macOS)
+      if: runner.os == 'macOS'
+      shell: bash
+      run: |
+        brew install --quiet ninja glib pkgconf zstd xz
+        # The pinned clang (QEMU, bindgen, the linker) needs the SDK spelled out.
+        echo "SDKROOT=$(xcrun --show-sdk-path)" >> "$GITHUB_ENV"
+
+    # LLVM (about 10 GB unpacked) plus a debug build whose every test binary links LLVM
+    # statically outgrow the runner's free space; drop what the build never uses.
+    - name: Free disk space (macOS)
+      if: runner.os == 'macOS'
+      shell: bash
+      run: |
+        df -h /System/Volumes/Data
+        keep=$(realpath "$(xcode-select -p)/../..")
+        for app in /Applications/Xcode*.app; do
+          [[ -L $app || $(realpath "$app") == "$keep" ]] || sudo rm -rf "$app"
+        done
+        sudo rm -rf ~/Library/Android /usr/local/share/android-sdk \
+          ~/Library/Developer/CoreSimulator /Library/Developer/CoreSimulator/Volumes \
+          ~/.dotnet /usr/local/share/dotnet ~/hostedtoolcache /Users/runner/hostedtoolcache
+        df -h /System/Volumes/Data
 
     - name: Rust
       shell: bash
@@ -24,6 +49,7 @@ runs:
         rustc --version
 
     - name: Space on /mnt
+      if: runner.os == 'Linux'
       shell: bash
       run: |
         sudo mkdir -p /mnt/deps /mnt/target
@@ -35,7 +61,7 @@ runs:
       uses: actions/cache@v6
       with:
         path: .deps/dl
-        key: deps-dl-${{ hashFiles('scripts/versions.sh') }}
+        key: deps-dl-${{ runner.os }}-${{ hashFiles('scripts/versions.sh') }}
 
     - name: Fetch QEMU and LLVM
       shell: bash
@@ -46,7 +72,7 @@ runs:
       uses: actions/cache@v6
       with:
         path: .deps/out
-        key: libtcg-${{ runner.os }}-${{ hashFiles('scripts/**', 'patches/**', 'libtcg/**') }}
+        key: libtcg-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/**', 'patches/**', 'libtcg/**') }}
 
     - name: Build lifters
       if: steps.lifters.outputs.cache-hit != 'true'
