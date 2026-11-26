@@ -552,7 +552,7 @@ impl<'a> CallSites<'a> {
                 "calls",
                 Some(analysis),
             )?;
-            memory::simplify(&module, self.machine)?;
+            memory::simplify_targets(&module, self.machine)?;
             module.update(|m| {
                 for function in &mut m.module.functions {
                     biara_ir::pass::promote_loop_slots(function);
@@ -1716,10 +1716,57 @@ impl<'ctx> FunctionFacts<'ctx> {
     }
 
     /// An address derived directly from an entry register.
-    fn register_address(&self, mut ptr: BasicValueEnum<'ctx>, depth: u32) -> Option<Address> {
+    fn register_address(&self, ptr: BasicValueEnum<'ctx>, depth: u32) -> Option<Address> {
+        self.register_address_from(Self::address_base(ptr)?, depth)
+    }
+
+    fn register_address_from(
+        &self,
+        (inst, offset): (InstructionValue<'ctx>, i64),
+        depth: u32,
+    ) -> Option<Address> {
         if depth > 16 {
             return None;
         }
+        if inst.get_opcode() == InstructionOpcode::Load {
+            return Some(Address {
+                reg: *self.entry_loads.get(&inst)?,
+                off: offset,
+            });
+        }
+        let mut address = None;
+        let mut merge = |value| {
+            let base = Self::address_base(value?)?;
+            // Calls can temporarily adjust SP in a loop. A back edge that
+            // returns to this phi with a net offset of zero preserves it.
+            if inst.get_opcode() == InstructionOpcode::Phi && base == (inst, 0) {
+                return Some(());
+            }
+            let mut next = self.register_address_from(base, depth + 1)?;
+            next.off = next.off.wrapping_add(offset);
+            if address.is_some_and(|previous| previous != next) {
+                return None;
+            }
+            address = Some(next);
+            Some(())
+        };
+        match inst.get_opcode() {
+            InstructionOpcode::Select => {
+                merge(analysis_operand(inst, 1))?;
+                merge(analysis_operand(inst, 2))?;
+            }
+            InstructionOpcode::Phi => {
+                let phi = PhiValue::try_from(inst).ok()?;
+                for k in 0..phi.count_incoming() {
+                    merge(phi.get_incoming(k).map(|(value, _)| value))?;
+                }
+            }
+            _ => return None,
+        }
+        address
+    }
+
+    fn address_base(mut ptr: BasicValueEnum<'ctx>) -> Option<(InstructionValue<'ctx>, i64)> {
         let mut offset = 0i64;
         for _ in 0..MAX_SLOT_WALK {
             let inst = ptr.as_instruction_value()?;
@@ -1742,35 +1789,7 @@ impl<'ctx> FunctionFacts<'ctx> {
                     };
                     (operand(0)?, index.get_sign_extended_constant()?)
                 }
-                InstructionOpcode::Load => {
-                    return Some(Address {
-                        reg: *self.entry_loads.get(&inst)?,
-                        off: offset,
-                    });
-                }
-                InstructionOpcode::Select | InstructionOpcode::Phi => {
-                    let mut address = None;
-                    let mut merge = |value| {
-                        let mut next = self.register_address(value?, depth + 1)?;
-                        next.off = next.off.wrapping_add(offset);
-                        if address.is_some_and(|previous| previous != next) {
-                            return None;
-                        }
-                        address = Some(next);
-                        Some(())
-                    };
-                    if inst.get_opcode() == InstructionOpcode::Select {
-                        merge(operand(1))?;
-                        merge(operand(2))?;
-                    } else {
-                        let phi = PhiValue::try_from(inst).ok()?;
-                        for k in 0..phi.count_incoming() {
-                            merge(phi.get_incoming(k).map(|(value, _)| value))?;
-                        }
-                    }
-                    return address;
-                }
-                _ => return None,
+                _ => return Some((inst, offset)),
             };
             ptr = base;
             offset = offset.wrapping_add(delta);
@@ -2426,10 +2445,10 @@ impl<'ctx> FunctionFacts<'ctx> {
                         _ => None,
                     };
                 }
-                let bits = match inst.get_type() {
-                    biara_ir_compat::types::AnyTypeEnum::IntType(t) => t.get_bit_width(),
-                    _ => return None,
+                let BasicValueEnum::IntValue(value) = v else {
+                    return None;
                 };
+                let bits = value.get_bit_width();
                 // A slot of the frame: what was stored there.
                 // (Above the entry stack pointer: the caller's frame.)
                 if let Some(o) = self.frame_offset(operand(0)?, 0) {

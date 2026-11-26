@@ -90,15 +90,6 @@ fn trim(module: &Module<'_>, machine: &TargetMachine) {
     }
 }
 
-/// `canonicalize`, then function-local cleanup that turns env and stack
-/// loads into shared SSA values and exposes bounds checks: the IR the
-/// analyses (jump tables, call sites) read. No inlining, so every guest
-/// instruction stays in its function.
-pub(crate) fn simplify(module: &Module<'_>, machine: &TargetMachine) -> Result<(), Error> {
-    canonicalize(module, machine)?;
-    simplify_local(module, machine)
-}
-
 /// Preserve integer guest address expressions for readonly target evaluation.
 pub(crate) fn simplify_targets(module: &Module<'_>, machine: &TargetMachine) -> Result<(), Error> {
     trim(module, machine);
