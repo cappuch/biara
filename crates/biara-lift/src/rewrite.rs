@@ -183,6 +183,11 @@ pub fn div_sugar(f: &mut Function) -> usize {
             let Some((width, signed)) = parse_div_name(name) else {
                 continue;
             };
+            // Narrow x86 helpers take whole registers and return whole
+            // registers with width-specific writeback rules.
+            if width != 64 {
+                continue;
+            }
             let (lo, hi, d) = (args[0], args[1], args[2]);
             // `hi` must only extend `lo`.
             let extends = if signed {
@@ -214,7 +219,9 @@ pub fn div_sugar(f: &mut Function) -> usize {
             if uses.is_empty()
                 || !uses
                     .iter()
-                    .all(|u| matches!(f.inst(*u), Some(Inst::ExtractValue { .. })))
+                    .all(|u| matches!(f.inst(*u), Some(Inst::ExtractValue {
+                        index: 0 | 1, ty: Type::Int(64), ..
+                    })))
             {
                 continue;
             }
@@ -236,7 +243,12 @@ pub fn div_sugar(f: &mut Function) -> usize {
                 BinOp::Urem
             }
         };
-        let block = f.defined_in[call.0 as usize];
+        let Some(block) = f.defined_in[call.0 as usize] else {
+            continue;
+        };
+        let Some(position) = f.block(block).insts.iter().position(|&id| id == call) else {
+            continue;
+        };
         let mk = |f: &mut Function, o: BinOp, b: Option<BlockId>| {
             f.values.push(Value::Inst(Inst::Bin {
                 op: o,
@@ -248,8 +260,9 @@ pub fn div_sugar(f: &mut Function) -> usize {
             f.pc.push(f.pc_of(call));
             ValueId((f.values.len() - 1) as u32)
         };
-        let quot = mk(f, op(true), block);
-        let rem = mk(f, op(false), block);
+        let quot = mk(f, op(true), Some(block));
+        let rem = mk(f, op(false), Some(block));
+        f.block_mut(block).insts.splice(position..=position, [quot, rem]);
         for u in uses {
             let Some(Inst::ExtractValue { index, .. }) = f.inst(u) else {
                 continue;
@@ -258,7 +271,6 @@ pub fn div_sugar(f: &mut Function) -> usize {
             replace_all_uses(f, u, replacement);
             remove_inst(f, u);
         }
-        remove_inst(f, call);
         sugared += 1;
     }
     sugared
