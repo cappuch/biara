@@ -339,8 +339,11 @@ impl<'f> Evaluator<'_, 'f> {
         if let Some(v) = self.store_before(slot, b, Some(at))? {
             return Some(v);
         }
-        let mut pending = vec![b];
-        let mut seen = std::collections::BTreeSet::new();
+        if Some(b) == self.f.entry {
+            return None;
+        }
+        let mut seen = self.f.blocks[b.0 as usize].preds.clone();
+        let mut pending: Vec<_> = seen.iter().copied().collect();
         let mut agreed: Option<ValueId> = None;
         let mut budget = 64u32;
         while let Some(block) = pending.pop() {

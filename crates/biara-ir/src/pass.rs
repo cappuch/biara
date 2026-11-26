@@ -174,12 +174,10 @@ pub fn promote_allocas(f: &mut Function) {
                         Some(v) if first.is_none() || first == Some(v) => first = Some(v),
                         _ => {
                             ok = false;
+                            first = None;
                             break;
                         }
                     }
-                }
-                if !ok {
-                    break;
                 }
                 cur = first;
             }
@@ -200,16 +198,10 @@ pub fn promote_allocas(f: &mut Function) {
                                 changed.push(i);
                             }
                         }
-                        None => {
-                            ok = false;
-                            break;
-                        }
+                        None => ok = false,
                     },
                     _ => {}
                 }
-            }
-            if !ok {
-                break;
             }
             if let Some(v) = cur {
                 current.insert(b, v);
