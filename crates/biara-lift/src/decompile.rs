@@ -1277,7 +1277,9 @@ fn prepare_c_with<'ctx>(
             &calls_owned,
             &helpers_owned,
             &drop_owned,
-        )
+        )?;
+        data.reindex();
+        Ok::<_, String>(())
     })
     .map_err(|e| Error::Llvm(format!("ABI form: {e}")))?;
     module
