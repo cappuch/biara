@@ -4512,6 +4512,60 @@ impl<'m, 'a, 'b> Emitter<'m, 'a, 'b> {
             })
     }
 
+    fn declaration_signature(&mut self, d: &biara_ir::Declaration) -> String {
+        if let Some(p) = KNOWN_PROTOS
+            .iter()
+            .find(|p| p.name == d.name && (!p.posix_only || self.posix))
+        {
+            let cr = CalleeRef {
+                name: d.name.clone(),
+                decl: true,
+                ty: d.ty.clone(),
+            };
+            let ret = self.import_result_ty(&cr, p);
+            let mut args = p.args.join(", ");
+            if p.variadic {
+                if !args.is_empty() {
+                    args.push_str(", ");
+                }
+                args.push_str("...");
+            } else if args.is_empty() {
+                args.push_str("void");
+            }
+            format!("{} {}({})", ret, fn_name(&d.name, true), args)
+        } else if let Some(p) = self.protos.get(&d.name).cloned() {
+            let ret = self.cty(&d.ty.ret);
+            let mut args = (0..p.nargs)
+                .map(|k| {
+                        if p.strmask.checked_shr(k).unwrap_or(0) & 1 == 1 {
+                            "const char *"
+                        } else {
+                            "uint64_t"
+                        }
+                    })
+                .collect::<Vec<_>>();
+            if p.ellipsis {
+                if args.is_empty() {
+                    args.push("uint64_t");
+                }
+                args.push("...");
+            } else if args.is_empty() {
+                args.push("void");
+            }
+            format!("{} {}({})", ret, fn_name(&d.name, true), args.join(", "))
+        } else {
+            let params: Vec<String> = d.ty.params.iter().map(|t| self.cty(t)).collect();
+            let ret = self.cty(&d.ty.ret);
+            let mut list = params.join(", ");
+            // An open signature has no named parameter before `...`, so an
+            // empty list is the K&R spelling that accepts any arguments.
+            if d.ty.varargs && !list.is_empty() {
+                list.push_str(", ...");
+            }
+            format!("{} {}({})", ret, ident(&d.name), list)
+        }
+    }
+
     fn signature_of(&mut self, fi: usize, with_names: bool) -> String {
         let f = &self.module.functions[fi];
         let name = f.name.clone();
@@ -5441,37 +5495,7 @@ impl<'m, 'a, 'b> Emitter<'m, 'a, 'b> {
                 self.emit_pending(&mut out)?;
                 continue;
             }
-            let sig = if let Some(p) = KNOWN_PROTOS
-                .iter()
-                .find(|p| p.name == d.name && (!p.posix_only || self.posix))
-            {
-                let cr = CalleeRef {
-                    name: d.name.clone(),
-                    decl: true,
-                    ty: d.ty.clone(),
-                };
-                let ret = self.import_result_ty(&cr, p);
-                let mut args = p.args.join(", ");
-                if p.variadic {
-                    if !args.is_empty() {
-                        args.push_str(", ");
-                    }
-                    args.push_str("...");
-                } else if args.is_empty() {
-                    args.push_str("void");
-                }
-                format!("{} {}({})", ret, fn_name(&d.name, true), args)
-            } else {
-                let params: Vec<String> = d.ty.params.iter().map(|t| self.cty(t)).collect();
-                let ret = self.cty(&d.ty.ret);
-                let mut list = params.join(", ");
-                // An open signature has no named parameter before `...`, so an
-                // empty list is the K&R spelling that accepts any arguments.
-                if d.ty.varargs && !list.is_empty() {
-                    list.push_str(", ...");
-                }
-                format!("{} {}({})", ret, ident(&d.name), list)
-            };
+            let sig = self.declaration_signature(&d);
             self.emit_pending(&mut out)?;
             if !out.write(&format!("{sig};\n")) {
                 return Err(out.err());
@@ -5515,6 +5539,12 @@ impl<'m, 'a, 'b> Emitter<'m, 'a, 'b> {
         for f in &self.module.functions {
             let decl = f.entry.is_none() && f.blocks.is_empty();
             self.global_names.insert(fn_name(&f.name, decl));
+        }
+        let mut declarations = BTreeMap::new();
+        for declaration in &self.module.decls {
+            let name = fn_name(&declaration.name, true);
+            self.global_names.insert(name.clone());
+            declarations.entry(name).or_insert(declaration);
         }
         let selected = self
             .module
@@ -5581,6 +5611,17 @@ impl<'m, 'a, 'b> Emitter<'m, 'a, 'b> {
             let mut deps: Vec<(String, String, String)> = Vec::new();
             let mut seen_ids: BTreeSet<String> = BTreeSet::new();
             let mut needed: BTreeSet<String> = text.identifiers.clone();
+            for name in &text.identifiers {
+                let Some(declaration) = declarations.get(name) else { continue };
+                if self.support_defs.contains_key(name) {
+                    continue;
+                }
+                let key = format!("import:{name}");
+                seen_ids.insert(key.clone());
+                let signature = self.declaration_signature(declaration);
+                needed.extend(scan_text(&signature, &self.callback_arguments).identifiers);
+                deps.push((key, "import".into(), format!("{signature};\n")));
+            }
             let mut expanded: BTreeSet<String> = BTreeSet::new();
             while let Some(id) = needed.iter().next().cloned() {
                 needed.remove(&id);

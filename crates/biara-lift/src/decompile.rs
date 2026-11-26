@@ -2466,6 +2466,14 @@ fn simplify(
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    use biara_ir::{BinOp, Builder, Constant, Declaration, FuncType, Global, Type};
+
+    fn test_function(name: &str, ret: Type, params: Vec<Type>) -> Builder {
+        let mut builder = Builder::new(name, FuncType { ret, params, varargs: false });
+        builder.func.ensure_params();
+        builder
+    }
+
 
     #[test]
     fn render_reports_deferred_write_failure() {
@@ -2547,30 +2555,39 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn generated_c_preserves_scalar_and_vector_bits() {
         let cx = Context::create();
-        let ir = biara_ir_compat::memory_buffer::MemoryBuffer::create_from_memory_range_copy(
-            br#"
-                define double @flip_sign(double %x) {
-                    %bits = bitcast double %x to i64
-                    %flipped = xor i64 %bits, -9223372036854775808
-                    %result = bitcast i64 %flipped to double
-                    ret double %result
-                }
-                define <4 x float> @flip_vector(<4 x float> %x) {
-                    %bits = bitcast <4 x float> %x to i128
-                    %flipped = xor i128 %bits, 18446744073709551615
-                    %result = bitcast i128 %flipped to <4 x float>
-                    ret <4 x float> %result
-                }
-                define i64 @vector_word(<4 x float> %x) {
-                    %bits = bitcast <4 x float> %x to <2 x i64>
-                    %word = extractelement <2 x i64> %bits, i32 1
-                    ret i64 %word
-                }
-            "#,
-            "bit-patterns",
-        );
         let mut transformed = package_module(&cx);
-        transformed.module = cx.create_module_from_ir(ir).unwrap();
+        transformed.module = cx.create_module("bit-patterns");
+        transformed.module.update(|m| {
+            let lanes = Type::Vector(Box::new(Type::Float(32)), 4);
+            for (name, ty, width, mask) in [
+                ("flip_sign", Type::Float(64), 64, i64::MIN as i128),
+                ("flip_vector", lanes.clone(), 128, u64::MAX as i128),
+            ] {
+                let word = Type::Int(width);
+                let mut builder = test_function(name, ty.clone(), vec![ty.clone()]);
+                let x = builder.func.params[0];
+                let block = builder.add_block("entry");
+                let bits = builder.cast(block, &ty, &word, x);
+                let mask = builder.const_typed(mask, width);
+                let flipped = builder.bin(block, BinOp::Xor, &word, bits, mask);
+                let out = builder.cast(block, &word, &ty, flipped);
+                builder.ret(block, Some(out));
+                m.module.functions.push(builder.func);
+            }
+
+            let word = Type::i128();
+            let pairs = Type::Vector(Box::new(Type::i64()), 2);
+            let mut builder = test_function("vector_word", Type::i64(), vec![lanes.clone()]);
+            let x = builder.func.params[0];
+            let block = builder.add_block("entry");
+            let halves = builder.cast(block, &lanes, &pairs, x);
+            let bits = builder.cast(block, &pairs, &word, halves);
+            let shift = builder.const_typed(64, 128);
+            let high = builder.bin(block, BinOp::Lshr, &word, bits, shift);
+            let result = builder.emit(block, biara_ir::Inst::Trunc { from: word, to: Type::i64(), value: high });
+            builder.ret(block, Some(result));
+            m.module.functions.push(builder.func);
+        });
         transformed.entries.clear();
         let mut source = Vec::new();
         transformed.render(&mut source).unwrap();
@@ -2624,50 +2641,48 @@ mod tests {
     fn generated_strings_preserve_bytes_and_escaping_pointer_identity() {
         let cx = Context::create();
         let make = || {
-            let ir = biara_ir_compat::memory_buffer::MemoryBuffer::create_from_memory_range_copy(
-                br#"
-                declare i32 @strcmp(i64, i64)
-                declare i64 @strlen(i64)
-                declare i64 @capture(i64)
-                define i32 @only(i64 %s) !biara.entry !0 {
-                    %r = call i32 @strcmp(i64 %s, i64 12288)
-                    ret i32 %r
-                }
-                define i32 @shared_a(i64 %s) !biara.entry !1 {
-                    %r = call i32 @strcmp(i64 %s, i64 16384)
-                    ret i32 %r
-                }
-                define i32 @shared_b(i64 %s) !biara.entry !2 {
-                    %r = call i32 @strcmp(i64 %s, i64 16384)
-                    ret i32 %r
-                }
-                define i64 @escape_a() !biara.entry !3 {
-                    %r = call i64 @capture(i64 20480)
-                    ret i64 %r
-                }
-                define i64 @escape_b() !biara.entry !4 {
-                    %r = call i64 @capture(i64 24576)
-                    ret i64 %r
-                }
-                define i64 @raw_length() !biara.entry !5 {
-                    %r = call i64 @strlen(i64 28672)
-                    ret i64 %r
-                }
-                define i64 @raw_address() !biara.entry !6 {
-                    ret i64 28672
-                }
-                !0 = !{i64 4096}
-                !1 = !{i64 4097}
-                !2 = !{i64 4098}
-                !3 = !{i64 4099}
-                !4 = !{i64 4100}
-                !5 = !{i64 4101}
-                !6 = !{i64 4102}
-            "#,
-                "strings",
-            );
             let mut transformed = package_module(&cx);
-            transformed.module = cx.create_module_from_ir(ir).unwrap();
+            transformed.module = cx.create_module("strings");
+            transformed.module.update(|m| {
+                for (name, ret, arity) in [
+                    ("strcmp", Type::i32(), 2),
+                    ("strlen", Type::i64(), 1),
+                    ("capture", Type::i64(), 1),
+                ] {
+                    m.module.decls.push(Declaration {
+                        name: name.into(),
+                        ty: FuncType { ret, params: vec![Type::i64(); arity], varargs: false },
+                        attrs: Default::default(),
+                    });
+                }
+                for (index, (name, callee, addr)) in [
+                    ("only", Some("strcmp"), 0x3000),
+                    ("shared_a", Some("strcmp"), 0x4000),
+                    ("shared_b", Some("strcmp"), 0x4000),
+                    ("escape_a", Some("capture"), 0x5000),
+                    ("escape_b", Some("capture"), 0x6000),
+                    ("raw_length", Some("strlen"), 0x7000),
+                    ("raw_address", None, 0x7000),
+                ].into_iter().enumerate() {
+                    let compares = callee == Some("strcmp");
+                    let ret = if compares { Type::i32() } else { Type::i64() };
+                    let params = if compares { vec![Type::i64()] } else { vec![] };
+                    let mut builder = test_function(name, ret.clone(), params);
+                    builder.func.attrs.entry_addr = Some(0x1000 + index as u64);
+                    let block = builder.add_block("entry");
+                    let address = builder.const_int(addr);
+                    let value = if let Some(callee) = callee {
+                        let callee = builder.const_func(callee);
+                        let mut args = builder.func.params.clone();
+                        args.push(address);
+                        builder.call(block, callee, args, &ret)
+                    } else {
+                        address
+                    };
+                    builder.ret(block, Some(value));
+                    m.module.functions.push(builder.func);
+                }
+            });
             transformed.entries.clear();
             transformed.strings = vec![
                 (0x3000, r#"quote\" slash\\\n\0019"#.into()),
@@ -2803,7 +2818,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_worker_restores_bodies_before_retry() {
+    fn failed_verification_preserves_bodies_before_retry() {
         let cx = Context::create();
         let transformed = package_module(&cx);
         let machine = crate::analysis_machine().unwrap();
@@ -2815,19 +2830,12 @@ mod tests {
         let block = cx.append_basic_block(invalid, "entry");
         let builder = cx.create_builder();
         builder.position_at_end(block);
-        // A real worker parse/verification failure, after extraction; the
-        // pipeline itself is valid. Fix the input and retry the same module.
+        // Reject invalid native IR before any pass mutates the module.
         builder
             .build_return(Some(&cx.i32_type().const_int(42, false)))
             .unwrap();
-        let error = function_passes(
-            &transformed.module,
-            &machine,
-            c"function(instcombine<no-verify-fixpoint>,simplifycfg)",
-            options,
-        )
-        .unwrap_err();
-        assert!(matches!(error, Error::Llvm(_)));
+        let error = transformed.module.verify().unwrap_err();
+        assert!(error.contains("invalid: ret"), "{error}");
         invalid
             .get_first_basic_block()
             .unwrap()
@@ -3030,42 +3038,51 @@ mod tests {
     #[test]
     fn grouped_round_preserves_private_calls_and_shared_global_state() {
         let cx = Context::create();
-        let source = b"
-            @factor = internal constant i64 7
-            @state = internal global i64 11
-            define i64 @first(i64 %x) {
-                %v = call i64 @leaf(i64 %x)
-                %k = load i64, ptr @factor
-                %r = add i64 %v, %k
-                ret i64 %r
+        let module = cx.create_module("shared-state");
+        module.update(|m| {
+            let word = Type::i64();
+            for (name, value) in [("factor", 7), ("state", 11)] {
+                m.module.globals.push(Global {
+                    name: name.into(),
+                    ty: word.clone(),
+                    init: Some(Constant::int(value, 64)),
+                    internal: true,
+                });
             }
-            define i64 @second(i64 %x) {
-                %v = call i64 @leaf(i64 %x)
-                %k = load i64, ptr @state
-                %r = add i64 %v, %k
-                ret i64 %r
+            for (name, callee, global) in [
+                ("first", Some("leaf"), Some("factor")),
+                ("second", Some("leaf"), Some("state")),
+                ("leaf", Some("leaf2"), None),
+                ("leaf2", None, Some("factor")),
+            ] {
+                let mut builder = test_function(name, word.clone(), vec![word.clone()]);
+                let x = builder.func.params[0];
+                let block = builder.add_block("entry");
+                let value = if let Some(callee) = callee {
+                    let callee = builder.const_func(callee);
+                    builder.call(block, callee, vec![x], &word)
+                } else {
+                    let factor = builder.const_int(3);
+                    builder.bin(block, BinOp::Mul, &word, x, factor)
+                };
+                let result = if let Some(global) = global {
+                    let address = builder.func.add_const(Constant::GlobalPtr(global.into()));
+                    let amount = builder.load(block, &word, address);
+                    builder.bin(block, BinOp::Add, &word, value, amount)
+                } else {
+                    value
+                };
+                builder.ret(block, Some(result));
+                m.module.functions.push(builder.func);
             }
-            define internal i64 @leaf(i64 %x) {
-                %r = call i64 @leaf2(i64 %x)
-                ret i64 %r
-            }
-            define internal i64 @leaf2(i64 %x) {
-                %v = mul i64 %x, 3
-                %k = load i64, ptr @factor
-                %r = add i64 %v, %k
-                ret i64 %r
-            }
-            define void @set_state(i64 %x) {
-                store i64 %x, ptr @state
-                ret void
-            }
-        \0";
-        // LLVM's text parser reads the sentinel immediately after the slice.
-        let buffer = biara_ir_compat::memory_buffer::MemoryBuffer::create_from_memory_range(
-            &source[..source.len() - 1],
-            "shared-state",
-        );
-        let module = cx.create_module_from_ir(buffer).unwrap();
+            let mut builder = test_function("set_state", Type::Void, vec![word.clone()]);
+            let block = builder.add_block("entry");
+            let x = builder.func.params[0];
+            let address = builder.func.add_const(Constant::GlobalPtr("state".into()));
+            builder.store(block, &word, x, address);
+            builder.ret(block, None);
+            m.module.functions.push(builder.func);
+        });
         let machine = crate::native_machine().unwrap();
         function_passes(
             &module,
@@ -3074,10 +3091,14 @@ mod tests {
             DecompileOptions::with_workers(std::num::NonZeroUsize::new(2).unwrap()),
         )
         .unwrap();
-        // `@factor`/`@state` live in the interpreter's global space, so the
-        // same module state is observed across calls exactly as before.
+        // The interpreter borrows caller-owned storage for native globals.
         let ir = module.ir();
+        let mut globals = [7u64, 11];
+        let address = globals.as_mut_ptr() as u64;
         let mut interp = crate::interp::Interp::new(&ir, (0, 0x10000));
+        interp.map((address, address + 16));
+        interp.bind("factor", address);
+        interp.bind("state", address + 8);
         let m = u64::MAX as u128;
         assert_eq!(interp.call("second", &[5]).unwrap(), 33);
         for state in [0u128, 19, m] {
@@ -3089,12 +3110,12 @@ mod tests {
                     & u64::MAX as u128;
                 assert_eq!(
                     interp.call("first", &[x]).unwrap(),
-                    value.wrapping_add(7),
+                    value.wrapping_add(7) & m,
                     "first({x})"
                 );
                 assert_eq!(
                     interp.call("second", &[x]).unwrap(),
-                    value.wrapping_add(state),
+                    value.wrapping_add(state) & m,
                     "second({x})"
                 );
             }

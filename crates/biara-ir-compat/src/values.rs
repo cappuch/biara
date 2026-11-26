@@ -1274,11 +1274,12 @@ impl<'ctx> InstructionValue<'ctx> {
     pub fn erase_from_basic_block(&self) {
         if let Some(b) = self.term {
             self.ctx.with_mut(self.ctx.module_id(), |m| {
-                for f in &mut m.module.functions {
-                    if let Some(blk) = f.blocks.get_mut(b.0 as usize) {
-                        blk.term = Some(biara_ir::Terminator::Unreachable);
-                        return;
-                    }
+                // Block IDs are local to the function.
+                if let Some(block) = self.func
+                    .and_then(|owner| m.module.functions.get_mut(owner))
+                    .and_then(|function| function.blocks.get_mut(b.0 as usize))
+                {
+                    block.term = Some(biara_ir::Terminator::Unreachable);
                 }
             });
             return;
