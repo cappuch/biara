@@ -60,14 +60,18 @@ pub fn verify(f: &Function) -> Result<(), VerifyError> {
             ));
         }
     }
-    for (bi, b) in f.blocks.iter().enumerate() {
+    // Every actual edge must appear in the predecessor set. Count each
+    // source once per destination so we can then reject spurious entries
+    // without replaying a large switch for every one of its destinations.
+    let mut incoming = vec![(None, 0usize); f.blocks.len()];
+    for (bi, block) in f.blocks.iter().enumerate() {
         let b = BlockId(bi as u32);
         let Some(term) = f.terminator(b) else {
             return fail(format!(
                 "{name}: block {bi} ({}) has no terminator; {} insts, preds {preds:?}",
-                f.blocks[bi].name,
-                f.blocks[bi].insts.len(),
-                preds = f.blocks[bi].preds
+                block.name,
+                block.insts.len(),
+                preds = block.preds
             ));
         };
         for succ in (0..).map_while(|i| crate::successor_at(term, i)) {
@@ -79,18 +83,17 @@ pub fn verify(f: &Function) -> Result<(), VerifyError> {
                     "{name}: block {bi} -> {succ:?} missing from preds"
                 ));
             }
+            let (last, count) = &mut incoming[succ.0 as usize];
+            if *last != Some(b) {
+                *last = Some(b);
+                *count += 1;
+            }
         }
-        for &p in &f.block(b).preds {
-            if p.0 as usize >= f.blocks.len() {
-                return fail(format!("{name}: block {bi} has out-of-range pred"));
-            }
-            if !f.terminator(p).is_some_and(|term| {
-                (0..).map_while(|i| crate::successor_at(term, i)).any(|succ| succ == b)
-            }) {
-                return fail(format!(
-                    "{name}: block {bi} has pred {p:?} that does not branch here"
-                ));
-            }
+    }
+    for (bi, block) in f.blocks.iter().enumerate() {
+        let b = BlockId(bi as u32);
+        if incoming[bi].1 != block.preds.len() {
+            return fail(format!("{name}: block {bi} has a predecessor without a matching branch"));
         }
         for &inst in &f.block(b).insts {
             if f.defined_in[inst.0 as usize] != Some(b) {
