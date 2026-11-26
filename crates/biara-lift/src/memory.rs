@@ -74,6 +74,13 @@ impl<'m> Trimmer<'m> {
 /// pipeline. (Explicit `instcombine` verifies its fixpoint and aborts the
 /// process on large lifted functions; the default pipelines do not.)
 pub(crate) fn canonicalize(module: &Module<'_>, machine: &TargetMachine) -> Result<(), Error> {
+    trim(module, machine);
+    rebase_guest_pointers(module)?;
+    scope_memory(module);
+    Ok(())
+}
+
+fn trim(module: &Module<'_>, machine: &TargetMachine) {
     let mut trimmer = Trimmer::new(machine);
     for function in module
         .get_functions()
@@ -81,9 +88,6 @@ pub(crate) fn canonicalize(module: &Module<'_>, machine: &TargetMachine) -> Resu
     {
         trimmer.run(function);
     }
-    rebase_guest_pointers(module)?;
-    scope_memory(module);
-    Ok(())
 }
 
 /// `canonicalize`, then function-local cleanup that turns env and stack
@@ -92,6 +96,17 @@ pub(crate) fn canonicalize(module: &Module<'_>, machine: &TargetMachine) -> Resu
 /// instruction stays in its function.
 pub(crate) fn simplify(module: &Module<'_>, machine: &TargetMachine) -> Result<(), Error> {
     canonicalize(module, machine)?;
+    simplify_local(module, machine)
+}
+
+/// Preserve integer guest address expressions for readonly target evaluation.
+pub(crate) fn simplify_targets(module: &Module<'_>, machine: &TargetMachine) -> Result<(), Error> {
+    trim(module, machine);
+    scope_memory(module);
+    simplify_local(module, machine)
+}
+
+fn simplify_local(module: &Module<'_>, machine: &TargetMachine) -> Result<(), Error> {
     module
         .run_passes(
             "function(simplifycfg,gvn,instcombine<no-verify-fixpoint>,simplifycfg)",

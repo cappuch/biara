@@ -60,7 +60,7 @@ pub(crate) fn find(
     read: Reader,
     max_entries: u64,
 ) -> Result<BTreeMap<u64, SiteResolution>, Error> {
-    crate::memory::simplify(module, machine)?;
+    crate::memory::simplify_targets(module, machine)?;
     let mut out: BTreeMap<u64, SiteResolution> = BTreeMap::new();
     let reader = |addr: u64, len: usize| -> Option<Vec<u8>> {
         let mut buf = vec![0u8; len];
