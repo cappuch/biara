@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Biara · Binary decompiler</title>
+<link rel="stylesheet" href="/style.css">
+<main>
+  <header><span class="brand">BIARA</span><h1>Binary decompiler</h1></header>
+  <form>
+    <label for="binary">Binary <small>ELF, PE, or Mach-O · up to 8 MiB</small></label>
+    <input id="binary" type="file" required>
+    <label for="root">Function <small>Optional</small></label>
+    <input id="root" type="text" maxlength="256" placeholder="main or 0x401000" spellcheck="false">
+    <button id="submit">Decompile</button>
+  </form>
+  <p role="status" id="status"></p>
+  <section id="result" hidden>
+    <div class="toolbar"><h2>Decompiled C</h2><button type="button" id="save">Download C</button></div>
+    <pre><code id="source"></code></pre>
+  </section>
+</main>
+<script src="/app.js"></script>
+</html>

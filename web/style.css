@@ -1,0 +1,17 @@
+:root { color-scheme: dark; font: 16px system-ui, sans-serif; background: #111418; color: #ecede9; }
+* { box-sizing: border-box; }
+body { margin: 0; }
+main { max-width: 1060px; margin: auto; padding: 4rem 1.4rem; }
+.brand { color: #abd394; font: 600 .83rem ui-monospace, monospace; letter-spacing: .22em; }
+h1 { margin: .55rem 0 2rem; font-size: clamp(2rem, 6vw, 3.8rem); letter-spacing: -.045em; }
+form { border: 1px solid #3b4548; background: #1c2227; padding: 1.6rem; border-radius: 12px; display: grid; gap: .8rem; max-width: 36rem; }
+small { color: #a7b3b8; margin-left: .4rem; }
+input, button { font: inherit; border: 1px solid #535f61; border-radius: 6px; padding: .72rem; }
+input { min-width: 0; background: #13181c; color: inherit; }
+button { cursor: pointer; color: #101b12; background: #abd394; font-weight: 650; width: fit-content; }
+button:disabled { opacity: .6; cursor: wait; }
+:focus-visible { outline: 2px solid #c6f0ad; outline-offset: 3px; }
+.toolbar { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: .8rem; }
+h2 { font-size: 1.2rem; }
+pre { overflow: auto; max-height: 70vh; border: 1px solid #3b4548; padding: 1rem; background: #181e22; border-radius: 8px; }
+code { font: .85rem ui-monospace, monospace; line-height: 1.6; }
