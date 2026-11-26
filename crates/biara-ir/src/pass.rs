@@ -34,20 +34,20 @@ pub fn simplify(f: &mut Function) {
 
 /// Replace an instruction's uses with `with`, everywhere in the function.
 pub fn replace_all_uses(f: &mut Function, from: ValueId, with: ValueId) {
+    rewrite_uses(f, |id| if id == from { with } else { id });
+}
+
+fn rewrite_uses(f: &mut Function, replace: impl Fn(ValueId) -> ValueId) {
     for b in &mut f.blocks {
         for &i in &b.insts {
             if let Value::Inst(inst) = &mut f.values[i.0 as usize] {
-                for slot in crate::operands_mut(inst) {
-                    if *slot == from {
-                        *slot = with;
-                    }
+                for operand in crate::operands_mut(inst) {
+                    *operand = replace(*operand);
                 }
             }
         }
-        for slot in b.term.as_mut().map(term_slots).unwrap_or_default() {
-            if *slot == from {
-                *slot = with;
-            }
+        for operand in b.term.as_mut().map(term_slots).unwrap_or_default() {
+            *operand = replace(*operand);
         }
     }
 }
@@ -143,14 +143,15 @@ pub fn promote_allocas(f: &mut Function) {
         return;
     }
 
+    let mut replacements = vec![None; f.values.len()];
+    let mut changed = Vec::new();
     for slot in promotable {
         let ty = infos[&slot].ty.clone();
         // Walk blocks in dominator-tree preorder, tracking the value the slot
         // holds. Blocks that read before any store on a path keep the slot.
         let mut current: HashMap<BlockId, ValueId> = HashMap::new();
         let mut ok = true;
-        let order = doms.order().to_vec();
-        for b in order {
+        for &b in doms.order() {
             let mut cur = f
                 .block(b)
                 .preds
@@ -163,10 +164,10 @@ pub fn promote_allocas(f: &mut Function) {
             // a path on which the slot holds something this walk cannot name,
             // which includes every loop's back edge. Promoting through it
             // would make the header read the pre-loop value forever.
-            let preds: Vec<BlockId> = f.block(b).preds.iter().copied().collect();
+            let preds = &f.block(b).preds;
             if preds.len() > 1 {
                 let mut first = None;
-                for p in &preds {
+                for p in preds {
                     match current.get(p).copied() {
                         Some(v) if first.is_none() || first == Some(v) => first = Some(v),
                         _ => {
@@ -180,14 +181,23 @@ pub fn promote_allocas(f: &mut Function) {
                 }
                 cur = first;
             }
-            let insts: Vec<ValueId> = f.block(b).insts.clone();
-            for i in insts {
-                match f.inst(i).cloned() {
-                    Some(Inst::Store { ptr, value, .. }) if ptr == slot => {
-                        cur = Some(value);
+            for &i in &f.block(b).insts {
+                match f.inst(i) {
+                    Some(Inst::Store { ptr, value, .. })
+                        if resolve_replacement(&replacements, *ptr) == slot =>
+                    {
+                        cur = Some(resolve_replacement(&replacements, *value));
                     }
-                    Some(Inst::Load { ptr, .. }) if ptr == slot => match cur {
-                        Some(v) => promote_load(f, i, v),
+                    Some(Inst::Load { ptr, .. })
+                        if resolve_replacement(&replacements, *ptr) == slot =>
+                    match cur {
+                        Some(v) => {
+                            let v = resolve_replacement(&replacements, v);
+                            if i != v {
+                                replacements[i.0 as usize] = Some(v);
+                                changed.push(i);
+                            }
+                        }
                         None => {
                             ok = false;
                             break;
@@ -203,6 +213,14 @@ pub fn promote_allocas(f: &mut Function) {
                 current.insert(b, v);
             }
         }
+        // Rewrite every load found on the walk in one visit to the function.
+        // Even a slot we cannot remove may have loads with known values.
+        if !changed.is_empty() {
+            rewrite_uses(f, |id| resolve_replacement(&replacements, id));
+            for id in changed.drain(..) {
+                replacements[id.0 as usize] = None;
+            }
+        }
         if ok {
             remove_slot(f, slot);
         }
@@ -214,8 +232,11 @@ pub fn promote_allocas(f: &mut Function) {
     dce(f);
 }
 
-fn promote_load(f: &mut Function, load: ValueId, value: ValueId) {
-    replace_all_uses(f, load, value);
+fn resolve_replacement(replacements: &[Option<ValueId>], mut value: ValueId) -> ValueId {
+    while let Some(Some(next)) = replacements.get(value.0 as usize).copied() {
+        value = next;
+    }
+    value
 }
 
 fn remove_slot(f: &mut Function, slot: ValueId) {
