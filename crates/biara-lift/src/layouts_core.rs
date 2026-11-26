@@ -1032,6 +1032,7 @@ impl Analysis {
 
         for (fi, f) in module.functions.iter().enumerate() {
             let fi = fi as u32;
+            let mut call_users = None;
             for b in &f.blocks {
                 for &id in &b.insts {
                     let here = ValRef { func: fi, value: id };
@@ -1100,17 +1101,25 @@ impl Analysis {
                             // consume the result so the result's facts
                             // instantiate at this site only.
                             if pointer_root(f, id) {
-                                for (u, _) in f.users(id) {
-                                    if u.0 == u32::MAX {
-                                        continue; // a terminator, never a value
+                                let users = call_users.get_or_insert_with(|| {
+                                    let mut users: BTreeMap<ValueId, Vec<ValueId>> = BTreeMap::new();
+                                    for &user in f.blocks.iter().flat_map(|b| &b.insts) {
+                                        let Some(inst) = f.inst(user) else { continue };
+                                        for operand in biara_ir::operands(inst) {
+                                            if matches!(f.inst(operand), Some(Inst::Call { .. })) {
+                                                let list = users.entry(operand).or_default();
+                                                if list.last() != Some(&user) {
+                                                    list.push(user);
+                                                }
+                                            }
+                                        }
                                     }
-                                    call_rets.push((
-                                        here,
-                                        ValRef {
-                                            func: fi,
-                                            value: u,
-                                        },
-                                    ));
+                                    users
+                                });
+                                if let Some(users) = users.get(&id) {
+                                    call_rets.extend(users.iter().map(|&value| {
+                                        (here, ValRef { func: fi, value })
+                                    }));
                                 }
                             }
                         }
