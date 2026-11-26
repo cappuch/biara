@@ -135,8 +135,19 @@ impl<'f> EdgeRanges<'f> {
                 .or_else(|| self.const_value(*lhs).map(|mask| (*rhs, mask))),
             _ => None,
         };
+        let normalize = |id| {
+            let (mut source, mut mask) = masked(id)?;
+            for _ in 0..8 {
+                let Some((next, inner_mask)) = masked(source) else {
+                    break;
+                };
+                source = next;
+                mask &= inner_mask;
+            }
+            Some((source, mask))
+        };
         self.f.ty(left) == self.f.ty(right)
-            && masked(left).is_some_and(|term| masked(right) == Some(term))
+            && normalize(left).is_some_and(|term| normalize(right) == Some(term))
     }
 
     pub fn guard_range(&self, value: ValueId, block: BlockId) -> Option<ConstantRange> {
