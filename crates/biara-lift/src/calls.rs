@@ -1706,20 +1706,31 @@ impl<'ctx> FunctionFacts<'ctx> {
     /// `ptr` as the entry stack pointer plus a constant, by arithmetic
     /// alone (an address loaded from memory is not followed).
     fn frame_offset(&self, ptr: BasicValueEnum<'ctx>, depth: u32) -> Option<i64> {
+        let address = self.register_address(ptr, depth)?;
+        (address.reg == self.sp).then_some(address.off)
+    }
+
+    /// An address derived directly from an entry register.
+    fn register_address(&self, ptr: BasicValueEnum<'ctx>, depth: u32) -> Option<Address> {
         if depth > 16 {
             return None;
         }
         let inst = ptr.as_instruction_value()?;
         let operand = |k: u32| inst.get_operand(k).and_then(|o| o.value());
-        let constant = |k: u32| match operand(k)? {
-            BasicValueEnum::IntValue(c) if c.is_const() => c.get_sign_extended_constant(),
+        let constant = |k| inst.get_constant_int_operand(k)?.get_sign_extended_constant();
+        let gep_offset = || match operand(1)? {
+            BasicValueEnum::IntValue(c) => c.get_sign_extended_constant(),
             _ => None,
         };
-        let at = |k: u32| self.frame_offset(operand(k)?, depth + 1);
+        let at = |k: u32| self.register_address(operand(k)?, depth + 1);
+        let offset = |mut address: Address, delta: i64| {
+            address.off = address.off.wrapping_add(delta);
+            address
+        };
         let same = |vals: &mut dyn Iterator<Item = Option<BasicValueEnum<'ctx>>>| {
             let mut out = None;
             for v in vals {
-                let o = self.frame_offset(v?, depth + 1)?;
+                let o = self.register_address(v?, depth + 1)?;
                 if out.is_some_and(|x| x != o) {
                     return None;
                 }
@@ -1728,19 +1739,22 @@ impl<'ctx> FunctionFacts<'ctx> {
             out
         };
         match inst.get_opcode() {
-            InstructionOpcode::Load => (self.entry_loads.get(&inst) == Some(&self.sp)).then_some(0),
+            InstructionOpcode::Load => Some(Address {
+                reg: *self.entry_loads.get(&inst)?,
+                off: 0,
+            }),
             InstructionOpcode::Add => match (constant(0), constant(1)) {
-                (_, Some(c)) => at(0).map(|o| o.wrapping_add(c)),
-                (Some(c), _) => at(1).map(|o| o.wrapping_add(c)),
+                (_, Some(c)) => Some(offset(at(0)?, c)),
+                (Some(c), _) => Some(offset(at(1)?, c)),
                 _ => None,
             },
-            InstructionOpcode::Sub => Some(at(0)?.wrapping_sub(constant(1)?)),
+            InstructionOpcode::Sub => Some(offset(at(0)?, constant(1)?.wrapping_neg())),
             InstructionOpcode::IntToPtr | InstructionOpcode::PtrToInt => at(0),
             InstructionOpcode::GetElementPtr
                 if inst.get_num_operands() == 2
                     && inst.get_gep_source_element_type().is_ok_and(is_i8) =>
             {
-                Some(at(0)?.wrapping_add(constant(1)?))
+                Some(offset(at(0)?, gep_offset()?))
             }
             InstructionOpcode::Select => same(&mut [operand(1), operand(2)].into_iter()),
             InstructionOpcode::Phi => {
@@ -2055,6 +2069,9 @@ impl<'ctx> FunctionFacts<'ctx> {
     }
 
     fn address(&self, pointer: BasicValueEnum<'ctx>) -> Option<Address> {
+        if let Some(address) = self.register_address(pointer, 0) {
+            return Some(address);
+        }
         match self.symbolic(pointer)? {
             Sym::Reg(reg, off) => Some(Address { reg, off }),
             _ => None,

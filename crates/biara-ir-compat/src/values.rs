@@ -953,6 +953,25 @@ impl<'ctx> InstructionValue<'ctx> {
             .unwrap_or(InstructionOpcode::Call)
     }
 
+    /// Read an integer constant from this instruction's own value arena.
+    pub fn get_constant_int_operand(&self, i: usize) -> Option<IntValue<'ctx>> {
+        if self.term.is_some() {
+            return None;
+        }
+        self.ctx.with(self.ctx.module_id(), |m| {
+            let f = m.module.functions.get(self.func?)?;
+            let block = f.defined_in.get(self.id.0 as usize).copied().flatten()?;
+            if !f.blocks.get(block.0 as usize)?.insts.contains(&self.id) {
+                return None;
+            }
+            let operand = biara_ir::operands(f.inst(self.id)?).nth(i)?;
+            let biara_ir::Constant::Int { bits, width } = f.constant(operand)? else {
+                return None;
+            };
+            Some(IntValue::constant(self.ctx, *bits as i128, *width))
+        })
+    }
+
     /// Operand `i`, as a value.
     pub fn get_operand(&self, i: u32) -> Option<Operand<'ctx>> {
         if let Some(b) = self.term {
