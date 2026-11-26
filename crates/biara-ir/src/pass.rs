@@ -451,12 +451,7 @@ fn remove_slot(f: &mut Function, slot: ValueId) {
 /// changed, so the pipeline can iterate.
 pub fn fold(f: &mut Function) -> bool {
     let mut changed = false;
-    let mut constants = HashMap::new();
-    for (index, value) in f.values.iter().enumerate() {
-        if let Value::Const(constant) = value {
-            constants.entry(constant.clone()).or_insert(ValueId(index as u32));
-        }
-    }
+    let mut constants = f.constant_index();
     let work: Vec<_> = f.blocks.iter().flat_map(|block| block.insts.iter().copied()).collect();
     let mut replacements = vec![None; f.values.len()];
     for id in work {
@@ -493,9 +488,6 @@ fn fold_inst(
     constants: &mut HashMap<Constant, ValueId>,
     inst: &Inst,
 ) -> Option<ValueId> {
-    let mut intern = |f: &mut Function, constant: Constant| {
-        *constants.entry(constant.clone()).or_insert_with(|| f.append_const(constant))
-    };
     match inst {
         Inst::Bin { op, ty, lhs, rhs } => {
             let w = ty.int_bits()?;
@@ -512,7 +504,7 @@ fn fold_inst(
                 (BinOp::And, _, Some(mask)) if mask == m => return Some(*lhs),
                 (BinOp::And | BinOp::Or, _, _) if lhs == rhs => return Some(*lhs),
                 (BinOp::Sub | BinOp::Xor, _, _) if lhs == rhs => {
-                    return Some(intern(f, Constant::zero_int(w)));
+                    return Some(f.add_indexed_const(constants, Constant::zero_int(w)));
                 }
                 _ => {}
             }
@@ -557,7 +549,7 @@ fn fold_inst(
                     (d as u128) & m
                 }
             };
-            Some(intern(f, Constant::Int { bits: v & m, width: w }))
+            Some(f.add_indexed_const(constants, Constant::Int { bits: v & m, width: w }))
         }
         Inst::Icmp { pred, ty, lhs, rhs } => {
             let w = ty.int_bits()?;
@@ -575,7 +567,7 @@ fn fold_inst(
                 IntPred::Ugt => l > r,
                 IntPred::Uge => l >= r,
             };
-            Some(intern(f, Constant::int(b as i128, 1)))
+            Some(f.add_indexed_const(constants, Constant::int(b as i128, 1)))
         }
         Inst::Select { cond, yes, no, .. } => match f.constant(*cond) {
             Some(Constant::Int { bits: 0, .. }) => Some(*no),
@@ -585,7 +577,7 @@ fn fold_inst(
         Inst::Trunc { to, value, .. } => {
             let c = f.constant(*value)?;
             let w = to.int_bits()?;
-            Some(intern(f, Constant::Int {
+            Some(f.add_indexed_const(constants, Constant::Int {
                 bits: c.as_u128()? & crate::analysis::mask(w),
                 width: w,
             }))
@@ -593,7 +585,7 @@ fn fold_inst(
         Inst::Zext { to, value, .. } => {
             let c = f.constant(*value)?;
             let w = to.int_bits()?;
-            Some(intern(f, Constant::Int {
+            Some(f.add_indexed_const(constants, Constant::Int {
                 bits: c.as_u128()?,
                 width: w,
             }))
@@ -603,7 +595,7 @@ fn fold_inst(
             let fw = from.int_bits()?;
             let w = to.int_bits()?;
             let s = crate::analysis::signed(c.as_u128()?, fw);
-            Some(intern(f, Constant::Int {
+            Some(f.add_indexed_const(constants, Constant::Int {
                 bits: (s as u128) & crate::analysis::mask(w),
                 width: w,
             }))

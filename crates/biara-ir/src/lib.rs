@@ -655,6 +655,27 @@ impl Function {
         self.append_const(c)
     }
 
+    /// Index constants before a batch that only appends constants to the arena.
+    pub fn constant_index(&self) -> std::collections::HashMap<Constant, ValueId> {
+        let mut index = std::collections::HashMap::new();
+        for (i, value) in self.values.iter().enumerate() {
+            if let Value::Const(constant) = value {
+                index.entry(constant.clone()).or_insert(ValueId(i as u32));
+            }
+        }
+        index
+    }
+
+    /// Add a constant using the index from this function. Every constant
+    /// inserted during the batch must update the same index.
+    pub fn add_indexed_const(
+        &mut self,
+        index: &mut std::collections::HashMap<Constant, ValueId>,
+        constant: Constant,
+    ) -> ValueId {
+        *index.entry(constant.clone()).or_insert_with(|| self.append_const(constant))
+    }
+
     fn append_const(&mut self, c: Constant) -> ValueId {
         self.values.push(Value::Const(c));
         self.defined_in.push(None);

@@ -1245,6 +1245,7 @@ impl<'a> Former<'a> {
         }
         let mut map: Vec<Option<ValueId>> = vec![None; old.values.len()];
         let mut rev: HashMap<u32, u32> = HashMap::new();
+        let mut constants = f.constant_index();
         for (i, val) in old.values.iter().enumerate() {
             let id = ValueId(i as u32);
             map[i] = match val {
@@ -1254,7 +1255,7 @@ impl<'a> Former<'a> {
                     }
                     Some(env)
                 }
-                Value::Const(c) => Some(f.add_const(c.clone())),
+                Value::Const(c) => Some(f.add_indexed_const(&mut constants, c.clone())),
                 Value::Inst(_) => match owned_gep.get(&id.0) {
                     Some(&r) => Some(slot_of(&slots, r)),
                     None => Some(placeholder(&mut f, &old.ty(id))),
