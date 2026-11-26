@@ -1,7 +1,7 @@
 //! Structural checks: the invariants LLVM's verifier enforced that biara
 //! relies on (typed operands, terminated blocks, phis aligned with preds).
 
-use crate::{BlockId, Function, Inst, Terminator, Type, Value, ValueId, successor_blocks};
+use crate::{BlockId, Function, Inst, Terminator, Type, Value, ValueId};
 use std::collections::HashMap;
 use std::fmt;
 
@@ -70,7 +70,7 @@ pub fn verify(f: &Function) -> Result<(), VerifyError> {
                 preds = f.blocks[bi].preds
             ));
         };
-        for &succ in &successor_blocks(term) {
+        for succ in (0..).map_while(|i| crate::successor_at(term, i)) {
             if succ.0 as usize >= f.blocks.len() {
                 return fail(format!("{name}: block {bi} branches out of range"));
             }
@@ -84,8 +84,9 @@ pub fn verify(f: &Function) -> Result<(), VerifyError> {
             if p.0 as usize >= f.blocks.len() {
                 return fail(format!("{name}: block {bi} has out-of-range pred"));
             }
-            let pred_term = f.terminator_or_unreachable(p);
-            if !successor_blocks(&pred_term).contains(&b) {
+            if !f.terminator(p).is_some_and(|term| {
+                (0..).map_while(|i| crate::successor_at(term, i)).any(|succ| succ == b)
+            }) {
                 return fail(format!(
                     "{name}: block {bi} has pred {p:?} that does not branch here"
                 ));

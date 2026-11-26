@@ -875,3 +875,15 @@ pub fn successor_blocks(t: &Terminator) -> Vec<BlockId> {
         }
     }
 }
+
+/// Lookup in the same order as `successor_blocks`, without allocating.
+pub(crate) fn successor_at(t: &Terminator, index: usize) -> Option<BlockId> {
+    match (t, index) {
+        (Terminator::Br(block), 0) => Some(*block),
+        (Terminator::CondBr { yes, .. }, 0) => Some(*yes),
+        (Terminator::CondBr { no, .. }, 1) => Some(*no),
+        (Terminator::Switch { default, .. }, 0) => Some(*default),
+        (Terminator::Switch { cases, .. }, index) => cases.get(index - 1).map(|&(_, block)| block),
+        _ => None,
+    }
+}

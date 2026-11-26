@@ -140,10 +140,8 @@ pub fn reverse_postorder(f: &Function) -> Vec<BlockId> {
     let mut stack = vec![(entry, 0usize)];
     visited[entry.0 as usize] = true;
     while let Some((b, i)) = stack.pop() {
-        let succs = f.successors(b);
-        if i < succs.len() {
+        if let Some(s) = f.terminator(b).and_then(|term| crate::successor_at(term, i)) {
             stack.push((b, i + 1));
-            let s = succs[i];
             if !visited[s.0 as usize] {
                 visited[s.0 as usize] = true;
                 stack.push((s, 0));
@@ -631,11 +629,13 @@ pub fn recompute_preds(f: &mut Function) {
     }
     for i in 0..f.blocks.len() {
         let b = BlockId(i as u32);
-        for succ in f.successors(BlockId(i as u32)) {
+        let mut index = 0;
+        while let Some(succ) = f.terminator(b).and_then(|term| crate::successor_at(term, index)) {
             // Out-of-range targets are a verify error, not a panic here.
             if let Some(block) = f.blocks.get_mut(succ.0 as usize) {
                 block.preds.insert(b);
             }
+            index += 1;
         }
     }
 }
