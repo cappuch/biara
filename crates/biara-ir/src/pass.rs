@@ -451,10 +451,10 @@ fn remove_slot(f: &mut Function, slot: ValueId) {
 /// changed, so the pipeline can iterate.
 pub fn fold(f: &mut Function) -> bool {
     let mut changed = false;
-    let mut consts: HashMap<ValueId, Constant> = HashMap::new();
-    for (i, v) in f.values.iter().enumerate() {
-        if let Value::Const(c) = v {
-            consts.insert(ValueId(i as u32), c.clone());
+    let mut constants = HashMap::new();
+    for (index, value) in f.values.iter().enumerate() {
+        if let Value::Const(constant) = value {
+            constants.entry(constant.clone()).or_insert(ValueId(index as u32));
         }
     }
     let work: Vec<_> = f.blocks.iter().flat_map(|block| block.insts.iter().copied()).collect();
@@ -474,11 +474,8 @@ pub fn fold(f: &mut Function) -> bool {
                 *operand = resolve_replacement(&replacements, *operand);
             }
         }
-        if let Some(folded) = fold_inst(f, &consts, &inst).filter(|&folded| folded != id) {
+        if let Some(folded) = fold_inst(f, &mut constants, &inst).filter(|&folded| folded != id) {
             replacements[id.0 as usize] = Some(folded);
-            if let Some(c) = f.constant(folded) {
-                consts.insert(folded, c.clone());
-            }
             changed = true;
         }
     }
@@ -493,15 +490,18 @@ pub fn fold(f: &mut Function) -> bool {
 
 fn fold_inst(
     f: &mut Function,
-    consts: &HashMap<ValueId, Constant>,
+    constants: &mut HashMap<Constant, ValueId>,
     inst: &Inst,
 ) -> Option<ValueId> {
+    let mut intern = |f: &mut Function, constant: Constant| {
+        *constants.entry(constant.clone()).or_insert_with(|| f.append_const(constant))
+    };
     match inst {
         Inst::Bin { op, ty, lhs, rhs } => {
             let w = ty.int_bits()?;
             let m = crate::analysis::mask(w);
-            let left = consts.get(lhs).and_then(Constant::as_u128);
-            let right = consts.get(rhs).and_then(Constant::as_u128);
+            let left = f.constant(*lhs).and_then(Constant::as_u128);
+            let right = f.constant(*rhs).and_then(Constant::as_u128);
             match (op, left, right) {
                 (BinOp::Add | BinOp::Or | BinOp::Xor, Some(0), _) => return Some(*rhs),
                 (BinOp::Add | BinOp::Sub | BinOp::Or | BinOp::Xor
@@ -512,7 +512,7 @@ fn fold_inst(
                 (BinOp::And, _, Some(mask)) if mask == m => return Some(*lhs),
                 (BinOp::And | BinOp::Or, _, _) if lhs == rhs => return Some(*lhs),
                 (BinOp::Sub | BinOp::Xor, _, _) if lhs == rhs => {
-                    return Some(f.add_const(Constant::zero_int(w)));
+                    return Some(intern(f, Constant::zero_int(w)));
                 }
                 _ => {}
             }
@@ -557,11 +557,11 @@ fn fold_inst(
                     (d as u128) & m
                 }
             };
-            Some(f.add_const(Constant::Int { bits: v & m, width: w }))
+            Some(intern(f, Constant::Int { bits: v & m, width: w }))
         }
-        Inst::Icmp { pred, ty, lhs, rhs } if consts.contains_key(lhs) && consts.contains_key(rhs) => {
+        Inst::Icmp { pred, ty, lhs, rhs } => {
             let w = ty.int_bits()?;
-            let (l, r) = (consts[lhs].as_u128()?, consts[rhs].as_u128()?);
+            let (l, r) = (f.constant(*lhs)?.as_u128()?, f.constant(*rhs)?.as_u128()?);
             let (ls, rs) = (crate::analysis::signed(l, w), crate::analysis::signed(r, w));
             let b = match pred {
                 IntPred::Eq => l == r,
@@ -575,35 +575,35 @@ fn fold_inst(
                 IntPred::Ugt => l > r,
                 IntPred::Uge => l >= r,
             };
-            Some(f.add_const(Constant::int(b as i128, 1)))
+            Some(intern(f, Constant::int(b as i128, 1)))
         }
-        Inst::Select { cond, yes, no, .. } => match consts.get(cond) {
+        Inst::Select { cond, yes, no, .. } => match f.constant(*cond) {
             Some(Constant::Int { bits: 0, .. }) => Some(*no),
             Some(Constant::Int { .. }) => Some(*yes),
             _ => None,
         },
         Inst::Trunc { to, value, .. } => {
-            let c = consts.get(value)?;
+            let c = f.constant(*value)?;
             let w = to.int_bits()?;
-            Some(f.add_const(Constant::Int {
+            Some(intern(f, Constant::Int {
                 bits: c.as_u128()? & crate::analysis::mask(w),
                 width: w,
             }))
         }
         Inst::Zext { to, value, .. } => {
-            let c = consts.get(value)?;
+            let c = f.constant(*value)?;
             let w = to.int_bits()?;
-            Some(f.add_const(Constant::Int {
+            Some(intern(f, Constant::Int {
                 bits: c.as_u128()?,
                 width: w,
             }))
         }
         Inst::Sext { from, to, value } => {
-            let c = consts.get(value)?;
+            let c = f.constant(*value)?;
             let fw = from.int_bits()?;
             let w = to.int_bits()?;
             let s = crate::analysis::signed(c.as_u128()?, fw);
-            Some(f.add_const(Constant::Int {
+            Some(intern(f, Constant::Int {
                 bits: (s as u128) & crate::analysis::mask(w),
                 width: w,
             }))

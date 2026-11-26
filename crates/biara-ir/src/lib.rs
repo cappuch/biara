@@ -652,6 +652,10 @@ impl Function {
         {
             return ValueId(i as u32);
         }
+        self.append_const(c)
+    }
+
+    fn append_const(&mut self, c: Constant) -> ValueId {
         self.values.push(Value::Const(c));
         self.defined_in.push(None);
         self.pc.push(None);
