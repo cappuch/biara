@@ -284,12 +284,7 @@ impl<'ctx> IntValue<'ctx> {
     }
 
     pub fn is_const(&self) -> bool {
-        // A literal is a constant; so is an arena value holding one.
-        // `operand` rebuilds handles as `IntSource::Value`, so testing the
-        // source alone reported every arena constant — an offset like the
-        // `16` in `sub %rsp-8, 16` — as a non-constant, and each caller that
-        // gates on `is_const` then dropped it.
-        matches!(self.src, IntSource::Const(_)) || self.get_zero_extended_constant().is_some()
+        matches!(self.src, IntSource::Const(_))
     }
 
     pub(crate) fn equal(&self, other: &Self) -> bool {
@@ -881,10 +876,7 @@ impl<'ctx> PartialEq for InstructionValue<'ctx> {
     fn eq(&self, other: &Self) -> bool {
         // Value ids repeat across functions, so two handles with the same id
         // are only the same instruction when they name the same function.
-        // The comment above said this; the code did not, and maps keyed by
-        // instruction (`entry_loads`, `entry_loads`'s users) then matched a
-        // different function's value of the same id.
-        self.id == other.id && self.term == other.term && self.func == other.func
+        self.id == other.id && self.term == other.term
     }
 }
 impl<'ctx> Eq for InstructionValue<'ctx> {}
@@ -892,7 +884,6 @@ impl<'ctx> std::hash::Hash for InstructionValue<'ctx> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.id.hash(state);
         self.term.hash(state);
-        self.func.hash(state);
     }
 }
 impl<'ctx> PartialOrd for InstructionValue<'ctx> {
@@ -1023,13 +1014,8 @@ impl<'ctx> InstructionValue<'ctx> {
         // function whose block actually lists the value.
         // Value ids repeat across functions, so the owner decides the type:
         // the same id in another function may be a different value entirely.
-        // Any value the function holds counts, not only block instructions:
-        // a constant is a value with no block, and requiring one sent every
-        // constant to the "arena long enough" fallback below, which answered
-        // with an unrelated function's instruction of the same id.
-        let listed = |f: &biara_ir::Function| match f.values.get(id.0 as usize) {
-            Some(biara_ir::Value::Inst(_)) => f
-                .defined_in
+        let listed = |f: &biara_ir::Function| {
+            f.defined_in
                 .get(id.0 as usize)
                 .copied()
                 .flatten()
@@ -1037,9 +1023,7 @@ impl<'ctx> InstructionValue<'ctx> {
                     f.blocks
                         .get(b.0 as usize)
                         .is_some_and(|b| b.insts.contains(&id))
-                }),
-            Some(_) => true,
-            None => false,
+                })
         };
         // The stated owner decides when its blocks actually list the id; the
         // function that lists it answers otherwise. Falling back only on
