@@ -795,6 +795,24 @@ impl<'c, F: Fn(u64) -> Option<(&'c [u8], u64)>> Recovery<'_, 'c, F> {
             .collect::<BTreeSet<u64>>()
             .into_iter();
         let labels: BTreeSet<u64> = opts.jump_tables.values().flatten().copied().collect();
+        // Discovery only appends empty functions and translates candidates
+        // outside existing blocks. Recovered spans stay fixed for this round.
+        let mut spans: Vec<_> = self
+            .cfg
+            .functions
+            .values()
+            .filter_map(|function| {
+                let start = *function.blocks.first()?;
+                let end = function.blocks.iter().map(|b| self.cfg.blocks[b].end()).max()?;
+                Some((start, end))
+            })
+            .collect();
+        spans.sort_unstable_by_key(|&(start, _)| start);
+        let mut max_end = 0;
+        for (_, end) in &mut spans {
+            max_end = max_end.max(*end);
+            *end = max_end;
+        }
         let mut wave = Vec::with_capacity(64);
         let mut added = false;
         // Batch independent candidate translations through the backend in
@@ -811,11 +829,11 @@ impl<'c, F: Fn(u64) -> Option<(&'c [u8], u64)>> Recovery<'_, 'c, F> {
                 !self.cfg.functions.contains_key(c)
                     && !self.rejected.contains(c)
                     && !labels.contains(c)
-                    && self.could_be_entry(d, *c)
+                    && self.could_be_entry(d, &spans, *c)
             });
             self.prefetch(&wave)?;
             for c in wave.drain(..) {
-                if !self.could_be_entry(d, c) {
+                if !self.could_be_entry(d, &spans, c) {
                     continue;
                 }
                 let translated = self.ensure(c);
@@ -837,7 +855,7 @@ impl<'c, F: Fn(u64) -> Option<(&'c [u8], u64)>> Recovery<'_, 'c, F> {
         Ok(added)
     }
 
-    fn could_be_entry(&self, d: &Discovery, c: u64) -> bool {
+    fn could_be_entry(&self, d: &Discovery, spans: &[(u64, u64)], c: u64) -> bool {
         if !c.is_multiple_of(self.spec.insn_align) || !d.in_code(c) {
             return false;
         }
@@ -853,14 +871,8 @@ impl<'c, F: Fn(u64) -> Option<(&'c [u8], u64)>> Recovery<'_, 'c, F> {
         // `one`/`two` labels are the ends of blocks that were cut apart, so
         // testing the nearest block alone accepts them. The span is the
         // furthest end among the function's blocks.
-        if self.cfg.functions.values().any(|f| {
-            c != f.entry
-                && f.blocks.iter().any(|b| *b < c)
-                && f.blocks
-                    .iter()
-                    .filter_map(|b| self.cfg.blocks.get(b))
-                    .any(|b| c < b.end())
-        }) {
+        let i = spans.partition_point(|&(start, _)| start < c);
+        if i > 0 && spans[i - 1].1 > c {
             return false;
         }
         // Part of a recovered block, or a block of some function: code that
