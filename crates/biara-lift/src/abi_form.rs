@@ -966,6 +966,7 @@ impl<'a> Former<'a> {
                 offset: self.conv.margin as i64,
             },
         );
+        let mut constants = f.constant_index();
         let mut cases = Vec::new();
         let mut seen = BTreeSet::new();
         for s in sigs {
@@ -993,7 +994,7 @@ impl<'a> Former<'a> {
                     self.conv.sp,
                     &Type::i64(),
                 );
-                let off = const_int(&mut f, s.stack_args[i], 64);
+                let off = f.add_indexed_const(&mut constants, Constant::int(s.stack_args[i] as i128, 64));
                 let a = emit(
                     &mut f,
                     &mut at,
@@ -1017,7 +1018,7 @@ impl<'a> Former<'a> {
                 let want = param_ty(s, self.regs, s.args.len() + i);
                 args.push(trunc_if_narrow(&mut f, &mut at, v, &want));
             }
-            let callee = f.add_const(Constant::Function(s.function.clone()));
+            let callee = f.add_indexed_const(&mut constants, Constant::Function(s.function.clone()));
             let rty = ret_ty(s, self.regs);
             let r = emit(
                 &mut f,
@@ -1044,11 +1045,11 @@ impl<'a> Former<'a> {
                 };
                 write_cpu(&mut f, &mut at, self.regs, env, s.rets[i], v);
             }
-            let yes = const_int(&mut f, 1, 1);
+            let yes = f.add_indexed_const(&mut constants, Constant::int(1, 1));
             f.blocks[cb.0 as usize].term = Some(Terminator::Ret(Some(yes)));
         }
         let other = push_block(&mut f, "other");
-        let no = const_int(&mut f, 0, 1);
+        let no = f.add_indexed_const(&mut constants, Constant::int(0, 1));
         f.blocks[other.0 as usize].term = Some(Terminator::Ret(Some(no)));
         f.blocks[entry.0 as usize].term = Some(Terminator::Switch {
             value: addr,
@@ -1380,11 +1381,18 @@ impl<'a> Former<'a> {
             .flat_map(|b| b.insts.iter().copied())
             .filter(|&v| matches!(f.inst(v), Some(Inst::Call { .. })))
             .collect();
+        let mut constants = if sites.is_empty() {
+            HashMap::new()
+        } else {
+            f.constant_index()
+        };
         for v in sites {
             if !in_block(&f, v) {
                 continue;
             }
-            self.rewrite_call(&mut f, s, env, &slots, &promote, &touched, &rev, v)?;
+            self.rewrite_call(
+                &mut f, &mut constants, s, env, &slots, &promote, &touched, &rev, v,
+            )?;
         }
 
         // Returns: the return registers become the result.
@@ -1560,6 +1568,7 @@ impl<'a> Former<'a> {
     fn rewrite_call(
         &mut self,
         f: &mut Function,
+        constants: &mut HashMap<Constant, ValueId>,
         s: &Sig,
         env: ValueId,
         slots: &[Option<ValueId>],
@@ -1614,7 +1623,7 @@ impl<'a> Former<'a> {
             && let Some(t) = self.sig(name).cloned()
             && kind.is_none_or(|k| k == CallKind::Direct)
         {
-            invoke(f, &mut at, regs, self.conv, env, slots, &t, sp, ret_addr);
+            invoke(f, constants, &mut at, regs, self.conv, env, slots, &t, sp, ret_addr);
             erase(f, block, v);
             return Ok(());
         }
@@ -1652,7 +1661,7 @@ impl<'a> Former<'a> {
                     );
                     let r = call_unknown(f, &mut at, regs, env, slots, p, &self.conv.args, arity);
                     write_slot(f, &mut at, regs, env, slots, self.conv.ret, r);
-                    resumed(f, &mut at, regs, self.conv, env, slots, sp, ret_addr);
+                    resumed(f, constants, &mut at, regs, self.conv, env, slots, sp, ret_addr);
                     erase(f, block, v);
                     return Ok(());
                 }
@@ -1662,7 +1671,7 @@ impl<'a> Former<'a> {
                         let x = read_slot(f, &mut at, regs, env, slots, r, &rty);
                         write_cpu(f, &mut at, regs, env, r, x);
                     }
-                    let callee = f.add_const(Constant::Function(CALL_AT.to_owned()));
+                    let callee = f.add_indexed_const(constants, Constant::Function(CALL_AT.to_owned()));
                     let known = emit(
                         f,
                         &mut at,
@@ -1707,7 +1716,7 @@ impl<'a> Former<'a> {
                         let x = read_cpu(f, &mut lat, regs, env, r, &rty);
                         write_slot(f, &mut lat, regs, env, slots, r, x);
                     }
-                    resumed(f, &mut lat, regs, self.conv, env, slots, sp, ret_addr);
+                    resumed(f, constants, &mut lat, regs, self.conv, env, slots, sp, ret_addr);
                     f.blocks[lifted.0 as usize].term = Some(Terminator::Br(cont));
                     let mut eat = At {
                         block: external,
@@ -1724,20 +1733,20 @@ impl<'a> Former<'a> {
                     );
                     let r = call_unknown(f, &mut eat, regs, env, slots, p, &self.conv.args, arity);
                     write_slot(f, &mut eat, regs, env, slots, self.conv.ret, r);
-                    resumed(f, &mut eat, regs, self.conv, env, slots, sp, ret_addr);
+                    resumed(f, constants, &mut eat, regs, self.conv, env, slots, sp, ret_addr);
                     f.blocks[external.0 as usize].term = Some(Terminator::Br(cont));
                     biara_ir::analysis::recompute_preds(f);
                     return Ok(());
                 }
                 let symbol = record.and_then(|c| c.import).unwrap_or_default();
                 let name = self.import_decl(&symbol);
-                let callee = f.add_const(Constant::Function(name));
+                let callee = f.add_indexed_const(constants, Constant::Function(name));
                 let r = call_unknown(f, &mut at, regs, env, slots, callee, &self.conv.args, arity);
                 let want = reg_ty(regs, self.conv.ret);
                 let have = f.ty(r);
                 let r = convert(f, &mut at, &have, &want, r);
                 write_slot(f, &mut at, regs, env, slots, self.conv.ret, r);
-                resumed(f, &mut at, regs, self.conv, env, slots, sp, ret_addr);
+                resumed(f, constants, &mut at, regs, self.conv, env, slots, sp, ret_addr);
                 erase(f, block, v);
                 Ok(())
             }
@@ -1751,7 +1760,7 @@ impl<'a> Former<'a> {
                         varargs: false,
                     },
                 );
-                let callee = f.add_const(Constant::Function(name));
+                let callee = f.add_indexed_const(constants, Constant::Function(name));
                 let r = call_unknown(
                     f,
                     &mut at,
@@ -1772,7 +1781,7 @@ impl<'a> Former<'a> {
             _ => {
                 // A division prelude call, then helpers.
                 if let Some(name) = &callee_name
-                    && self.div_op(f, &mut at, regs, env, slots, name, v)?
+                    && self.div_op(f, constants, &mut at, regs, env, slots, name, v)?
                 {
                     erase(f, block, v);
                     return Ok(());
@@ -1881,6 +1890,7 @@ impl<'a> Former<'a> {
     fn div_op(
         &mut self,
         f: &mut Function,
+        constants: &mut HashMap<Constant, ValueId>,
         at: &mut At,
         regs: &[Reg],
         env: ValueId,
@@ -1937,7 +1947,7 @@ impl<'a> Former<'a> {
         let hi = convert(f, at, &hi_ty, &Type::i64(), hi);
         let d_have = f.ty(args[1]);
         let d = convert(f, at, &d_have, &Type::i64(), args[1]);
-        let callee = f.add_const(Constant::Function(name));
+        let callee = f.add_indexed_const(constants, Constant::Function(name));
         let r = emit(
             f,
             at,
@@ -2288,6 +2298,7 @@ fn call_unknown(
 /// After a call returns to `ret`: the stack pointer as the return leaves it.
 fn resumed(
     f: &mut Function,
+    constants: &mut HashMap<Constant, ValueId>,
     at: &mut At,
     regs: &[Reg],
     conv: &Conv,
@@ -2297,7 +2308,7 @@ fn resumed(
     ret: u64,
 ) {
     let sp_ty = reg_ty(regs, conv.sp);
-    let pop = const_int(f, conv.pop, regs[conv.sp as usize].bits);
+    let pop = f.add_indexed_const(constants, Constant::int(conv.pop as i128, regs[conv.sp as usize].bits));
     let v = emit(
         f,
         at,
@@ -2310,7 +2321,7 @@ fn resumed(
     );
     write_slot(f, at, regs, env, slots, conv.sp, v);
     if ret != 0 {
-        let pc = const_u64(f, ret, regs[conv.pc as usize].bits);
+        let pc = f.add_indexed_const(constants, Constant::int(ret as i128, regs[conv.pc as usize].bits));
         write_slot(f, at, regs, env, slots, conv.pc, pc);
     }
 }
@@ -2356,6 +2367,7 @@ fn find_pushed_return(
 /// results in the register slots.
 fn invoke(
     f: &mut Function,
+    constants: &mut HashMap<Constant, ValueId>,
     at: &mut At,
     regs: &[Reg],
     conv: &Conv,
@@ -2373,7 +2385,7 @@ fn invoke(
     if !t.stack_args.is_empty() {
         let sp64 = convert(f, at, &reg_ty(regs, conv.sp), &Type::i64(), sp);
         for i in 0..t.stack_args.len() {
-            let off = const_int(f, t.stack_args[i], 64);
+            let off = f.add_indexed_const(constants, Constant::int(t.stack_args[i] as i128, 64));
             let a = emit(
                 f,
                 at,
@@ -2399,7 +2411,7 @@ fn invoke(
         }
     }
     let rty = ret_ty(t, regs);
-    let callee = f.add_const(Constant::Function(t.function.clone()));
+    let callee = f.add_indexed_const(constants, Constant::Function(t.function.clone()));
     let r = emit(
         f,
         at,
@@ -2426,7 +2438,7 @@ fn invoke(
         };
         write_slot(f, at, regs, env, slots, t.rets[i], v);
     }
-    resumed(f, at, regs, conv, env, slots, sp, ret_addr);
+    resumed(f, constants, at, regs, conv, env, slots, sp, ret_addr);
 }
 
 #[cfg(test)]
