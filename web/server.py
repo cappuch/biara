@@ -16,6 +16,8 @@ OUTPUT_LIMIT = 8 * 1024 * 1024
 TIME_LIMIT = 60
 ASSETS = {"/": ("index.html", "text/html"), "/app.js": ("app.js", "text/javascript"),
           "/style.css": ("style.css", "text/css")}
+INSPECTORS = {"disassembly": "disassemble", "imports": "list_imports",
+              "strings": "list_strings", "segments": "list_segments"}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -52,7 +54,16 @@ class Handler(BaseHTTPRequestHandler):
         if url.path != "/decompile":
             self.error(404, "Endpoint not found.")
             return
-        root = parse_qs(url.query).get("root", [""])[0].strip()
+        query = parse_qs(url.query)
+        root = query.get("root", [""])[0].strip()
+        view = query.get("view", ["pseudocode"])[0]
+        if view not in (*INSPECTORS, "pseudocode", "graph"):
+            self.error(400, "Unknown workbench view.")
+            return
+        if view in ("disassembly", "graph") and not root:
+            self.error(400, "Select a function first.")
+            return
+        structured = view != "pseudocode" or query.get("format", ["text"])[0] == "json"
         if len(root) > 256 or root.startswith("-") or (root and not root.isprintable()):
             self.error(400, "Use a function name or address.")
             return
@@ -70,7 +81,7 @@ class Handler(BaseHTTPRequestHandler):
             self.error(503, "A decompilation is already running. Try again shortly.")
             return
         try:
-            self.decompile(size, root)
+            self.decompile(size, root, structured, view)
         except (TimeoutError, subprocess.TimeoutExpired):
             self.error(408, "The upload or decompilation timed out.")
         except OSError:
@@ -78,7 +89,7 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             self.server.slot.release()
 
-    def decompile(self, size, root):
+    def decompile(self, size, root, structured, view):
         with tempfile.TemporaryDirectory(prefix="biara-web-") as directory:
             work = Path(directory)
             binary = work / "input"
@@ -91,13 +102,35 @@ class Handler(BaseHTTPRequestHandler):
                         return
                     output.write(chunk)
                     remaining -= len(chunk)
-            args = [self.server.biara, "lift", str(binary)]
-            if root:
-                args.append(root)
-            args += ["--emit", "decomp", "--jobs", "1", "--max-blocks", "2000",
-                     "--memory-mib", "2048", "--database", str(work / "analysis.db")]
-            with (work / "output").open("w+b") as stdout, (work / "errors").open("w+b") as stderr:
-                with subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=stdout,
+            limits = ["--jobs", "1", "--max-blocks", "2000", "--memory-mib", "2048",
+                      "--database", str(work / "analysis.db")]
+            if view in INSPECTORS:
+                args = [self.server.biara, "mcp", str(binary), *limits]
+                options = {"wait_seconds": 45}
+                if view == "disassembly":
+                    options.update(address_or_function=root, count=100)
+                else:
+                    options["limit"] = 100
+                requests = [
+                    {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                     "params": {"protocolVersion": "2025-11-25", "capabilities": {},
+                                "clientInfo": {"name": "biara-workbench", "version": "1"}}},
+                    {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                     "params": {"name": INSPECTORS[view], "arguments": options}},
+                ]
+                (work / "requests").write_text("".join(json.dumps(request) + "\n" for request in requests))
+            else:
+                args = [self.server.biara, "lift", str(binary)]
+                if root:
+                    args.append(root)
+                args += ["--emit", "cfg" if view == "graph" else "decomp", *limits]
+                if structured:
+                    args += ["--format", "json"]
+                (work / "requests").touch()
+            with ((work / "requests").open("rb") as stdin,
+                  (work / "output").open("w+b") as stdout,
+                  (work / "errors").open("w+b") as stderr):
+                with subprocess.Popen(args, stdin=stdin, stdout=stdout,
                                       stderr=stderr, cwd=work, start_new_session=True) as process:
                     try:
                         returncode = process.wait(timeout=TIME_LIMIT)
@@ -118,7 +151,20 @@ class Handler(BaseHTTPRequestHandler):
             if len(source) > OUTPUT_LIMIT:
                 self.error(422, "Output exceeds 8 MiB. Select a function to narrow the result.")
                 return
-            self.reply(200, source)
+            if view in INSPECTORS:
+                try:
+                    reply = next(response for response in map(json.loads, source.splitlines())
+                                 if response.get("id") == 2)
+                    result = reply["result"]
+                    lines = "\n".join(item["text"] for item in result["content"])
+                except (KeyError, ValueError, StopIteration):
+                    self.error(502, "The inspector returned an invalid response.")
+                    return
+                if result.get("isError"):
+                    self.error(422, lines.replace(str(binary), "input"))
+                    return
+                source = json.dumps({"text": lines}).encode()
+            self.reply(200, source, "application/json" if structured else "text/plain; charset=utf-8")
 
 
 def main():

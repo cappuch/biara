@@ -1,23 +1,58 @@
 <!doctype html>
 <html lang="en">
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Biara · Binary decompiler</title>
-<link rel="stylesheet" href="/style.css">
-<main>
-  <header><span class="brand">BIARA</span><h1>Binary decompiler</h1></header>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Biara Workbench</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+<header class="top">
+  <h1><span aria-hidden="true"></span>biara</h1>
   <form>
-    <label for="binary">Binary <small>ELF, PE, or Mach-O · up to 8 MiB</small></label>
-    <input id="binary" type="file" required>
-    <label for="root">Function <small>Optional</small></label>
-    <input id="root" type="text" maxlength="256" placeholder="main or 0x401000" spellcheck="false">
+    <label class="field"><span>Open binary</span><input id="binary" type="file" required></label>
+    <label class="field"><span>Function or address</span><input id="root" type="text" maxlength="256" placeholder="Any function" spellcheck="false"></label>
     <button id="submit">Decompile</button>
   </form>
-  <p role="status" id="status"></p>
-  <section id="result" hidden>
-    <div class="toolbar"><h2>Decompiled C</h2><button type="button" id="save">Download C</button></div>
-    <pre><code id="source"></code></pre>
-  </section>
-</main>
-<script src="/app.js"></script>
+</header>
+<div class="workspace">
+  <aside aria-label="Functions">
+    <nav class="tabs" aria-label="Sidebar">
+      <button type="button" data-side="functions" aria-pressed="true">Functions</button>
+      <button type="button" data-side="imports" disabled>Imports</button>
+      <button type="button" data-side="strings" disabled>Strings</button>
+      <button type="button" data-side="segments" disabled>Segments</button>
+    </nav>
+    <input id="filter" type="search" placeholder="Filter functions" aria-label="Filter functions" disabled>
+    <div id="functions"></div>
+    <pre id="side-inspector" hidden></pre>
+    <span id="count"></span>
+  </aside>
+  <main>
+    <div class="section-title"><nav class="tabs" aria-label="Main view">
+      <button type="button" data-view="disassembly" disabled>Disassembly</button>
+      <button type="button" data-view="graph" disabled>Graph</button>
+      <button type="button" data-view="pseudocode" aria-pressed="true">Pseudocode</button>
+      <button type="button" data-view="hex" disabled>Hex</button>
+    </nav><div class="actions">
+      <button type="button" id="copy" disabled>Copy</button>
+      <button type="button" id="save" disabled>Download C</button>
+    </div></div>
+    <h2 id="title" hidden></h2>
+    <p role="status" id="status">Choose an ELF, PE, or Mach-O binary up to 8 MiB.</p>
+    <pre id="result" hidden><code id="source"></code></pre>
+    <pre id="inspector" hidden></pre>
+    <div id="graph" hidden><canvas></canvas></div>
+    <details id="references" open hidden>
+      <summary>Cross-references</summary>
+      <div id="relations"></div>
+    </details>
+    <details id="analysis" hidden>
+      <summary>Analysis evidence</summary>
+      <pre id="evidence"></pre>
+    </details>
+  </main>
+</div>
+</body>
 </html>
