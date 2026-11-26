@@ -475,3 +475,39 @@ of `%v115 = store i64 0`. If the id is right and only `func` is wrong, fix
 where the handle is built. If the id is wrong too, the leak is at
 construction. Do not widen the predicates again — that road is measured and
 it fails.
+
+---
+
+## 8. The `args[1]` constant, measured precisely
+
+Dumping **only** the `"calls"` module (the fix in §2 — filter on
+`ir.name == "calls"`) and instrumenting the `constant` closure in
+`FunctionFacts::symbolic_at` gives the exact operand shape for
+`%v66 = add i64 %v52, -16`:
+
+```
+CONST k=1 op=i64 v51  is_const=false  zec=18446744073709551608  result=None
+CONST k=1 op=i64 v59  is_const=false  zec=32                    result=None
+```
+
+`18446744073709551608` is `0xFFFF_FFFF_FFFF_FFF8`, i.e. **-8** (the `%v52`
+step), and `32` is the stack-pointer env offset. So:
+
+- The operand ids are **right**. There is no cross-function id leak.
+- `get_zero_extended_constant()` **succeeds** on them — the arena lookup
+  works once `self.func` is correct.
+- `is_const()` returns **false** because these are `IntSource::Value`, and the
+  `if c.is_const()` guard in the `constant` closure therefore discards a value
+  that is in fact known.
+
+So the fix is to stop gating on `is_const()` and use the value the constant
+accessor returns. That change alone is not enough: it needs
+`get_sign_extended_constant` to resolve in the right function, which is what
+the `operand` owner change in §7 provides — and §7's combination breaks
+`aarch64/tail`.
+
+The narrow question left is therefore: why does correcting the owner make
+`tail`'s dispatch loop fail? `Unsupported("dispatch made no progress")` comes
+from the interpreter, so a lifted branch target changes. Compare the lifted
+`biara.dispatch` of `t_tail` before and after the owner change; the answer is
+in whichever target stops being constant.
