@@ -1594,6 +1594,9 @@ impl<'ctx> PreparedC<'ctx> {
                     continue;
                 }
                 biara_ir::pass::promote_loop_slots(f);
+                if discardable.contains("helper_cc_compute_nz") {
+                    crate::rewrite::fold_logicq_nonzero(f);
+                }
                 biara_ir::pass::fold(f);
                 biara_ir::pass::prune_constant_edges(f);
                 biara_ir::pass::dce_with_unused_calls(f, |name| discardable.contains(name));

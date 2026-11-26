@@ -276,6 +276,34 @@ pub fn div_sugar(f: &mut Function) -> usize {
     sugared
 }
 
+/// QEMU's LOGICQ nonzero query returns the entire 64-bit result.
+pub fn fold_logicq_nonzero(f: &mut Function) {
+    const CC_OP_LOGICQ: u128 = 27;
+    let mut calls = Vec::new();
+    for &id in f.blocks.iter().flat_map(|block| &block.insts) {
+        let Some(Inst::Call { callee, args, ty: Type::Int(64) }) = f.inst(id) else {
+            continue;
+        };
+        let [result, _, operation] = args.as_slice() else {
+            continue;
+        };
+        if matches!(f.constant(*callee), Some(Constant::Function(name)) if name == "helper_cc_compute_nz")
+            && f.constant(*operation).and_then(Constant::as_u128) == Some(CC_OP_LOGICQ)
+            && f.ty(*result) == Type::Int(64)
+        {
+            calls.push(id);
+        }
+    }
+    for id in calls {
+        let Some(Inst::Call { args, .. }) = f.inst(id) else {
+            continue;
+        };
+        let result = args[0];
+        replace_all_uses(f, id, result);
+        remove_inst(f, id);
+    }
+}
+
 /// Split `biara_sdiv64` into its width and signedness.
 fn parse_div_name(name: &str) -> Option<(u32, bool)> {
     let rest = name.strip_prefix("biara_")?;
