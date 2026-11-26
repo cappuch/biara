@@ -553,6 +553,11 @@ impl<'a> CallSites<'a> {
                 Some(analysis),
             )?;
             memory::simplify(&module, self.machine)?;
+            module.update(|m| {
+                for function in &mut m.module.functions {
+                    biara_ir::pass::promote_loop_slots(function);
+                }
+            });
             self.collect_unindexed(&module);
         }
         self.index_sites();
@@ -1550,7 +1555,7 @@ impl<'ctx> FunctionFacts<'ctx> {
                     continue;
                 }
                 let global = dest.is_none();
-                if let Some(v) = i.get_operand(0).and_then(|o| o.value())
+                if let Some(v) = analysis_operand(i, 0)
                     && let Some(Sym::Reg(r, e)) = facts.symbolic(v)
                     && r == sp
                 {
@@ -1711,58 +1716,66 @@ impl<'ctx> FunctionFacts<'ctx> {
     }
 
     /// An address derived directly from an entry register.
-    fn register_address(&self, ptr: BasicValueEnum<'ctx>, depth: u32) -> Option<Address> {
+    fn register_address(&self, mut ptr: BasicValueEnum<'ctx>, depth: u32) -> Option<Address> {
         if depth > 16 {
             return None;
         }
-        let inst = ptr.as_instruction_value()?;
-        let operand = |k: u32| inst.get_operand(k).and_then(|o| o.value());
-        let constant = |k| inst.get_constant_int_operand(k)?.get_sign_extended_constant();
-        let gep_offset = || match operand(1)? {
-            BasicValueEnum::IntValue(c) => c.get_sign_extended_constant(),
-            _ => None,
-        };
-        let at = |k: u32| self.register_address(operand(k)?, depth + 1);
-        let offset = |mut address: Address, delta: i64| {
-            address.off = address.off.wrapping_add(delta);
-            address
-        };
-        let same = |vals: &mut dyn Iterator<Item = Option<BasicValueEnum<'ctx>>>| {
-            let mut out = None;
-            for v in vals {
-                let o = self.register_address(v?, depth + 1)?;
-                if out.is_some_and(|x| x != o) {
-                    return None;
+        let mut offset = 0i64;
+        for _ in 0..MAX_SLOT_WALK {
+            let inst = ptr.as_instruction_value()?;
+            let operand = |k: u32| analysis_operand(inst, k);
+            let constant = |k| inst.get_constant_int_operand(k)?.get_sign_extended_constant();
+            let (base, delta) = match inst.get_opcode() {
+                InstructionOpcode::Add => match (constant(0), constant(1)) {
+                    (_, Some(c)) => (operand(0)?, c),
+                    (Some(c), _) => (operand(1)?, c),
+                    _ => return None,
+                },
+                InstructionOpcode::Sub => (operand(0)?, constant(1)?.wrapping_neg()),
+                InstructionOpcode::IntToPtr | InstructionOpcode::PtrToInt => (operand(0)?, 0),
+                InstructionOpcode::GetElementPtr
+                    if inst.get_num_operands() == 2
+                        && inst.get_gep_source_element_type().is_ok_and(is_i8) =>
+                {
+                    let BasicValueEnum::IntValue(index) = inst.get_operand(1)?.value()? else {
+                        return None;
+                    };
+                    (operand(0)?, index.get_sign_extended_constant()?)
                 }
-                out = Some(o);
-            }
-            out
-        };
-        match inst.get_opcode() {
-            InstructionOpcode::Load => Some(Address {
-                reg: *self.entry_loads.get(&inst)?,
-                off: 0,
-            }),
-            InstructionOpcode::Add => match (constant(0), constant(1)) {
-                (_, Some(c)) => Some(offset(at(0)?, c)),
-                (Some(c), _) => Some(offset(at(1)?, c)),
-                _ => None,
-            },
-            InstructionOpcode::Sub => Some(offset(at(0)?, constant(1)?.wrapping_neg())),
-            InstructionOpcode::IntToPtr | InstructionOpcode::PtrToInt => at(0),
-            InstructionOpcode::GetElementPtr
-                if inst.get_num_operands() == 2
-                    && inst.get_gep_source_element_type().is_ok_and(is_i8) =>
-            {
-                Some(offset(at(0)?, gep_offset()?))
-            }
-            InstructionOpcode::Select => same(&mut [operand(1), operand(2)].into_iter()),
-            InstructionOpcode::Phi => {
-                let phi = PhiValue::try_from(inst).ok()?;
-                same(&mut (0..phi.count_incoming()).map(|k| phi.get_incoming(k).map(|(v, _)| v)))
-            }
-            _ => None,
+                InstructionOpcode::Load => {
+                    return Some(Address {
+                        reg: *self.entry_loads.get(&inst)?,
+                        off: offset,
+                    });
+                }
+                InstructionOpcode::Select | InstructionOpcode::Phi => {
+                    let mut address = None;
+                    let mut merge = |value| {
+                        let mut next = self.register_address(value?, depth + 1)?;
+                        next.off = next.off.wrapping_add(offset);
+                        if address.is_some_and(|previous| previous != next) {
+                            return None;
+                        }
+                        address = Some(next);
+                        Some(())
+                    };
+                    if inst.get_opcode() == InstructionOpcode::Select {
+                        merge(operand(1))?;
+                        merge(operand(2))?;
+                    } else {
+                        let phi = PhiValue::try_from(inst).ok()?;
+                        for k in 0..phi.count_incoming() {
+                            merge(phi.get_incoming(k).map(|(value, _)| value))?;
+                        }
+                    }
+                    return address;
+                }
+                _ => return None,
+            };
+            ptr = base;
+            offset = offset.wrapping_add(delta);
         }
+        None
     }
 
     /// Whether the call `i` leaves the frame slot `[off, end)` alone: the
@@ -1973,7 +1986,7 @@ impl<'ctx> FunctionFacts<'ctx> {
                         {
                             return None;
                         }
-                        let width = match i.get_operand(0)?.value()? {
+                        let width = match analysis_operand(i, 0)? {
                             BasicValueEnum::IntValue(v) => v.get_type().get_bit_width(),
                             _ => return None,
                         };
@@ -2045,7 +2058,7 @@ impl<'ctx> FunctionFacts<'ctx> {
                 }
             }
         }
-        found?.get_operand(0)?.value()
+        analysis_operand(found?, 0)
     }
 
     /// An x87 store helper's (guest address operand, width in bits), if
