@@ -1,5 +1,5 @@
 //! Function-local canonicalization at scale: execute 600 lifted functions
-//! with distinct constants and branches at LLVM -O0 and -O2. This catches
+//! with distinct constants and branches before and after optimization. This catches
 //! cross-function analysis reuse and lost register/return-state updates.
 //!
 //! Requires libtcg-x86_64.so (scripts/build-libtcg.sh x86_64);
@@ -14,7 +14,8 @@ use biara_lift::{ResolveOptions, analysis_machine, recover_resolving};
 use biara_loader::Image;
 use biara_tcg::Libtcg;
 use common::{linker, tmp};
-use biara_ir_compat::{OptimizationLevel, context::Context};
+use biara_ir_compat::context::Context;
+use biara_lift::interp::Interp;
 
 const MANY: usize = 600;
 
@@ -84,26 +85,29 @@ fn many() {
         if opt != 0 {
             biara_lift::optimize(&module, &machine, opt).unwrap();
         }
-        let ee = module
-            .create_jit_execution_engine /* native JIT: module under test was lifted with analysis_machine */(OptimizationLevel::None)
-            .unwrap();
-        for h in cfg.helpers() {
-            if let Some(decl) = module.get_function(&h.symbol()) {
-                ee.add_global_mapping(&decl, h.addr);
-            }
+        let ir = module.ir();
+        let mut interp = Interp::new(
+            &ir,
+            (
+                env as u64 - biara_lift::CPU_STATE_MARGIN,
+                env as u64 + info.env_size as u64,
+            ),
+        );
+        interp.map((stack.as_ptr() as u64, stack.as_ptr_range().end as u64));
+        for helper in cfg.helpers() {
+            interp.bind(helper.symbol(), helper.addr as u64);
         }
         for i in 0..MANY {
             let name = format!("f{i}");
             let entry = image.symbol(&name).unwrap().addr;
-            let f = unsafe { ee.get_function::<unsafe extern "C" fn(*mut u8)>(&name) }.unwrap();
             for x in [0, 1, 2, u64::MAX, 1 << 63, 0xdead_beef] {
                 unsafe {
                     std::ptr::copy_nonoverlapping(pristine.as_ptr(), env, pristine.len());
                     env.add(rdi).cast::<u64>().write_unaligned(x);
                     env.add(rsp).cast::<u64>().write_unaligned(sp);
                     env.add(rip).cast::<u64>().write_unaligned(entry);
-                    f.call(env);
                 }
+                interp.call(&name, &[env as u128]).unwrap();
                 let read = |offset| unsafe { env.add(offset).cast::<u64>().read_unaligned() };
                 let expected = if x & 1 != 0 {
                     x.wrapping_mul(3).wrapping_add(i as u64)

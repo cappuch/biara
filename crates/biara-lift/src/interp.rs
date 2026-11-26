@@ -36,6 +36,34 @@ pub enum Trap {
     Unsupported(&'static str),
 }
 
+/// Carry from QEMU's lazy x86 flags. The four-entry CCOp groups use
+/// their bottom two bits for operand widths of 8, 16, 32, and 64.
+fn x86_carry(dst: u64, src1: u64, src2: u64, op: u32) -> u64 {
+    let width = 8 << (op & 3);
+    let mask = u64::MAX >> (64 - width);
+    let result = dst & mask;
+    let operand = src1 & mask;
+    let with_carry = u128::from(operand) + u128::from(src2 & mask);
+    match op {
+        0 | 2 | 40..=43 => src1 & 1,
+        1 | 3 => dst,
+        4..=7 => u64::from(src1 != 0),
+        8..=11 => u64::from(result < operand),
+        12..=15 => u64::from(u128::from(result) < with_carry),
+        16..=19 => u64::from((result.wrapping_add(operand) & mask) < operand),
+        20..=23 => {
+            let minuend = result.wrapping_add(with_carry as u64) & mask;
+            u64::from(u128::from(minuend) < with_carry)
+        }
+        28..=35 => src1,
+        36..=39 => operand >> (width - 1),
+        44..=47 => u64::from(operand == 0),
+        48..=51 => u64::from(operand != 0),
+        58 | 59 => dst & 1,
+        _ => 0,
+    }
+}
+
 impl Interp<'_> {
     /// Run a QEMU helper the lifter left as a declaration.
     ///
@@ -47,6 +75,9 @@ impl Interp<'_> {
         let bare = name.strip_prefix("helper_")?;
         let arg = |i: usize| args.get(i).copied().unwrap_or(0) as u64;
         match bare {
+            "cc_compute_c" if args.len() == 4 => {
+                Some(u128::from(x86_carry(arg(0), arg(1), arg(2), arg(3) as u32)))
+            }
             "memset" => {
                 let (dst, c, n) = (arg(0), arg(1) as u8, arg(2));
                 // A bogus length would spin the loop instead of reporting a
