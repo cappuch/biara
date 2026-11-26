@@ -820,7 +820,7 @@ impl biara_lift::RecoveryBackend for Session {
         &mut self,
         cfg: &biara_cfg::Cfg,
         pending: &BTreeSet<u64>,
-        _machine: &inkwell::targets::TargetMachine,
+        _machine: &biara_ir_compat::targets::TargetMachine,
         _read: &dyn Fn(u64, &mut [u8]) -> bool,
         max_entries: u64,
     ) -> Result<ResolutionArtifact, biara_lift::Error> {

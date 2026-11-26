@@ -17,9 +17,16 @@ fn tmp() -> PathBuf {
     PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
 }
 
-/// `llvm-objcopy`, `llvm-strip`: next to the pinned clang.
+/// `llvm-objcopy`, `llvm-strip`: next to the clang at `BIARA_CLANG`, else from
+/// `PATH` when the LLVM install is minimal.
 fn llvm_tool(name: &str) -> PathBuf {
-    Path::new(env!("BIARA_CLANG")).with_file_name(name)
+    let sibling = Path::new(env!("BIARA_CLANG")).with_file_name(name);
+    sibling.exists().then_some(sibling).unwrap_or_else(|| {
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .map(|d| d.join(name))
+            .find(|p| p.exists())
+            .unwrap_or_else(|| panic!("{name} is neither next to BIARA_CLANG nor on PATH"))
+    })
 }
 
 fn run(prog: &Path, args: &[&str]) {

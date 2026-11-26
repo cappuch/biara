@@ -848,7 +848,7 @@ pub(crate) fn execute(directory: &Path) -> Result<()> {
             None,
         )?;
         let selected = BTreeSet::from([address]);
-        let cx = inkwell::context::Context::create();
+        let cx = biara_ir_compat::context::Context::create();
         let mut prepared = biara_lift::prepare_c_selected(
             &cx,
             &machine,

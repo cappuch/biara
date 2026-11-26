@@ -14,8 +14,16 @@ use std::{
 use biara_loader::Image;
 use serde_json::Value;
 
+/// A tool related to the clang at `BIARA_CLANG`, or the same tool from `PATH`
+/// when the LLVM install is minimal (see biara-lift's `common::llvm_tool`).
 fn llvm_tool(name: &str) -> PathBuf {
-    Path::new(env!("BIARA_CLANG")).parent().unwrap().join(name)
+    let sibling = Path::new(env!("BIARA_CLANG")).parent().unwrap().join(name);
+    sibling.exists().then_some(sibling).unwrap_or_else(|| {
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .map(|d| d.join(name))
+            .find(|p| p.exists())
+            .unwrap_or_else(|| panic!("{name} is neither next to BIARA_CLANG nor on PATH"))
+    })
 }
 
 fn build(dir: &Path, opt: u8, name: &str, rebase: bool) -> PathBuf {

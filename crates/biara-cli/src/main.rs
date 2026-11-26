@@ -10,7 +10,7 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use biara_loader::Image;
 use biara_tcg::Libtcg;
 use clap::{Parser, Subcommand, ValueEnum};
-use inkwell::context::Context;
+use biara_ir_compat::context::Context;
 use parking_lot::Mutex;
 
 mod decomp;

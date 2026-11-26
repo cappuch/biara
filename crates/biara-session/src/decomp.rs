@@ -242,7 +242,7 @@ pub fn decompile(program: &Program, types: &Types, entry: u64) -> Result<Decompi
 
 fn run(program: &Program, types: &Types, entry: u64) -> anyhow::Result<Decompiled> {
     use anyhow::Context as _;
-    let cx = inkwell::context::Context::create();
+    let cx = biara_ir_compat::context::Context::create();
     let machine = biara_lift::analysis_machine()?;
     let selected = BTreeSet::from([entry]);
     let name_of = |e: u64| {

@@ -30,7 +30,7 @@ use biara_cfg::{Cfg, ExitKind};
 use biara_loader::Image;
 use biara_proto::{FunctionPackage, ReadabilityMetrics};
 use biara_tcg::Libtcg;
-use inkwell::{context::Context as LlvmContext, targets::TargetMachine};
+use biara_ir_compat::{context::Context as LlvmContext, targets::TargetMachine};
 use parking_lot::Mutex;
 use serde::Serialize;
 use serde_json::{Value, json};

@@ -26,7 +26,8 @@ reqwest.workspace = true
 zstd.workspace = true
 toml.workspace = true
 clap.workspace = true
-inkwell.workspace = true
+biara-ir-compat = { path = "../biara-ir-compat" }
+biara-ir.workspace = true
 parking_lot.workspace = true
 serde.workspace = true
 serde_json.workspace = true

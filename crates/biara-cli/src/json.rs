@@ -18,7 +18,7 @@ use biara_lift::{
 };
 use biara_loader::Image;
 use biara_tcg::ContextInfo;
-use inkwell::targets::TargetMachine;
+use biara_ir_compat::targets::TargetMachine;
 use serde::{Serialize, Serializer, ser::SerializeSeq};
 use serde_json::{Value, json};
 

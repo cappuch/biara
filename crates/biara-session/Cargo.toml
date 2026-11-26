@@ -16,7 +16,8 @@ biara-proto.workspace = true
 biara-tcg.workspace = true
 anyhow.workspace = true
 parking_lot.workspace = true
-inkwell.workspace = true
+biara-ir-compat = { path = "../biara-ir-compat" }
+biara-ir.workspace = true
 serde_json.workspace = true
 blake3.workspace = true
 iced-x86 = { version = "1.22", default-features = false, features = ["std", "decoder", "intel", "instr_info"] }
