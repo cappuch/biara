@@ -292,6 +292,14 @@ fn standard(bits: u32) -> bool {
     container(bits) == bits
 }
 
+fn zero_initializer(constant: &Constant) -> bool {
+    match constant {
+        Constant::Zero | Constant::Int { bits: 0, .. } => true,
+        Constant::Aggregate(fields) => fields.iter().all(zero_initializer),
+        _ => false,
+    }
+}
+
 fn width_mask(w: u32) -> u128 {
     if w >= 128 {
         u128::MAX
@@ -4319,7 +4327,11 @@ impl<'m, 'a, 'b> Emitter<'m, 'a, 'b> {
                 }
                 Inst::InsertValue { agg, value, index, .. } => {
                     let n = self.name(v);
-                    let agg_val = self.val(f, agg);
+                    let agg_val = if f.constant(agg).is_some_and(zero_initializer) {
+                        format!("({}){{0}}", self.cty(&ty))
+                    } else {
+                        self.val(f, agg)
+                    };
                     let ins = self.ival(f, value);
                     let is_undef = matches!(f.value(agg), Value::Const(Constant::Undef));
                     let field = format!("{}.f{}", n, index);

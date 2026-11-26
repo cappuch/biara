@@ -392,9 +392,7 @@ impl<'a, 'ctx> Lowering<'a, 'ctx> {
             let Some(&callee) = t.functions.get(&dst) else {
                 continue;
             };
-            let bb = self
-                .cx
-                .append_basic_block(self.func, &format!("call_{dst:x}"));
+            let bb = self.fresh(&format!("call_{dst:x}"));
             self.b.position_at_end(bb);
             self.join_dirty();
             let kept = t.abis.map(|abis| match abis.get(&dst) {
@@ -443,9 +441,7 @@ impl<'a, 'ctx> Lowering<'a, 'ctx> {
             let bb = match (t.blocks.get(&dst), t.functions.get(&dst)) {
                 (Some(&bb), _) => bb,
                 (None, Some(&f)) => {
-                    let bb = self
-                        .cx
-                        .append_basic_block(self.func, &format!("tail_{dst:x}_{}", self.pc));
+                    let bb = self.fresh(&format!("tail_{dst:x}"));
                     let here = self.b.get_insert_block().unwrap();
                     self.b.position_at_end(bb);
                     self.sync_out()?;
@@ -790,7 +786,7 @@ impl<'a, 'ctx> Lowering<'a, 'ctx> {
     /// the name must carry the guest pc or two blocks end up called `L0` and
     /// every branch to `%L0` becomes ambiguous.
     fn label(&mut self, id: u64) -> BasicBlock<'ctx> {
-        let pc = self.pc;
+        let pc = self.block.pc;
         let slot = &mut self.labels[id as usize];
         *slot.get_or_insert_with(|| {
             self.cx
@@ -840,7 +836,7 @@ impl<'a, 'ctx> Lowering<'a, 'ctx> {
     /// separates repeated `brcond`s within one translation block.
     fn fresh(&mut self, base: &str) -> BasicBlock<'ctx> {
         self.next_id += 1;
-        let name = format!("{base}_{:x}_{}", self.pc, self.next_id);
+        let name = format!("{base}_{:x}_{}", self.block.pc, self.next_id);
         self.cx.append_basic_block(self.func, &name)
     }
 
