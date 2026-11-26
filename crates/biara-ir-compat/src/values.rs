@@ -977,17 +977,13 @@ impl<'ctx> InstructionValue<'ctx> {
                 self.ctx, owner, target,
             )));
         }
-        let id = self.ctx.with(self.ctx.module_id(), |m| {
-            let candidates: Vec<&biara_ir::Function> = match self.func {
-                Some(i) => m.module.functions.get(i).into_iter().collect(),
-                None => m.module.functions.iter().collect(),
-            };
-            candidates.iter().find_map(|f| {
-                let inst = f.inst(self.id)?;
-                biara_ir::operands(inst).nth(i as usize)
-            })
-        });
-        if let Some(id) = id {
+        // `resolve_inst` already decides which function holds this
+        // instruction, checking the stated owner really lists the id. Searching
+        // `self.func` alone here named a different instruction whenever the
+        // owner was stale, and then handed back that instruction's operands.
+        if let Some(inst) = self.resolve_inst()
+            && let Some(id) = biara_ir::operands(&inst).nth(i as usize)
+        {
             return Some(self.operand(id));
         }
         // A `gep`'s offset is an immediate in the IR; expose it as the second
