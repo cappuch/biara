@@ -127,12 +127,29 @@ impl<'f> EdgeRanges<'f> {
         })
     }
 
+    fn same_masked_value(&self, left: ValueId, right: ValueId) -> bool {
+        let masked = |id| match self.f.inst(id) {
+            Some(Inst::Bin { op: BinOp::And, lhs, rhs, .. }) => self
+                .const_value(*rhs)
+                .map(|mask| (*lhs, mask))
+                .or_else(|| self.const_value(*lhs).map(|mask| (*rhs, mask))),
+            _ => None,
+        };
+        self.f.ty(left) == self.f.ty(right)
+            && masked(left).is_some_and(|term| masked(right) == Some(term))
+    }
+
     pub fn guard_range(&self, value: ValueId, block: BlockId) -> Option<ConstantRange> {
         let mut b = block;
         for _ in 0..16 {
             let p = self.single_pred[b.0 as usize]?;
-            let Some(Terminator::CondBr { cond, yes, no }) = self.f.blocks[p.0 as usize].term.clone() else {
-                return None;
+            let (cond, yes, no) = match self.f.blocks[p.0 as usize].term.as_ref()? {
+                Terminator::CondBr { cond, yes, no } => (*cond, *yes, *no),
+                Terminator::Br(target) if *target == b => {
+                    b = p;
+                    continue;
+                }
+                _ => return None,
             };
             // `b` must be the false arm, so the guard's predicate failed.
             if yes == b || no != b {
@@ -148,7 +165,10 @@ impl<'f> EdgeRanges<'f> {
                 let w = ty.int_bits()?;
                 // The guard compares the value through whatever widening or
                 // truncation the lifter inserted; both preserve it.
-                if *lhs == value || self.same_under_casts(*lhs, value) {
+                if *lhs == value
+                    || self.same_under_casts(*lhs, value)
+                    || self.same_masked_value(*lhs, value)
+                {
                     if let Some(k) = self.const_value(*rhs) {
                         let bound = k & biara_ir::analysis::mask(w);
                         return match pred {

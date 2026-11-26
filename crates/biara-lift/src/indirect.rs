@@ -230,6 +230,10 @@ fn resolve_site(
         }
         k = k.wrapping_add(step) & biara_ir::analysis::mask(range.width);
     }
+    // An oversized alternative did not limit an exhaustive enumeration.
+    if res.complete {
+        res.limited = false;
+    }
     let _ = doms;
     res
 }
