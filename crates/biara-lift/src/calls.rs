@@ -1873,21 +1873,20 @@ impl<'ctx> FunctionFacts<'ctx> {
         // A store earlier in the load's own block dominates it, so it settles
         // the value without consulting predecessors; only a block with no
         // such store needs the path walk, where every path must agree.
-        {
-            let mut cur = at.get_previous_instruction();
-            while let Some(i) = cur {
-                if i.get_opcode() == InstructionOpcode::Store && same(&i) {
-                    return analysis_operand(i, 0);
-                }
-                cur = i.get_previous_instruction();
+        let mut scanned = 0;
+        let mut cur = at.get_previous_instruction();
+        while let Some(i) = cur {
+            if i.get_opcode() == InstructionOpcode::Store && same(&i) {
+                return analysis_operand(i, 0);
             }
+            scanned += 1;
+            cur = i.get_previous_instruction();
         }
         let mut found: Option<BasicValueEnum<'ctx>> = None;
         let mut pending = Vec::new();
         let mut seen = HashSet::new();
         let mut bb = at.get_parent()?;
-        let mut cur = at.get_previous_instruction();
-        let mut budget = MAX_SLOT_WALK;
+        let mut budget = MAX_SLOT_WALK.checked_sub(scanned)?;
         loop {
             let mut hit = None;
             while let Some(i) = cur {
