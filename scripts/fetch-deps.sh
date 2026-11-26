@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Download the pinned QEMU source and unpack the pinned LLVM release into .deps/.
+# Download the pinned QEMU source, and the pinned LLVM release only when the
+# system has no usable LLVM (scripts/llvm.sh finds one first).
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/versions.sh"
 
@@ -17,38 +18,45 @@ mkdir -p "$DEPS/dl"
 
 fetch "$QEMU_URL" "$QEMU_SHA256" "$DEPS/dl/qemu-$QEMU_VERSION.tar.xz"
 
-fetch "$LLVM_URL" "$LLVM_SHA256" "$DEPS/dl/$LLVM_ASSET"
-if [[ ! -x $LLVM_PREFIX/bin/llvm-config ]]; then
-    rm -rf "$LLVM_PREFIX"
-    mkdir -p "$LLVM_PREFIX"
-    # The release archive uses a 1 GiB zstd window.
-    zstd -dc --long=31 "$DEPS/dl/$LLVM_ASSET" \
-        | tar -x -C "$LLVM_PREFIX" --strip-components=1
+# LLVM: use what the host has (scripts/llvm.sh probes Homebrew, /usr/local,
+# /usr/lib/llvm-N and PATH) and only unpack the pinned release when nothing
+# qualifies. A previous download counts as a candidate too, so this is a no-op
+# on the second run.
+if bash "$ROOT/scripts/llvm.sh" >/dev/null 2>&1; then
+    echo "llvm $("$LLVM_PREFIX/bin/llvm-config" --version): $(cat "$LLVM_PREFIX/.source")"
+else
+    fetch "$LLVM_URL" "$LLVM_SHA256" "$DEPS/dl/$LLVM_ASSET"
+    if [[ ! -x $LLVM_RELEASE_PREFIX/bin/llvm-config ]]; then
+        rm -rf "$LLVM_RELEASE_PREFIX"
+        mkdir -p "$LLVM_RELEASE_PREFIX"
+        # The release archive uses a 1 GiB zstd window.
+        zstd -dc --long=31 "$DEPS/dl/$LLVM_ASSET" \
+            | tar -x -C "$LLVM_RELEASE_PREFIX" --strip-components=1
+    fi
+
+    # The macOS release also ships its own libc++ (headers and libraries),
+    # libc++abi and libunwind. Its newer headers call into a libc++ macOS does
+    # not have; without them the release's clang uses the SDK's, like the
+    # system's compiler.
+    if [[ $(uname -s) == Darwin ]]; then
+        rm -rf "$LLVM_RELEASE_PREFIX"/include/c++ "$LLVM_RELEASE_PREFIX"/lib/libc++* \
+            "$LLVM_RELEASE_PREFIX"/lib/libunwind*
+    fi
+    LLVM_SYS_231_PREFIX= bash "$ROOT/scripts/llvm.sh" >/dev/null
+    echo "llvm $("$LLVM_PREFIX/bin/llvm-config" --version): $LLVM_RELEASE_PREFIX"
 fi
 
-# The macOS release also ships its own libc++ (headers and libraries),
-# libc++abi and libunwind. The link searches LLVM's lib/ first (llvm-sys) and
-# would take them; its newer headers call into a libc++ macOS does not have.
-# Without them the pinned clang uses the SDK's, like the system's library.
+# LLVM wants zstd and biara-loader liblzma, which macOS lacks. Offer only
+# Homebrew's static archives (.cargo/config.toml searches here first), so the
+# binaries run without Homebrew. Skip whatever is already provided by the LLVM
+# install or the SDK.
 if [[ $(uname -s) == Darwin ]]; then
-    rm -rf "$LLVM_PREFIX"/include/c++ "$LLVM_PREFIX"/lib/libc++* "$LLVM_PREFIX"/lib/libunwind*
-    # LLVM wants zstd and biara-loader liblzma, which macOS lacks. Offer only
-    # Homebrew's static archives (.cargo/config.toml searches here first), so
-    # the binaries run without Homebrew.
     mkdir -p "$DEPS/macos-static"
-    ln -sf "$(brew --prefix zstd)/lib/libzstd.a" "$(brew --prefix xz)/lib/liblzma.a" \
-        "$DEPS/macos-static/"
+    for lib in zstd xz; do
+        archive=$(brew --prefix "$lib" 2>/dev/null)/lib/lib$( [[ $lib == xz ]] && echo lzma || echo zstd).a
+        [[ -f $archive ]] && ln -sf "$archive" "$DEPS/macos-static/"
+    done
 fi
-
-# llvm-sys runs $LLVM_SYS_231_PREFIX/bin/llvm-config. The release builds
-# report zstd as an absolute path on their build machine; rewrite it to
-# -lzstd.
-mkdir -p "$LLVM_SYS_PREFIX/bin"
-cat > "$LLVM_SYS_PREFIX/bin/llvm-config" <<EOF
-#!/bin/sh
-"$LLVM_PREFIX/bin/llvm-config" "\$@" | sed 's#[^ ]*/libzstd\.a#-lzstd#g'
-EOF
-chmod +x "$LLVM_SYS_PREFIX/bin/llvm-config"
 
 echo "qemu $QEMU_VERSION: $DEPS/dl/qemu-$QEMU_VERSION.tar.xz"
 echo "llvm $("$LLVM_PREFIX/bin/llvm-config" --version): $LLVM_PREFIX"

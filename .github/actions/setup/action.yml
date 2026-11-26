@@ -1,8 +1,9 @@
 name: Toolchain
 description: >
-  Install the system packages, the Rust toolchain and the pinned LLVM, and build (or restore)
-  the libtcg lifters into .deps/out. On Linux, .deps and target live on /mnt: the unpacked LLVM
-  alone is 12 GB. macOS builds no helper bitcode: download it into .deps/out afterwards.
+  Install the system packages and the Rust toolchain, provision LLVM (a system install when the
+  runner has a usable one, else the pinned release), and build (or restore) the libtcg lifters
+  into .deps/out. On Linux, .deps and target live on /mnt: the unpacked LLVM alone is 12 GB.
+  macOS builds no helper bitcode: download it into .deps/out afterwards.
 
 runs:
   using: composite
@@ -21,8 +22,10 @@ runs:
       if: runner.os == 'macOS'
       shell: bash
       run: |
-        brew install --quiet ninja glib pkgconf zstd xz
-        # The pinned clang (QEMU, bindgen, the linker) needs the SDK spelled out.
+        # LLVM comes from Homebrew: its archives are object files the SDK linker
+        # reads, so the workspace needs neither the pinned release nor lld.
+        brew install --quiet llvm ninja glib pkgconf zstd xz
+        # QEMU's build and bindgen find the SDK when it is spelled out.
         echo "SDKROOT=$(xcrun --show-sdk-path)" >> "$GITHUB_ENV"
 
     # LLVM (about 10 GB unpacked) plus a debug build whose every test binary links LLVM
@@ -63,6 +66,10 @@ runs:
         path: .deps/dl
         key: deps-dl-${{ runner.os }}-${{ hashFiles('scripts/versions.sh') }}
 
+    # scripts/llvm.sh links a usable LLVM the runner already has. macOS gets Homebrew's
+    # above, so the multi-GB release download is skipped there; ubuntu-24.04 ships
+    # LLVM 18, so Linux still takes the pinned-release fallback below. A distro with
+    # LLVM 23 dev packages (apt install llvm-23-dev lld) would skip it too.
     - name: Fetch QEMU and LLVM
       shell: bash
       run: scripts/fetch-deps.sh

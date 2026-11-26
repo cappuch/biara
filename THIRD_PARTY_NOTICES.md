@@ -24,8 +24,9 @@ with a binary release.
 
 ## Linked or loaded at run time
 
-- **LLVM 23.1.2** (through `inkwell`, MIT): Apache-2.0 WITH LLVM-exception.
-- **inkwell**: MIT.
+- **LLVM 23.x**: Apache-2.0 WITH LLVM-exception. LLVM is no longer linked into the binaries: the
+  IR, passes and C emitter are in-tree. It is used only at build time, to compile the QEMU TCG
+  lifters (which are LLVM passes) and to cross-compile the test corpora.
 - **GLib** (which the `libtcg-<arch>` lifters link): LGPL-2.1-or-later, with its dependencies
   **PCRE2** (BSD-3-Clause) and GNU **libintl** (LGPL-2.1-or-later). Linux takes them from the
   system. The macOS archives ship Homebrew's unmodified shared libraries next to the lifters;

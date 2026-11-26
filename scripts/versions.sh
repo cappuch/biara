@@ -1,7 +1,7 @@
 # Pinned toolchain versions. Sourced by the other scripts.
-# Bumping a version: update the sha256s, rebase patches/qemu-<ver>/, and
-# update LLVM_SYS_*_PREFIX / the inkwell feature in .cargo/config.toml and
-# Cargo.toml.
+# Bumping a version: update the sha256s and rebase patches/qemu-<ver>/.
+# LLVM is a build-time tool (clang, llvm-link) only; bumping it also means
+# updating the paths .cargo/config.toml names.
 #
 # Hosts: Linux x86-64 and macOS arm64 (the hosts LLVM publishes both
 # releases for).
@@ -38,9 +38,10 @@ sha256_check() {
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEPS="$ROOT/.deps"
+# The pinned release, when it has to be downloaded, unpacks here; LLVM_PREFIX
+# is a prefix scripts/llvm.sh owns (symlinks into whichever install it found).
+LLVM_RELEASE_PREFIX="$DEPS/llvm-release-$LLVM_VERSION"
 LLVM_PREFIX="$DEPS/llvm-$LLVM_VERSION"
-# llvm-config wrapper consumed by llvm-sys (see fetch-deps.sh).
-LLVM_SYS_PREFIX="$DEPS/llvm-sys-$LLVM_VERSION"
 QEMU_SRC="$DEPS/build/qemu-src-$QEMU_VERSION"
 QEMU_BUILD="$DEPS/build/qemu-$QEMU_VERSION"
 OUT="$DEPS/out"

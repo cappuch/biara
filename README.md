@@ -1,7 +1,7 @@
 <h1 align="center">biara</h1>
 
 <p align="center">
-  <b>A binary analyser built on QEMU's lifter and LLVM.</b><br>
+  <b>A binary analyser built on QEMU's lifter.</b><br>
   Machine code in; control flow, calling conventions, types and readable C out.
 </p>
 
@@ -9,8 +9,8 @@
   <img src="docs/images/pseudocode.png" alt="biara-ui showing the decompiled pseudocode of a function with a jump table recovered as a switch" width="860">
 </p>
 
-biara reads an executable, lifts its machine code through **QEMU's TCG frontends** into **LLVM
-IR**, and recovers what a reverse engineer wants from it: functions and basic blocks, jump
+biara reads an executable, lifts its machine code through **QEMU's TCG frontends** into an
+**SSA IR of its own** (`crates/biara-ir`), and recovers what a reverse engineer wants from it: functions and basic blocks, jump
 tables and indirect-call targets, stack frames and calling conventions, struct layouts, and
 decompiled C. You can drive it from the **command line** (JSON for scripts and agents) or from
 a **desktop workbench** in the spirit of IDA, drawn on the GPU.
@@ -107,27 +107,46 @@ Tagged versions are also on the [releases page](https://github.com/freegamerskid
 unpack one and run `biara` or `biara-ui` from it (the lifters sit next to them). On macOS, clear
 the download quarantine first: `xattr -dr com.apple.quarantine biara-*-arm64-macos`.
 
-To build, the toolchain is pinned and fetched for you:
+To build you need Rust (recent stable, edition 2024). LLVM is **not** linked as a library: the IR,
+the optimisation passes and the C emitter are all in this workspace (`crates/biara-ir`,
+`crates/biara-lift`). A clang is still needed for two narrow jobs, and `scripts/llvm.sh` finds one
+you already have, in this order: `$LLVM_SYS_231_PREFIX`, a release `fetch-deps.sh` unpacked,
+`.deps/llvm-local` (an install you placed by hand), Homebrew (`brew install llvm`),
+`/usr/local/opt/llvm*`, `/usr/lib/llvm-23*`, then `llvm-config` on `PATH`. It links what it finds
+into `.deps/llvm-23.1.2` — the paths `.cargo/config.toml` expects. `scripts/fetch-deps.sh`
+downloads the pinned release (several GB) only when nothing qualifies.
+
+The two jobs: it compiles the QEMU TCG lifters from LLVM bitcode (they are LLVM passes), and it
+cross-compiles the test corpora. Prefer a distro package or Homebrew build over a prebuilt LLVM
+tarball, because linking *bitcode* archives needs that LLVM's own clang and lld.
 
 | Piece | Version | Where it comes from |
 | --- | --- | --- |
 | QEMU | 11.1.2 | downloaded by `scripts/fetch-deps.sh`, patched and built as `libtcg-<arch>.so` (`.dylib` on macOS) |
-| LLVM | 23.1.2 | prebuilt release, unpacked into `.deps/` (several GB) |
+| LLVM 23 (clang only) | 23.x | compiles the TCG lifters and the test corpora; `scripts/llvm.sh` discovers an installed one, `scripts/fetch-deps.sh` downloads the pinned 23.1.2 release only as a fallback |
 | Rust | recent stable (edition 2024) | your `rustup` |
 
 You also need what QEMU's build needs: Python 3, `ninja`, glib development headers, plus `curl`
-and `zstd`. On macOS: `brew install ninja glib pkgconf zstd xz`.
+and `zstd`. On macOS: `brew install llvm ninja glib pkgconf zstd xz`.
 
 ```sh
-scripts/fetch-deps.sh                 # download and verify QEMU and LLVM into .deps/
+scripts/fetch-deps.sh                 # QEMU source + LLVM (found, or downloaded as a fallback)
 scripts/build-libtcg.sh               # build the lifters (x86_64 and aarch64; pass names for one)
 cargo build --release                 # target/release/biara and target/release/biara-ui
 ```
 
+`.cargo/config.toml` names `.deps/llvm-23.1.2/bin/clang` as both the workspace linker and
+`BIARA_CLANG`. `scripts/llvm.sh` writes that path as a wrapper because it has two jobs: it links
+host Mach-O binaries with the SDK toolchain (Apple's clang rejects the release's `-fuse-ld=lld`),
+and it cross-compiles the test corpora for Linux and PE, where it translates `-fuse-ld=lld` to
+`--ld-path` and needs an lld. `scripts/llvm.sh` also provisions that lld: from the install when it
+ships one, else from the Rust toolchain's `rust-lld`. Do not point the workspace at another
+linker without that reasoning.
+
 The helper bitcode (`helpers-<arch>.bc`) is built on Linux only: it is compiled for the x86-64
 analysis target, and QEMU's helpers contain host-specific code. On macOS, copy the
-`helpers-*.bc` of a Linux build or a release archive into `.deps/out/`, and point the pinned
-clang at the SDK before building:
+`helpers-*.bc` of a Linux build or a release archive into `.deps/out/`, and point the clang at
+the SDK before building:
 
 ```sh
 export SDKROOT=$(xcrun --show-sdk-path)
@@ -152,7 +171,7 @@ program from the entry point, symbols, exports and unwind tables.
 
 | `--emit` | You get |
 | --- | --- |
-| `llvm` (default) | LLVM IR, textual; `-O1`..`-O3` optimise it, `--link-helpers` inlines QEMU's helpers |
+| `llvm` (default) | The internal IR in LLVM's textual syntax; `-O1`..`-O3` run biara's own passes, `--link-helpers` inlines QEMU's helpers |
 | `tcg` | QEMU's TCG ops per translation block |
 | `c` | Compilable C with recovered calling conventions and stack frames |
 | `decomp` | Readable function bodies, dependencies and the evidence behind them |
@@ -218,7 +237,7 @@ from the layout behind a parameter and types that parameter `struct name *`, and
 signature is what binds the declaration to the code and makes its field names visible.
 Everything is saved in the same notes file the workbench uses, so a human editing in
 `biara-ui` and an agent in `biara mcp` see each other's changes. The protocol stream owns
-fd 1; fd 1 is pointed at stderr at startup so no engine or LLVM output can corrupt it.
+fd 1; fd 1 is pointed at stderr at startup so no engine output can corrupt it.
 
 ## Desktop workbench
 
@@ -252,7 +271,7 @@ flowchart LR
     B[binary] --> L[loader<br>segments, symbols, imports]
     L --> T[libtcg<br>QEMU TCG frontend]
     T --> C[CFG recovery<br>jump tables, indirect calls]
-    C --> I[LLVM IR lowering]
+    C --> I[biara-ir lowering]
     I --> A[ABI, types, audit]
     A --> D[decompiler]
     C -.checkpoints.-> S[(SQLite store)]
@@ -271,7 +290,8 @@ bytes do pass through QEMU's frontends, so treat hostile input accordingly.)
 | `biara-loader` | ELF, PE and Mach-O: segments, symbols, imports, function starts, DWARF |
 | `biara-cfg` | Control-flow recovery over translation blocks |
 | `biara-abi` | Stack frames and calling conventions |
-| `biara-lift` | TCG to LLVM IR lowering, analyses, type inference, C and decompiler output |
+| `biara-ir` | SSA IR, dominators, constant ranges, optimising passes, textual printer |
+| `biara-lift` | TCG to `biara-ir` lowering, analyses, type inference, C and decompiler output |
 | `biara-engine` | Persistent, process-isolated recovery with a memory budget |
 | `biara-diff` | Function matching between two binaries |
 | `biara-proto` | Shared formats: annotations, job bundles, diff results |
@@ -295,7 +315,7 @@ Very large binaries (tens of MB) can take a long time and a lot of memory. `--me
 the analysis and the store lets an interrupted run resume.
 
 Decompiling one function costs about its size: a 69,000-block obfuscated function (35 MB of C)
-takes under a minute, most of it in LLVM's own passes.
+takes under a minute, most of it in the optimisation passes.
 
 ## Limits
 
