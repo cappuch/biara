@@ -124,8 +124,10 @@ fn print_const(c: &Constant) -> String {
 }
 
 fn operand(f: &Function, v: ValueId) -> String {
-    match f.value(v) {
-        Value::Const(c) => print_const(c),
+    // Value ids are per function, so an operand naming another function's
+    // value is simply not a constant here. `name_of` is total.
+    match f.values.get(v.0 as usize) {
+        Some(Value::Const(c)) => print_const(c),
         _ => name_of(f, v),
     }
 }
@@ -210,8 +212,8 @@ fn print_inst(f: &Function, i: &Inst) -> String {
             operand(f, *base)
         ),
         Inst::Call { callee, args, ty } => {
-            let callee = match f.value(*callee) {
-                Value::Const(Constant::Function(n)) => format!("@{n}"),
+            let callee = match f.values.get(callee.0 as usize) {
+                Some(Value::Const(Constant::Function(n))) => format!("@{n}"),
                 _ => operand(f, *callee),
             };
             format!(
