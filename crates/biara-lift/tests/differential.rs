@@ -418,6 +418,7 @@ fn check(name: &str, f: TestFn) {
                 env as u64 + info.env_size as u64,
             ),
         );
+        interp.set_context_info(&info);
         for h in cfg.helpers() {
             interp.bind(h.symbol(), h.addr as u64);
         }

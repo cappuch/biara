@@ -121,6 +121,41 @@ fn x86_flags(dst: u64, src1: u64, src2: u64, op: u32) -> u64 {
 }
 
 impl Interp<'_> {
+    fn x86_divide(&self, name: &str, args: &[u128]) -> Result<u128, Trap> {
+        let [env, divisor] = args else {
+            return Err(Trap::Unsupported("invalid x86 divide arguments"));
+        };
+        let Some((rax, rdx)) = self.x86_divide_registers else {
+            return Err(Trap::UnknownCallee(name.into()));
+        };
+        let register_address = |offset| {
+            u64::try_from(*env)
+                .ok()
+                .and_then(|address| address.checked_add(offset))
+                .map(u128::from)
+                .ok_or(Trap::Unsupported("invalid x86 CPU address"))
+        };
+        let rax = register_address(rax)?;
+        let rdx = register_address(rdx)?;
+        let dividend = self.load(rax, 64)? | (self.load(rdx, 64)? << 64);
+        let divisor = *divisor as u64;
+        let fault = || Trap::Unsupported("x86 divide exception");
+        let (quotient, remainder) = if name == "helper_idivq_EAX" {
+            let (dividend, divisor) = (dividend as i128, i128::from(divisor as i64));
+            let quotient = dividend.checked_div(divisor).ok_or_else(fault)?;
+            let quotient = i64::try_from(quotient).map_err(|_| fault())?;
+            (quotient as u64, (dividend % divisor) as u64)
+        } else {
+            let divisor = u128::from(divisor);
+            let quotient = dividend.checked_div(divisor).ok_or_else(fault)?;
+            let quotient = u64::try_from(quotient).map_err(|_| fault())?;
+            (quotient, (dividend % divisor) as u64)
+        };
+        self.store(rax, u128::from(quotient), 64)?;
+        self.store(rdx, u128::from(remainder), 64)?;
+        Ok(0)
+    }
+
     /// Run a QEMU helper the lifter left as a declaration.
     ///
     /// These are the `helper_*` routines QEMU implements in C; the ones that
@@ -577,6 +612,7 @@ const MAX_DEPTH: usize = 512;
 /// An interpreted unit of lifted code.
 pub struct Interp<'a> {
     module: &'a Module,
+    x86_divide_registers: Option<(u64, u64)>,
     /// Guest-memory bounds; the lifted code addresses host memory directly.
     memory: (u64, u64),
     /// Addresses of globals, by name; shared with each frame so a constant
@@ -621,6 +657,7 @@ impl<'a> Interp<'a> {
     pub fn new(module: &'a Module, memory: (u64, u64)) -> Self {
         Self {
             module,
+            x86_divide_registers: None,
             memory,
             extra: Vec::new(),
             dispatch: std::cell::Cell::new(None),
@@ -638,6 +675,23 @@ impl<'a> Interp<'a> {
             alloca: vec![0; 1 << 20],
             scratch: 0,
         }
+    }
+
+    /// Supply the guest register layout for stateful QEMU helpers.
+    pub fn set_context_info(&mut self, info: &biara_tcg::ContextInfo) {
+        let reg = |name| {
+            let temp = info.globals.iter().find(|temp| {
+                temp.name.as_deref() == Some(name)
+                    && temp.mem_base == Some(info.env_global)
+                    && temp.ty.bits() == 64
+            })?;
+            u64::try_from(temp.mem_offset).ok()
+        };
+        self.x86_divide_registers = if info.arch == "x86_64" {
+            reg("rax").zip(reg("rdx"))
+        } else {
+            None
+        };
     }
 
     /// Bind an external symbol (a QEMU helper) to an address. Calls to it are
@@ -905,6 +959,8 @@ impl<'a> Interp<'a> {
                 };
                 if let Some(v) = intrinsic(&name, &args, f, &ret_ty) {
                     Some(v)
+                } else if matches!(name.as_str(), "helper_divq_EAX" | "helper_idivq_EAX") {
+                    Some(self.x86_divide(&name, &args)?)
                 } else if let Some(r) = self.helper(&name, &args) {
                     Some(r & mask(w))
                 } else {
