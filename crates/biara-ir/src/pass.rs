@@ -394,52 +394,80 @@ pub fn dce(f: &mut Function) {
     // what is unreachable, or a stale cache would delete live blocks.
     recompute_preds(f);
     loop {
-        // Blocks unreachable from the entry (from the dominator's rpo).
-        let reachable: BTreeSet<BlockId> = Dominators::new(f).order().iter().copied().collect();
         let mut dropped = false;
-
-        for i in 0..f.blocks.len() {
-            let b = BlockId(i as u32);
-            if !reachable.contains(&b) && f.blocks[i].preds.is_empty() && Some(b) != f.entry {
-                f.blocks[i].insts.clear();
-                // Deliberately dead, not unbuilt: say so.
-                f.blocks[i].term = Some(Terminator::Unreachable);
+        for (index, block) in f.blocks.iter_mut().enumerate() {
+            // A block with no incoming edge can only be reached as the entry.
+            if block.preds.is_empty() && Some(BlockId(index as u32)) != f.entry {
+                block.insts.clear();
+                block.term = Some(Terminator::Unreachable);
                 dropped = true;
             }
         }
         if dropped {
             recompute_preds(f);
         }
-        let mut removed = false;
-        loop {
-            let mut dead: Vec<ValueId> = Vec::new();
-            for b in &f.blocks {
-                for &i in &b.insts {
-                    let side = matches!(
-                        f.inst(i),
-                        Some(Inst::Store { .. })
-                            | Some(Inst::Call { .. })
-                            | Some(Inst::Marker { .. })
-                            | Some(Inst::Fence)
-                    );
-                    if !side && f.uses(i) == 0 {
-                        dead.push(i);
-                    }
-                }
-            }
-            if dead.is_empty() {
-                break;
-            }
-            for b in &mut f.blocks {
-                b.insts.retain(|i| !dead.contains(i));
-            }
-            removed = true;
-        }
+        let removed = remove_unused_instructions(f);
         if !removed {
             break;
         }
     }
 }
+
+fn remove_unused_instructions(f: &mut Function) -> bool {
+    let mut uses = vec![0usize; f.values.len()];
+    let mut removable = vec![false; f.values.len()];
+    for block in &f.blocks {
+        for inst in block.insts.iter().filter_map(|&id| f.inst(id)) {
+            for operand in crate::operands(inst) {
+                if let Some(count) = uses.get_mut(operand.0 as usize) {
+                    *count += 1;
+                }
+            }
+        }
+        for operand in block.term.iter().flat_map(crate::term_operands) {
+            if let Some(count) = uses.get_mut(operand.0 as usize) {
+                *count += 1;
+            }
+        }
+    }
+
+    let mut pending = Vec::new();
+    for &id in f.blocks.iter().flat_map(|block| &block.insts) {
+        let index = id.0 as usize;
+        removable[index] = !matches!(
+            f.inst(id),
+            Some(Inst::Store { .. } | Inst::Call { .. } | Inst::Marker { .. } | Inst::Fence)
+        );
+        if removable[index] && uses[index] == 0 {
+            pending.push(id);
+        }
+    }
+    if pending.is_empty() {
+        return false;
+    }
+
+    while let Some(id) = pending.pop() {
+        if let Some(inst) = f.inst(id) {
+            for operand in crate::operands(inst) {
+                let index = operand.0 as usize;
+                if let Some(count) = uses.get_mut(index) {
+                    *count -= 1;
+                    if *count == 0 && removable[index] {
+                        pending.push(operand);
+                    }
+                }
+            }
+        }
+    }
+    for block in &mut f.blocks {
+        block.insts.retain(|id| {
+            let index = id.0 as usize;
+            !removable[index] || uses[index] != 0
+        });
+    }
+    true
+}
+
 
 /// Collapse trivial branches, merge a block into its only predecessor, and
 /// drop unreachable blocks.
