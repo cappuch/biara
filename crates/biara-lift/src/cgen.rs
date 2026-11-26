@@ -1095,6 +1095,11 @@ static KNOWN_PROTOS: &[ImportPrototype] = &[
         false,
     ),
     proto("strlen", "uint64_t", &["const char *"], false, false),
+    proto("atoi", "int32_t", &["const char *"], false, false),
+    proto("getenv", "char *", &["const char *"], false, false),
+    proto("strchr", "char *", &["const char *", "int32_t"], false, false),
+    proto("strstr", "char *", &["const char *", "const char *"], false, false),
+    proto("memcmp", "int32_t", &["const void *", "const void *", "uint64_t"], false, false),
     proto(
         "strcmp",
         "int32_t",
