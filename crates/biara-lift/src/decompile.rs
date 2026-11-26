@@ -1573,6 +1573,22 @@ impl<'ctx> PreparedC<'ctx> {
             )?;
         }
         module.update(|m| {
+            // QEMU value-only condition-code helpers do not access the
+            // environment or trap. Require the ABI former's purity evidence
+            // as well as the known helper name.
+            let discardable: BTreeSet<String> = m
+                .module
+                .decls
+                .iter()
+                .map(|d| (&d.name, &d.attrs))
+                .chain(m.module.functions.iter().map(|f| (&f.name, &f.attrs)))
+                .filter(|(name, attrs)| {
+                    matches!(name.as_str(), "helper_cc_compute_c" | "helper_cc_compute_all" | "helper_cc_compute_nz")
+                        && attrs.entry_addr.is_none()
+                        && attrs.memory.is_some_and(|effect| !effect.argmem_write && !effect.inaccessible_write)
+                })
+                .map(|(name, _)| name.clone())
+                .collect();
             for f in &mut m.module.functions {
                 if f.blocks.is_empty() {
                     continue;
@@ -1580,7 +1596,7 @@ impl<'ctx> PreparedC<'ctx> {
                 biara_ir::pass::promote_loop_slots(f);
                 biara_ir::pass::fold(f);
                 biara_ir::pass::prune_constant_edges(f);
-                biara_ir::pass::dce(f);
+                biara_ir::pass::dce_with_unused_calls(f, |name| discardable.contains(name));
             }
         });
         module.verify().map_err(|e| Error::Llvm(e.to_string()))?;

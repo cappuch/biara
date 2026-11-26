@@ -615,6 +615,12 @@ fn remove_inst(f: &mut Function, block: BlockId, id: ValueId) {
 /// Remove instructions with no uses that have no side effects, and blocks
 /// that are unreachable from the entry.
 pub fn dce(f: &mut Function) {
+    dce_with_unused_calls(f, |_| false);
+}
+
+/// Also remove unused calls to direct callees the caller proves have no
+/// observable effects, including exceptions or nontermination.
+pub fn dce_with_unused_calls(f: &mut Function, discardable: impl Fn(&str) -> bool) {
     // `preds` is a cache: derive it from the terminators before deciding
     // what is unreachable, or a stale cache would delete live blocks.
     recompute_preds(f);
@@ -631,7 +637,7 @@ pub fn dce(f: &mut Function) {
         if dropped {
             recompute_preds(f);
         }
-        let removed = remove_unused_instructions(f);
+        let removed = remove_unused_instructions(f, &discardable);
         if !removed {
             break;
         }
@@ -676,7 +682,7 @@ pub fn prune_constant_edges(f: &mut Function) {
     }
 }
 
-fn remove_unused_instructions(f: &mut Function) -> bool {
+fn remove_unused_instructions(f: &mut Function, discardable: &impl Fn(&str) -> bool) -> bool {
     let mut uses = vec![0usize; f.values.len()];
     let mut removable = vec![false; f.values.len()];
     for block in &f.blocks {
@@ -697,10 +703,14 @@ fn remove_unused_instructions(f: &mut Function) -> bool {
     let mut pending = Vec::new();
     for &id in f.blocks.iter().flat_map(|block| &block.insts) {
         let index = id.0 as usize;
-        removable[index] = !matches!(
-            f.inst(id),
-            Some(Inst::Store { .. } | Inst::Call { .. } | Inst::Marker { .. } | Inst::Fence)
-        );
+        removable[index] = match f.inst(id) {
+            Some(Inst::Store { .. } | Inst::Marker { .. } | Inst::Fence) => false,
+            Some(Inst::Call { callee, .. }) => matches!(
+                f.constant(*callee),
+                Some(Constant::Function(name)) if discardable(name)
+            ),
+            _ => true,
+        };
         if removable[index] && uses[index] == 0 {
             pending.push(id);
         }
