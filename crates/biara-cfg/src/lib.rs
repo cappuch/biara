@@ -846,6 +846,23 @@ impl<'c, F: Fn(u64) -> Option<(&'c [u8], u64)>> Recovery<'_, 'c, F> {
         if i > 0 && self.extents_end[i - 1] > c {
             return false;
         }
+        // Inside a recovered function's span: a label, never an entry.
+        //
+        // A candidate can equal the end of a recovered block and still lie
+        // strictly inside the function that block belongs to — `dispatch`'s
+        // `one`/`two` labels are the ends of blocks that were cut apart, so
+        // testing the nearest block alone accepts them. The span is the
+        // furthest end among the function's blocks.
+        if self.cfg.functions.values().any(|f| {
+            c != f.entry
+                && f.blocks.iter().any(|b| *b < c)
+                && f.blocks
+                    .iter()
+                    .filter_map(|b| self.cfg.blocks.get(b))
+                    .any(|b| c < b.end())
+        }) {
+            return false;
+        }
         // Part of a recovered block, or a block of some function: code that
         // is reached without being a function entry.
         match self.cfg.blocks.range(..=c).next_back() {
