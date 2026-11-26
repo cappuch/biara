@@ -921,15 +921,30 @@ impl<'ctx> InstructionValue<'ctx> {
                 // Value ids repeat across functions, so the id alone does not
                 // say which function owns this instruction. The one whose
                 // block actually lists it does.
-                let owner = |m: &crate::ModuleData| -> Option<usize> {
-                    match self.func {
-                        Some(i) => Some(i),
-                        None => m.module.functions.iter().position(|f| {
+                // The stated owner answers only when its blocks really list
+                // the id; otherwise the function that lists it does. Taking
+                // `self.func` on trust reports another function's opcode,
+                // because ids repeat across functions.
+                let listed = |f: &biara_ir::Function| {
+                    f.defined_in
+                        .get(self.id.0 as usize)
+                        .copied()
+                        .flatten()
+                        .is_some_and(|b| {
                             f.blocks
-                                .iter()
-                                .any(|b| b.insts.contains(&self.id))
-                        }),
-                    }
+                                .get(b.0 as usize)
+                                .is_some_and(|x| x.insts.contains(&self.id))
+                        })
+                };
+                let owner = |m: &crate::ModuleData| -> Option<usize> {
+                    let by_owner = self
+                        .func
+                        .and_then(|i| m.module.functions.get(i))
+                        .filter(|f| listed(f))
+                        .map(|_| self.func.unwrap_or(0));
+                    by_owner.or_else(|| {
+                        m.module.functions.iter().position(|f| listed(f))
+                    })
                 };
                 let f = owner(m).and_then(|i| m.module.functions.get(i))?;
                 f.inst(self.id)
