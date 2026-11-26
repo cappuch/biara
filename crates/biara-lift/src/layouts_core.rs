@@ -1483,6 +1483,21 @@ impl Analysis {
         // The source version each (target, pointee) field flow last carried.
         let mut flowed: BTreeMap<(usize, usize), u64> = BTreeMap::new();
 
+        // Classes are stable throughout propagation. Index each caller-side
+        // pointer store once, in the original order for each slot.
+        let mut stored_owners: BTreeMap<(usize, i64), Vec<usize>> = BTreeMap::new();
+        for (slot, value) in stored {
+            let Some(container) = slot.root.and_then(|root| self.class_of(root)) else {
+                continue;
+            };
+            let value_base = base(f_of(module, *value), value.func, value.value, 0);
+            if value_base.off == 0
+                && let Some(owner) = value_base.root.and_then(|root| self.class_of(root))
+            {
+                stored_owners.entry((container, slot.off)).or_default().push(owner);
+            }
+        }
+
         for round in 0..PROPAGATE_ROUNDS {
             self.dropped.iterations = round;
             let mut widths_changed = false;
@@ -1788,29 +1803,9 @@ impl Analysis {
                         };
                         // Caller-side children stored at this slot: their
                         // classes alias the callee child at this site.
-                        let mut slot_owners: Vec<usize> = Vec::new();
-                        for (sb, sv) in stored {
-                            let Some(sroot) = sb.root else { continue };
-                            if sb.off != slot {
-                                continue;
-                            }
-                            let (Some(sc), Some(ac_rep)) =
-                                (self.class_of(sroot), Some(self.uf.rep(ac)))
-                            else {
-                                continue;
-                            };
-                            if sc != ac_rep {
-                                continue;
-                            }
-                            let svb = base(f_of(module, *sv), sv.func, sv.value, 0);
-                            if let Some(svroot) = svb.root {
-                                if svb.off == 0 && self.var_of.contains_key(&svroot) {
-                                    if let Some(c) = self.class_of(svroot) {
-                                        slot_owners.push(c);
-                                    }
-                                }
-                            }
-                        }
+                        let slot_owners = stored_owners
+                            .get(&(self.uf.rep(ac), slot))
+                            .map_or(&[][..], Vec::as_slice);
                         if callee_side {
                             let Some(vroot) = vbraw.root else { continue };
                             if !self.var_of.contains_key(&vroot) || slot_owners.is_empty() {
@@ -1820,7 +1815,7 @@ impl Analysis {
                             let mut flow: Vec<(usize, i64, u32)> = Vec::new();
                             if let Some(offs) = self.acc.get(&cc) {
                                 for (off, bytes) in offs {
-                                    for o in &slot_owners {
+                                    for o in slot_owners {
                                         if *o != cc {
                                             flow.push((*o, *off, *bytes));
                                         }
@@ -1829,7 +1824,7 @@ impl Analysis {
                             }
                             if let Some(offs) = xacc.get(&cc) {
                                 for (off, bytes) in offs {
-                                    for o in &slot_owners {
+                                    for o in slot_owners {
                                         if *o != cc {
                                             flow.push((*o, *off, *bytes));
                                         }
