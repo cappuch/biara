@@ -1640,7 +1640,7 @@ impl<'ctx> FunctionFacts<'ctx> {
                         // alloca it was spilled to (`store (load slot), home`).
                         // The alloca holds the live value, so the store that
                         // filled it answers for the argument.
-                        found = Some(match i.get_operand(0).and_then(|o| o.value()) {
+                        found = Some(match analysis_operand(i, 0) {
                             Some(BasicValueEnum::IntValue(v))
                                 if let Some(load) = v.as_instruction_value()
                                     && load.get_opcode() == InstructionOpcode::Load =>
@@ -1845,7 +1845,7 @@ impl<'ctx> FunctionFacts<'ctx> {
             let mut cur = at.get_previous_instruction();
             while let Some(i) = cur {
                 if i.get_opcode() == InstructionOpcode::Store && same(&i) {
-                    return i.get_operand(0).and_then(|o| o.value());
+                    return analysis_operand(i, 0);
                 }
                 cur = i.get_previous_instruction();
             }
@@ -1861,7 +1861,7 @@ impl<'ctx> FunctionFacts<'ctx> {
             while let Some(i) = cur {
                 budget = budget.checked_sub(1)?;
                 if i.get_opcode() == InstructionOpcode::Store && same(&i) {
-                    hit = Some(i.get_operand(0).and_then(|o| o.value())?);
+                    hit = Some(analysis_operand(i, 0)?);
                     break;
                 }
                 cur = i.get_previous_instruction();
@@ -1913,7 +1913,7 @@ impl<'ctx> FunctionFacts<'ctx> {
             return None;
         }
         let operand = |k: u32| -> Option<u64> {
-            match inst.get_operand(k).and_then(|o| o.value())? {
+            match analysis_operand(inst, k)? {
                 BasicValueEnum::IntValue(v) => match v.as_instruction_value() {
                     Some(i) => self.fold_constant(i, v.get_type().get_bit_width(), depth + 1),
                     None => v.get_zero_extended_constant(),
@@ -2124,7 +2124,7 @@ impl<'ctx> FunctionFacts<'ctx> {
         let Some(inst) = value.as_instruction_value() else {
             return Arg::Unknown;
         };
-        let operand = |k| inst.get_operand(k).and_then(|o| o.value());
+        let operand = |k| analysis_operand(inst, k);
         if inst.get_opcode() == InstructionOpcode::Load {
             if inst.get_volatile().unwrap_or(true)
                 || inst.get_atomic_ordering().ok() != Some(biara_ir_compat::AtomicOrdering::NotAtomic)
@@ -2365,7 +2365,7 @@ impl<'ctx> FunctionFacts<'ctx> {
                 .map(|c| Sym::OneOf(vec![Leaf::Const(c)]));
         }
         let inst = v.as_instruction_value()?;
-        let operand = |k: u32| inst.get_operand(k).and_then(|o| o.value());
+        let operand = |k: u32| analysis_operand(inst, k);
         let constant = |k: u32| {
             operand(k).and_then(|o| match o {
                 BasicValueEnum::IntValue(c) if c.is_const() => c.get_sign_extended_constant(),
@@ -2461,6 +2461,14 @@ impl<'ctx> FunctionFacts<'ctx> {
             _ => None,
         }
     }
+}
+
+// Resolve integer literals against the instruction's own function before
+// following legacy value handles, whose numeric IDs can repeat across arenas.
+fn analysis_operand<'ctx>(inst: InstructionValue<'ctx>, index: u32) -> Option<BasicValueEnum<'ctx>> {
+    inst.get_constant_int_operand(index as usize)
+        .map(BasicValueEnum::IntValue)
+        .or_else(|| inst.get_operand(index)?.value())
 }
 
 fn is_i8(t: BasicTypeEnum) -> bool {
