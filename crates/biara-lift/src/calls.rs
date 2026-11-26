@@ -1459,6 +1459,8 @@ struct FunctionFacts<'ctx> {
     arg_homes: Vec<i64>,
     /// `reaching_slot` answers by load.
     slots: RefCell<HashMap<InstructionValue<'ctx>, Option<BasicValueEnum<'ctx>>>>,
+    /// The reaching store for loads from local allocas. The load fixes the slot.
+    alloca_stores: RefCell<HashMap<InstructionValue<'ctx>, Option<BasicValueEnum<'ctx>>>>,
     /// Nested `reaching_slot` depth through `slot_safe_across`/`symbolic`
     /// (which re-enter `search_slot`): bailed out past the limit below, so
     /// huge functions cannot grow the call stack without bound.
@@ -1499,6 +1501,7 @@ impl<'ctx> FunctionFacts<'ctx> {
             escape_global: true,
             arg_homes: arg_homes.to_vec(),
             slots: RefCell::default(),
+            alloca_stores: RefCell::default(),
             nesting: std::cell::Cell::new(0),
             sp_home,
             home,
@@ -1859,6 +1862,19 @@ impl<'ctx> FunctionFacts<'ctx> {
     /// stack-slot search cannot see it; matching the pointer operand is the
     /// exact test.
     fn reaching_alloca(
+        &self,
+        at: InstructionValue<'ctx>,
+        slot: BasicValueEnum<'ctx>,
+    ) -> Option<BasicValueEnum<'ctx>> {
+        if let Some(&stored) = self.alloca_stores.borrow().get(&at) {
+            return stored;
+        }
+        let stored = self.search_alloca(at, slot);
+        self.alloca_stores.borrow_mut().insert(at, stored);
+        stored
+    }
+
+    fn search_alloca(
         &self,
         at: InstructionValue<'ctx>,
         slot: BasicValueEnum<'ctx>,
