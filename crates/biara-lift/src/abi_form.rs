@@ -1616,10 +1616,16 @@ impl<'a> Former<'a> {
             Some(CallKind::Import | CallKind::Indirect) => {
                 // Native direct calls already use the callee signature.
                 // Infer register arguments only for the raw-register ABI.
-                let arity = record
+                let observed_arity = record
                     .as_ref()
                     .and_then(|c| c.arity)
-                    .filter(|&arity| arity != u32::MAX)
+                    .filter(|&arity| arity != u32::MAX);
+                let import_arity = record
+                    .as_ref()
+                    .and_then(|c| c.import.as_deref())
+                    .and_then(crate::cgen::known_proto_arity);
+                let arity = import_arity
+                    .or(observed_arity)
                     .or_else(|| callee_name.as_deref().and_then(crate::cgen::known_proto_arity))
                     .unwrap_or_else(|| self.infer_arity(f, s, slots, promote, block, idx));
                 // Known guest targets are called through their exact native
