@@ -1597,17 +1597,6 @@ impl<'a> Former<'a> {
         else {
             return Ok(());
         };
-        // A call whose arity was never recorded still has arguments in its
-        // argument registers; reading zero of them would emit a call that
-        // takes none. A known library signature settles it exactly.
-        // A call whose arity was never recorded still has arguments in its
-        // argument registers; reading zero of them would emit a call that
-        // takes none. A known library signature settles it exactly.
-        let known = callee_name.as_deref().and_then(crate::cgen::known_proto_arity);
-        let arity = match (kind, record.as_ref().and_then(|c| c.arity)) {
-            (_, Some(a)) if a != u32::MAX => a,
-            _ => known.unwrap_or_else(|| self.infer_arity(f, s, slots, promote, block, idx)),
-        };
         let regs = self.regs;
         let sp_reg = self.conv.sp;
         let mut at = At { block, pos: idx };
@@ -1624,6 +1613,14 @@ impl<'a> Former<'a> {
         }
         match kind {
             Some(CallKind::Import | CallKind::Indirect) => {
+                // Native direct calls already use the callee signature.
+                // Infer register arguments only for the raw-register ABI.
+                let arity = record
+                    .as_ref()
+                    .and_then(|c| c.arity)
+                    .filter(|&arity| arity != u32::MAX)
+                    .or_else(|| callee_name.as_deref().and_then(crate::cgen::known_proto_arity))
+                    .unwrap_or_else(|| self.infer_arity(f, s, slots, promote, block, idx));
                 // Known guest targets are called through their exact native
                 // types; only external addresses use the unresolved
                 // raw-register ABI.
@@ -1674,7 +1671,7 @@ impl<'a> Former<'a> {
                         .insts
                         .split_off(call_index + 1);
                     f.blocks[block.0 as usize].insts.pop();
-                    let cont = push_block(f, "indirect.resume");
+                    let cont = push_block(f, &format!("indirect.resume.{}", v.0));
                     f.blocks[cont.0 as usize].insts = tail.clone();
                     for x in tail {
                         f.defined_in[x.0 as usize] = Some(cont);
@@ -1684,8 +1681,8 @@ impl<'a> Former<'a> {
                         .take()
                         .unwrap_or(Terminator::Unreachable);
                     f.blocks[cont.0 as usize].term = Some(old_term);
-                    let lifted = push_block(f, "indirect.lifted");
-                    let external = push_block(f, "indirect.external");
+                    let lifted = push_block(f, &format!("indirect.lifted.{}", v.0));
+                    let external = push_block(f, &format!("indirect.external.{}", v.0));
                     f.blocks[block.0 as usize].term = Some(Terminator::CondBr {
                         cond: known,
                         yes: lifted,

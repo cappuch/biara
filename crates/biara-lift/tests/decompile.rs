@@ -198,16 +198,16 @@ fn run(b: &Built, label: &str) {
         let f = unsafe { libc::dlsym(b.handle, n.as_ptr()) };
         assert!(!f.is_null(), "{label}: no {name}");
         for (a, x) in inputs() {
-            // Arguments by convention position; at most six registers.
-            let mut v = [0u64; 6];
+            // AArch64 has up to eight integer argument registers.
+            let mut v = [0u64; 8];
+            assert!(params.len() <= v.len(), "{label}: {name} takes {params:?}");
             for (k, &p) in params.iter().enumerate() {
                 v[k] = [a, x].get(p).copied().unwrap_or(0);
             }
-            type F = extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64;
-            assert!(params.len() <= 6, "{label}: {name} takes {params:?}");
+            type F = extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> u64;
             // Extra arguments are harmless in the host's C convention.
             let f: F = unsafe { std::mem::transmute::<*mut c_void, F>(f) };
-            let got = f(v[0], v[1], v[2], v[3], v[4], v[5]);
+            let got = f(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
             let expected = match b.native.iter().find(|(n, _)| *n == name) {
                 Some(&(_, addr)) => {
                     let f: extern "C" fn(u64, u64) -> u64 = unsafe { std::mem::transmute(addr) };

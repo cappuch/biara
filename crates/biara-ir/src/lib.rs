@@ -354,7 +354,7 @@ pub struct BlockId(pub u32);
 pub struct FuncId(pub u32);
 
 /// One instruction. The result type is implied by the operator.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Inst {
     Bin { op: BinOp, ty: Type, lhs: ValueId, rhs: ValueId },
     Un { op: UnOp, ty: Type, value: ValueId },

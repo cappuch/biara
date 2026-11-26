@@ -241,7 +241,7 @@ impl<'a, 'ctx> Lowering<'a, 'ctx> {
         // blocks (or the function's entry): closing them here would terminate
         // bodies that have not been emitted yet, so only blocks created while
         // emitting `block` are the epilogue's business.
-        let preexisting: Vec<_> = func.get_basic_blocks();
+        let first_new_block = func.count_basic_blocks();
         let mut l = Lowering {
             cx,
             module,
@@ -290,13 +290,8 @@ impl<'a, 'ctx> Lowering<'a, 'ctx> {
         // no ending of its own; send it through the epilogue so it records
         // the next pc like every other path out.
         if let Some(exit) = exit {
-            for bb in l.func.get_basic_blocks() {
-                // The block this emit started in is this emit's to close even
-                // though it existed already; blocks of other translation
-                // blocks are not.
-                if (bb == start || !preexisting.contains(&bb))
-                    && bb.get_terminator().is_none()
-                {
+            for bb in std::iter::once(start).chain(l.func.basic_blocks_from(first_new_block)) {
+                if bb.get_terminator().is_none() {
                     l.b.position_at_end(bb);
                     l.b.build_unconditional_branch(exit)?;
                 }

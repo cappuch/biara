@@ -2135,6 +2135,11 @@ impl<'m, 'a, 'b> Emitter<'m, 'a, 'b> {
             return suffixed(*bits, *width);
         }
         if self.inline.contains(&a) {
+            // An inline expression can have a narrower C type than its IR
+            // type, for example a sign extension written as an int32_t cast.
+            if f.ty(a).int_bits().is_some_and(|bits| bits >= 64) {
+                return format!("({})({})", self.cty(&f.ty(a)), x);
+            }
             if let Some(Inst::Select { yes, no, .. }) = f.inst(a) {
                 let consts = matches!(f.value(*yes), Value::Const(_))
                     && matches!(f.value(*no), Value::Const(_));
@@ -3504,6 +3509,7 @@ impl<'m, 'a, 'b> Emitter<'m, 'a, 'b> {
                         || !self.names.contains_key(&x)
                         || self.inline.contains(&x)
                         || self.is_alloca(f, x)
+                        || matches!(f.value(x), Value::Param { .. })
                         || self.cty_name_of(f, x) != self.cty_name_of(f, p)
                         || self.canon(x) == self.canon(p)
                     {
@@ -4623,6 +4629,7 @@ impl<'m, 'a, 'b> Emitter<'m, 'a, 'b> {
 /// QEMU's carry-flag helper, which the lifter calls as an opaque function:
 /// the emitted C must define it, or the program cannot link.
 const CC_COMPUTE_C: &str = "\
+#ifndef helper_cc_compute_c
 uint64_t helper_cc_compute_c(uint64_t a, uint64_t b, uint64_t dst, uint32_t op) {
     /* CC_OP_EFLAGS reads the stored flags; add/sub/logic derive carry from
      * operands, matching QEMU's helper_cc_compute_c. */
@@ -4634,6 +4641,7 @@ uint64_t helper_cc_compute_c(uint64_t a, uint64_t b, uint64_t dst, uint32_t op) 
     default: return 0;
     }
 }
+#endif
 ";
 
 fn helper_defs(helpers: &mut BTreeMap<String, bool>, support: &mut BTreeMap<String, String>) -> String {
@@ -5262,12 +5270,23 @@ impl<'m, 'a, 'b> Emitter<'m, 'a, 'b> {
             .map(|c| (c.off + self.opts.margin as i64, c.bytes, ident(&c.name)))
             .collect();
         fields.sort_by_key(|f| f.0);
+        let storage = self.module.globals.iter().find_map(|global| {
+            if global.name == crate::abi_form::CPU_GLOBAL
+                && let Type::Array(element, bytes) = &global.ty
+                && **element == Type::i8()
+            {
+                i64::try_from(*bytes).ok()
+            } else {
+                None
+            }
+        });
         let size = fields
             .iter()
             .map(|f| f.0 + f.1 as i64)
             .max()
             .unwrap_or(0)
-            .max(self.opts.margin as i64 + 8);
+            .max(self.opts.margin as i64 + 8)
+            .max(storage.unwrap_or(0));
         let mut s = String::from("struct cpu_state {\n");
         let mut at: i64 = 0;
         let mut used: BTreeSet<String> = BTreeSet::new();
@@ -5406,6 +5425,16 @@ impl<'m, 'a, 'b> Emitter<'m, 'a, 'b> {
         // declaration counts and a repeat would conflict.
         for d in self.module.decls.clone() {
             if !declared.insert(fn_name(&d.name, true).to_owned()) {
+                continue;
+            }
+            if (d.name.starts_with("biara_div") || d.name.starts_with("biara_sdiv"))
+                && let Type::Struct(fields) = &d.ty.ret
+            {
+                let aggregate = self.aggregate(fields);
+                self.helpers
+                    .entry(format!("{}|{}", d.name, aggregate))
+                    .or_insert(false);
+                self.emit_pending(&mut out)?;
                 continue;
             }
             let sig = if let Some(p) = KNOWN_PROTOS

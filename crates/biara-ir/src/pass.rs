@@ -232,6 +232,190 @@ pub fn promote_allocas(f: &mut Function) {
     dce(f);
 }
 
+/// Promote private integer slots through joins and loop back edges.
+/// Slots with a potentially uninitialised read retain their memory form.
+pub fn promote_loop_slots(f: &mut Function) {
+    let Some(entry) = f.entry else { return };
+    recompute_preds(f);
+    let doms = Dominators::new(f);
+    let mut reachable = vec![false; f.blocks.len()];
+    for &block in doms.order() {
+        reachable[block.0 as usize] = true;
+    }
+    let mut slots = BTreeMap::new();
+    for &id in &f.block(entry).insts {
+        if let Some(Inst::Alloca { ty: Type::Int(width) }) = f.inst(id) {
+            slots.insert(id, (*width, false, BTreeMap::<BlockId, Vec<_>>::new()));
+        }
+    }
+    if slots.is_empty() {
+        return;
+    }
+    for (index, block) in f.blocks.iter().enumerate() {
+        let block_id = BlockId(index as u32);
+        for &id in &block.insts {
+            let Some(inst) = f.inst(id) else { continue };
+            for operand in crate::operands(inst) {
+                let Some((width, escaped, accesses)) = slots.get_mut(&operand) else {
+                    continue;
+                };
+                match inst {
+                    Inst::Load { ptr, ty: Type::Int(bits), .. }
+                        if *ptr == operand && *bits == *width && reachable[index] =>
+                    {
+                        accesses.entry(block_id).or_default().push((id, None));
+                    }
+                    Inst::Store { ptr, value, ty: Type::Int(bits), .. }
+                        if *ptr == operand && *value != operand
+                            && *bits == *width && reachable[index] =>
+                    {
+                        accesses.entry(block_id).or_default().push((id, Some(*value)));
+                    }
+                    _ => *escaped = true,
+                }
+            }
+        }
+        for operand in block.term.iter().flat_map(crate::term_operands) {
+            if let Some((_, escaped, _)) = slots.get_mut(&operand) {
+                *escaped = true;
+            }
+        }
+    }
+
+    let mut replacements = vec![None; f.values.len()];
+    let mut removed = vec![false; f.values.len()];
+    let mut new_phis = Vec::new();
+    for (slot, (width, escaped, accesses)) in slots {
+        if escaped || accesses.is_empty() {
+            continue;
+        }
+        let mut stores = vec![false; f.blocks.len()];
+        let mut live_in = vec![false; f.blocks.len()];
+        let mut pending = Vec::new();
+        for (&block, accesses) in &accesses {
+            let index = block.0 as usize;
+            stores[index] = accesses.iter().any(|(_, value)| value.is_some());
+            if accesses[0].1.is_none() {
+                live_in[index] = true;
+                pending.push(block);
+            }
+        }
+        let mut valid = true;
+        while let Some(block) = pending.pop() {
+            let preds = &f.block(block).preds;
+            if block == entry || preds.is_empty() {
+                valid = false;
+                continue;
+            }
+            for &pred in preds {
+                let index = pred.0 as usize;
+                if !reachable[index] {
+                    valid = false;
+                    continue;
+                }
+                if !stores[index] && !live_in[index] {
+                    live_in[index] = true;
+                    pending.push(pred);
+                }
+            }
+        }
+        if !valid {
+            // Even when an uninitialised path prevents promotion, stores
+            // whose values no later load can observe are dead.
+            for (&block, accesses) in &accesses {
+                let mut needed = f.successors(block).iter().any(|b| live_in[b.0 as usize]);
+                for &(id, stored) in accesses.iter().rev() {
+                    if stored.is_some() {
+                        removed[id.0 as usize] = !needed;
+                        needed = false;
+                    } else {
+                        needed = true;
+                    }
+                }
+            }
+            continue;
+        }
+
+        let mut phis = Vec::new();
+        let mut exit_values = vec![None; f.blocks.len()];
+        for &block in doms.order() {
+            let index = block.0 as usize;
+            let mut value = None;
+            if live_in[index] {
+                let preds = &f.block(block).preds;
+                if preds.len() == 1 {
+                    let pred = *preds.iter().next().unwrap();
+                    value = exit_values[pred.0 as usize];
+                } else {
+                    let phi = ValueId(f.values.len() as u32);
+                    f.values.push(Value::Inst(Inst::Phi {
+                        ty: Type::Int(width),
+                        incoming: Vec::new(),
+                    }));
+                    f.defined_in.push(Some(block));
+                    f.pc.push(None);
+                    f.block_mut(block).insts.insert(0, phi);
+                    phis.push((block, phi));
+                    new_phis.push(phi);
+                    value = Some(phi);
+                }
+            }
+            for &(id, stored) in accesses.get(&block).into_iter().flatten() {
+                if let Some(stored) = stored {
+                    value = Some(resolve_replacement(&replacements, stored));
+                } else {
+                    replacements[id.0 as usize] = value;
+                }
+                removed[id.0 as usize] = true;
+            }
+            exit_values[index] = value;
+        }
+        for (block, phi) in phis {
+            let incoming = f
+                .block(block)
+                .preds
+                .iter()
+                .map(|&pred| (exit_values[pred.0 as usize].expect("live predecessor"), pred))
+                .collect();
+            *f.value_mut(phi) = Value::Inst(Inst::Phi { ty: Type::Int(width), incoming });
+        }
+        removed[slot.0 as usize] = true;
+    }
+    if !removed.iter().any(|&dead| dead) {
+        return;
+    }
+    // A back edge can carry the phi itself when the value is loop invariant.
+    // Ignore these self edges when looking for one unique incoming value.
+    replacements.resize(f.values.len(), None);
+    removed.resize(f.values.len(), false);
+    loop {
+        let before = new_phis.len();
+        new_phis.retain(|&phi| {
+            let Some(Inst::Phi { incoming, .. }) = f.inst(phi) else {
+                return false;
+            };
+            let mut values = incoming
+                .iter()
+                .map(|&(value, _)| resolve_replacement(&replacements, value))
+                .filter(|&value| value != phi);
+            let Some(first) = values.next() else { return true };
+            if values.any(|value| value != first) {
+                return true;
+            }
+            replacements[phi.0 as usize] = Some(first);
+            removed[phi.0 as usize] = true;
+            false
+        });
+        if new_phis.len() == before {
+            break;
+        }
+    }
+    rewrite_uses(f, |id| resolve_replacement(&replacements, id));
+    for block in &mut f.blocks {
+        block.insts.retain(|id| !removed.get(id.0 as usize).copied().unwrap_or(false));
+    }
+}
+
 fn resolve_replacement(replacements: &[Option<ValueId>], mut value: ValueId) -> ValueId {
     while let Some(Some(next)) = replacements.get(value.0 as usize).copied() {
         value = next;
@@ -273,24 +457,35 @@ pub fn fold(f: &mut Function) -> bool {
             consts.insert(ValueId(i as u32), c.clone());
         }
     }
-    let mut work: Vec<(BlockId, ValueId)> = Vec::new();
-    for (bi, b) in f.blocks.iter().enumerate() {
-        for &i in &b.insts {
-            work.push((BlockId(bi as u32), i));
-        }
-    }
-    for (block, id) in work {
-        let Some(inst) = f.inst(id).cloned() else {
+    let work: Vec<_> = f.blocks.iter().flat_map(|block| block.insts.iter().copied()).collect();
+    let mut replacements = vec![None; f.values.len()];
+    for id in work {
+        let Some(inst) = f.inst(id) else { continue };
+        if !matches!(
+            inst,
+            Inst::Bin { .. } | Inst::Icmp { .. } | Inst::Select { .. }
+                | Inst::Trunc { .. } | Inst::Zext { .. } | Inst::Sext { .. }
+        ) {
             continue;
-        };
-        if let Some(folded) = fold_inst(f, &consts, &inst) {
-            // Point uses at the folded value and drop the instruction.
-            replace_all_uses(f, id, folded);
-            remove_inst(f, block, id);
+        }
+        let mut inst = inst.clone();
+        if changed {
+            for operand in crate::operands_mut(&mut inst) {
+                *operand = resolve_replacement(&replacements, *operand);
+            }
+        }
+        if let Some(folded) = fold_inst(f, &consts, &inst).filter(|&folded| folded != id) {
+            replacements[id.0 as usize] = Some(folded);
             if let Some(c) = f.constant(folded) {
                 consts.insert(folded, c.clone());
             }
             changed = true;
+        }
+    }
+    if changed {
+        rewrite_uses(f, |id| resolve_replacement(&replacements, id));
+        for block in &mut f.blocks {
+            block.insts.retain(|id| replacements[id.0 as usize].is_none());
         }
     }
     changed
@@ -303,10 +498,25 @@ fn fold_inst(
 ) -> Option<ValueId> {
     match inst {
         Inst::Bin { op, ty, lhs, rhs } => {
-            let (l, r) = (consts.get(lhs)?, consts.get(rhs)?);
-            let (lv, rv) = (l.as_u128()?, r.as_u128()?);
             let w = ty.int_bits()?;
             let m = crate::analysis::mask(w);
+            let left = consts.get(lhs).and_then(Constant::as_u128);
+            let right = consts.get(rhs).and_then(Constant::as_u128);
+            match (op, left, right) {
+                (BinOp::Add | BinOp::Or | BinOp::Xor, Some(0), _) => return Some(*rhs),
+                (BinOp::Add | BinOp::Sub | BinOp::Or | BinOp::Xor
+                    | BinOp::Shl | BinOp::Lshr | BinOp::Ashr, _, Some(0)) => return Some(*lhs),
+                (BinOp::Mul, Some(1), _) => return Some(*rhs),
+                (BinOp::Mul, _, Some(1)) => return Some(*lhs),
+                (BinOp::And, Some(mask), _) if mask == m => return Some(*rhs),
+                (BinOp::And, _, Some(mask)) if mask == m => return Some(*lhs),
+                (BinOp::And | BinOp::Or, _, _) if lhs == rhs => return Some(*lhs),
+                (BinOp::Sub | BinOp::Xor, _, _) if lhs == rhs => {
+                    return Some(f.add_const(Constant::zero_int(w)));
+                }
+                _ => {}
+            }
+            let (lv, rv) = (left?, right?);
             let v = match op {
                 BinOp::Add => lv.wrapping_add(rv) & m,
                 BinOp::Sub => lv.wrapping_sub(rv) & m,
@@ -430,6 +640,44 @@ pub fn dce(f: &mut Function) {
         let removed = remove_unused_instructions(f);
         if !removed {
             break;
+        }
+    }
+}
+
+/// Collapse constant conditional branches before structuring a function.
+pub fn prune_constant_edges(f: &mut Function) {
+    let mut changed = false;
+    for block in &mut f.blocks {
+        let Some(Terminator::CondBr { cond, yes, no }) = block.term else {
+            continue;
+        };
+        if let Some(Value::Const(Constant::Int { bits, width: 1 })) = f.values.get(cond.0 as usize) {
+            block.term = Some(Terminator::Br(if bits & 1 == 0 { no } else { yes }));
+            changed = true;
+        }
+    }
+    if !changed {
+        return;
+    }
+    let mut reachable = vec![false; f.blocks.len()];
+    let mut work: Vec<_> = f.entry.into_iter().collect();
+    while let Some(block) = work.pop() {
+        if !std::mem::replace(&mut reachable[block.0 as usize], true) {
+            work.extend(f.successors(block));
+        }
+    }
+    for (index, block) in f.blocks.iter_mut().enumerate() {
+        if !reachable[index] {
+            block.insts.clear();
+            block.term = Some(Terminator::Unreachable);
+        }
+    }
+    recompute_preds(f);
+    for block in &f.blocks {
+        for &id in &block.insts {
+            if let Value::Inst(Inst::Phi { incoming, .. }) = &mut f.values[id.0 as usize] {
+                incoming.retain(|&(_, pred)| block.preds.contains(&pred));
+            }
         }
     }
 }
@@ -601,21 +849,21 @@ pub fn dse(f: &mut Function) {
     for b in 0..f.blocks.len() {
         let block = BlockId(b as u32);
         let insts: Vec<ValueId> = f.blocks[b].insts.clone();
-        let mut last_store: HashMap<ValueId, ValueId> = HashMap::new();
+        let mut last_store: HashMap<ValueId, (ValueId, Type)> = HashMap::new();
         let mut dead: Vec<ValueId> = Vec::new();
         for i in insts {
-            match f.inst(i).cloned() {
-                Some(Inst::Store { ptr, .. }) => {
-                    if let Some(prev) = last_store.insert(ptr, i) {
-                        dead.push(prev);
+            match f.inst(i) {
+                Some(Inst::Store { ptr, ty, .. }) => {
+                    if let Some((previous, previous_ty)) = last_store.insert(*ptr, (i, ty.clone()))
+                        && previous_ty == *ty
+                    {
+                        dead.push(previous);
                     }
                 }
-                Some(inst) => {
-                    if let Inst::Load { ptr, .. } = inst {
-                        last_store.remove(&ptr);
-                    }
-                }
-                None => {}
+                // Distinct SSA pointers can alias. Calls can read guest and
+                // CPU state through arguments or globals.
+                Some(Inst::Load { .. } | Inst::Call { .. } | Inst::Fence) => last_store.clear(),
+                _ => {}
             }
         }
         for d in dead {
@@ -628,30 +876,35 @@ pub fn dse(f: &mut Function) {
 /// an earlier dominating one.
 pub fn gvn(f: &mut Function) {
     let doms = Dominators::new(f);
-    let mut available: HashMap<String, ValueId> = HashMap::new();
-    for b in doms.order().to_vec() {
-        let insts: Vec<ValueId> = f.block(b).insts.clone();
-        for i in insts {
-            let Some(inst) = f.inst(i).cloned() else {
+    let mut available: HashMap<Inst, (BlockId, ValueId)> = HashMap::new();
+    let mut replacements = vec![None; f.values.len()];
+    let mut changed = false;
+    for &block in doms.order() {
+        for &id in &f.block(block).insts {
+            let Some(inst) = f.inst(id).filter(|inst| is_pure(inst)) else {
                 continue;
             };
-            if !is_pure(&inst) {
-                continue;
+            let mut key = inst.clone();
+            if changed {
+                for operand in crate::operands_mut(&mut key) {
+                    *operand = resolve_replacement(&replacements, *operand);
+                }
             }
-            let key = key_of(f, &inst, i);
-            match available.get(&key) {
-                Some(&prev) if prev != i => {
-                    replace_all_uses(f, i, prev);
-                    remove_inst(f, b, i);
-                }
-                _ => {
-                    available.insert(key, i);
-                }
+            if let Some(&(definition, previous)) = available.get(&key)
+                && doms.dominates(definition, block)
+            {
+                replacements[id.0 as usize] = Some(previous);
+                changed = true;
+            } else {
+                available.insert(key, (block, id));
             }
         }
-        // A block with multiple preds invalidates nothing here: the key is
-        // operand-based, so a dominating equal expression is still equal.
-        let _ = &doms;
+    }
+    if changed {
+        rewrite_uses(f, |id| resolve_replacement(&replacements, id));
+        for block in &mut f.blocks {
+            block.insts.retain(|id| replacements[id.0 as usize].is_none());
+        }
     }
 }
 
@@ -664,43 +917,9 @@ fn is_pure(i: &Inst) -> bool {
             | Inst::Alloca { .. }
             | Inst::Marker { .. }
             | Inst::Fence
+            | Inst::Phi { .. }
+            | Inst::Freeze { .. }
     )
-}
-
-fn key_of(f: &Function, inst: &Inst, self_id: ValueId) -> String {
-    let mut s = format!("{:?}", std::mem::discriminant(inst));
-    // Fields that are part of the instruction's meaning but not operands:
-    // a `gep` is distinguished by its offset, a cast by its type, an
-    // extraction by its index.
-    match inst {
-        Inst::Gep { offset, .. } => s.push_str(&format!("o{offset}")),
-        Inst::Bin { op, ty, .. } => s.push_str(&format!("{op:?}{ty:?}")),
-        Inst::Un { op, ty, .. } => s.push_str(&format!("{op:?}{ty:?}")),
-        Inst::Rot { left, ty, .. } => s.push_str(&format!("{left}{ty:?}")),
-        Inst::Icmp { pred, ty, .. } => s.push_str(&format!("{pred:?}{ty:?}")),
-        Inst::Trunc { from, to, .. }
-        | Inst::Zext { from, to, .. }
-        | Inst::Sext { from, to, .. }
-        | Inst::Cast { from, to, .. } => s.push_str(&format!("{from:?}{to:?}")),
-        Inst::ExtractValue { index, ty, .. } | Inst::InsertValue { index, ty, .. } => {
-            s.push_str(&format!("i{index}{ty:?}"));
-        }
-        Inst::Select { ty, .. } => s.push_str(&format!("{ty:?}")),
-        Inst::Freeze { ty, .. } => s.push_str(&format!("{ty:?}")),
-        _ => {}
-    }
-    for o in crate::operands(inst) {
-        // Value ids are per function, so an id outside this arena names
-        // nothing here and must not be indexed.
-        match f.values.get(o.0 as usize) {
-            Some(Value::Const(c)) => s.push_str(&format!("c{:?}", c)),
-            Some(Value::Param { index, .. }) => s.push_str(&format!("p{index}")),
-            Some(Value::Inst(_)) => s.push_str(&format!("v{}", o.0)),
-            None => s.push_str(&format!("x{}", o.0)),
-        }
-    }
-    let _ = self_id;
-    s
 }
 
 // ---- pipeline --------------------------------------------------------------

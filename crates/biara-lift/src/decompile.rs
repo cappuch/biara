@@ -86,7 +86,7 @@ use biara_ir_compat::{
 };
 
 use crate::{
-    DISPATCH, DebugName, DebugObject, DecompileOptions, Error, RUN, SYSCALL, lower::PC_MD, memory,
+    DISPATCH, DebugName, DebugObject, DecompileOptions, Error, RUN, SYSCALL, lower::PC_MD,
 };
 use biara_proto::{FunctionPackage, annotations::Annotations};
 
@@ -1598,6 +1598,18 @@ impl<'ctx> PreparedC<'ctx> {
                 options,
             )?;
         }
+        module.update(|m| {
+            for f in &mut m.module.functions {
+                if f.blocks.is_empty() {
+                    continue;
+                }
+                biara_ir::pass::promote_loop_slots(f);
+                biara_ir::pass::fold(f);
+                biara_ir::pass::prune_constant_edges(f);
+                biara_ir::pass::dce(f);
+            }
+        });
+        module.verify().map_err(|e| Error::Llvm(e.to_string()))?;
         let (strings, shapes) = guest_strings(&module, read, 96, summaries.guest_bits);
         // Typed import declarations: `const char *` at string positions,
         // `uint64_t` elsewhere, up to the most arguments any call passes.
@@ -2398,7 +2410,6 @@ fn simplify(
     let run = |p: &CStr| function_passes(module, machine, p, options);
     for _ in 0..4 {
         run(c"function(sroa,early-cse<memssa>,instcombine<no-verify-fixpoint>)")?;
-        memory::rebase_guest_pointers(module)?;
         let mut folded = 0;
         module.update(|m| {
             for f in &mut m.module.functions {

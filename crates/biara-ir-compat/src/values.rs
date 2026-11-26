@@ -662,16 +662,18 @@ impl<'ctx> FunctionValue<'ctx> {
     }
 
     pub fn get_basic_blocks(&self) -> Vec<crate::basic_block::BasicBlock<'ctx>> {
-        let n = self.ctx.with(self.module, |m| m.module.functions[self.func].blocks.len());
-        (0..n)
-            .map(|i| {
-                crate::basic_block::BasicBlock::new(
-                    self.ctx,
-                    self.func,
-                    biara_ir::BlockId(i as u32),
-                )
-            })
-            .collect()
+        self.basic_blocks_from(0).collect()
+    }
+
+    /// Iterate over blocks appended at or after the given block count.
+    pub fn basic_blocks_from(
+        &self,
+        first: u32,
+    ) -> impl Iterator<Item = crate::basic_block::BasicBlock<'ctx>> {
+        let func = self.func;
+        let ctx = self.ctx;
+        (first..self.count_basic_blocks())
+            .map(move |i| crate::basic_block::BasicBlock::new(ctx, func, biara_ir::BlockId(i)))
     }
 
     pub fn set_linkage(&self, _linkage: crate::module::Linkage) {}
@@ -1210,53 +1212,43 @@ impl<'ctx> InstructionValue<'ctx> {
     }
 
     pub fn get_previous_instruction(&self) -> Option<InstructionValue<'ctx>> {
-        let ids = self.owning_block_insts()?;
-        let at = ids.iter().position(|v| *v == self.id)?;
-        at.checked_sub(1).map(|i| Self {
-            ctx: self.ctx,
-            func: self.func,
-            id: ids[i],
-            term: None,
-            _m: PhantomData,
-        })
+        self.adjacent_instruction(-1)
     }
 
     /// The instruction after this one in its block.
     pub fn get_next_instruction(&self) -> Option<InstructionValue<'ctx>> {
-        // The owning block is the one that lists this instruction: block ids
-        // repeat across functions, so a global search can name the wrong one.
-        let ids = self.owning_block_insts()?;
-        let at = ids.iter().position(|v| *v == self.id)?;
-        ids.get(at + 1).map(|id| Self {
-            ctx: self.ctx,
-            func: self.func,
-            id: *id,
-            term: None,
-            _m: PhantomData,
-        })
+        self.adjacent_instruction(1)
     }
 
-    /// The instruction list of the block that actually holds this value.
-    ///
-    /// Block ids repeat across functions, so the block and its owner must be
-    /// resolved together: looking a block id up in every function would find
-    /// another function's block with the same number.
-    fn owning_block_insts(&self) -> Option<Vec<biara_ir::ValueId>> {
-        self.ctx.with(self.ctx.module_id(), |m| {
-            let holds = |f: &biara_ir::Function| {
-                f.blocks.iter().find_map(|blk| {
-                    blk.insts
-                        .contains(&self.id)
-                        .then(|| blk.insts.clone())
-                })
+    fn adjacent_instruction(&self, step: isize) -> Option<InstructionValue<'ctx>> {
+        let id = self.ctx.with(self.ctx.module_id(), |m| {
+            let find = |f: &biara_ir::Function| {
+                let locate = |block: &biara_ir::Block| {
+                    let index = block.insts.iter().position(|&id| id == self.id)?;
+                    Some(index.checked_add_signed(step).and_then(|i| block.insts.get(i)).copied())
+                };
+                // Use the defining block when it still lists the value. A
+                // pass may have moved it without updating the block cache.
+                f.defined_in
+                    .get(self.id.0 as usize)
+                    .copied()
+                    .flatten()
+                    .and_then(|block| f.blocks.get(block.0 as usize))
+                    .and_then(locate)
+                    .or_else(|| f.blocks.iter().find_map(locate))
             };
-            // Value ids are per-function, so another function listing the
-            // same id is a different instruction. Only an instruction whose
-            // owner is unknown searches the whole module.
             match self.func {
-                Some(i) => m.module.functions.get(i).and_then(&holds),
-                None => m.module.functions.iter().find_map(&holds),
+                Some(owner) => m.module.functions.get(owner).and_then(find),
+                None => m.module.functions.iter().find_map(find),
             }
+            .flatten()
+        })?;
+        Some(Self {
+            ctx: self.ctx,
+            func: self.func,
+            id,
+            term: None,
+            _m: PhantomData,
         })
     }
 
