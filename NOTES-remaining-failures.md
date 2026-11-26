@@ -444,3 +444,34 @@ the code treats as equal. If you re-land it, run the gate on it alone.
    `last_store` cross-block lookback, a post-fixpoint label purge).
 5. `aarch64` corpus is 289 inputs × 4 lift variants × 18 tests. It is slow but
    it is the truth.
+
+---
+
+## 7. What was tried for `args[1]` and rejected (measured)
+
+Two changes each move `audit` from `:86` to `:87` (`args[0]` and `args[2]`
+resolve) and each breaks `aarch64/tail` with
+`Unsupported("dispatch made no progress")`:
+
+1. `IntValue::is_const` / `symbolic_at` accepting arena constants
+   (`get_zero_extended_constant` instead of `is_const`, and dropping the
+   `is_const` gate in the `constant` closure).
+2. `InstructionValue::operand`'s owner being accepted whenever the function's
+   arena contains the id, instead of requiring `listed`.
+
+They are coupled: (1) alone regresses `audit` back to `:86`, because the
+constant accessor still refuses to answer unless the handle's `func` holds the
+constant. Together they reach `:87`, which is as far as `audit` has ever got —
+and `tail` fails.
+
+Both are reverted. HEAD is `17de142`, aarch64 is 18/18, `audit` fails at
+`:86`.
+
+The remaining question, stated exactly: **which function holds the constant
+that `%v66`'s operand refers to, and why does the handle naming it disagree?**
+Answer that by dumping, for the `"calls"` module only (see §2), the
+`func`/`id`/`values[id]` triple for the operand of `%v66` and for the operand
+of `%v115 = store i64 0`. If the id is right and only `func` is wrong, fix
+where the handle is built. If the id is wrong too, the leak is at
+construction. Do not widen the predicates again — that road is measured and
+it fails.
