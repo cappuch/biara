@@ -1206,19 +1206,6 @@ impl<'a> Former<'a> {
                                 touched[r as usize] = true;
                                 owned_gep.insert(v.0, r);
                                 elided.insert(v.0);
-                            } else if *offset < 0 {
-                                // Stores to the state before env (icount and
-                                // I/O flags) go. Loads stay, reading the zeroed
-                                // margin of `biara_cpu`: an explicit
-                                // conservative fallback, as QEMU's helpers
-                                // would supply those bytes.
-                                for (u, _) in old.users(v) {
-                                    if let Some(Inst::Store { ptr, .. }) = old.inst(u)
-                                        && *ptr == v
-                                    {
-                                        elided.insert(u.0);
-                                    }
-                                }
                             }
                         }
                         Some(Inst::Load { ptr, .. }) | Some(Inst::Store { ptr, .. })
@@ -1226,6 +1213,17 @@ impl<'a> Former<'a> {
                         {
                             if let Some(&r) = self.reg_at.get(&0) {
                                 touched[r as usize] = true;
+                            }
+                        }
+                        Some(Inst::Store { ptr, .. }) => {
+                            // Discard writes to icount and I/O flags before env.
+                            // Loads still read from the zeroed CPU-state margin.
+                            if let Some(Inst::Gep { base, offset }) = old.inst(*ptr)
+                                && *base == ev
+                                && *offset < 0
+                                && !self.reg_at.contains_key(offset)
+                            {
+                                elided.insert(v.0);
                             }
                         }
                         _ => {}
