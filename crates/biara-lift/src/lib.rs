@@ -321,6 +321,10 @@ fn lift_with<'ctx>(
     let mut trimmer = (cfg.functions.len() > 512).then(|| memory::Trimmer::new(machine));
     for (entry, func) in cfg.functions.iter().filter(|(e, _)| lifted(e)) {
         let f = functions[entry];
+        let large = func.blocks.len() >= 32;
+        if large {
+            module.update(|data| data.index_builder_constants(Some(f.index())));
+        }
         let allocas = cx.append_basic_block(f, "entry");
         let blocks: HashMap<u64, _> = func
             .blocks
@@ -405,6 +409,9 @@ fn lift_with<'ctx>(
         // Every translation block of this function has now been emitted, so
         // a block still open is one nothing reaches.
         lower::Lowering::close_function(cx, f);
+        if large {
+            module.update(|data| data.index_builder_constants(None));
+        }
         if let Some(trimmer) = &mut trimmer {
             trimmer.run(f);
         }

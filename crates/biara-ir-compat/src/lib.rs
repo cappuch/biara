@@ -45,6 +45,7 @@ pub struct ModuleData {
     pub metadata: HashMap<String, Vec<MetadataNode>>,
     /// Globals by name (data the C renderer reads).
     pub globals: HashMap<String, ()>,
+    builder_constants: Option<(usize, HashMap<biara_ir::Constant, biara_ir::ValueId>)>,
 }
 
 /// One metadata attachment: either a value payload or a list of sub-nodes.
@@ -65,13 +66,33 @@ impl ModuleData {
             index: HashMap::new(),
             metadata: HashMap::new(),
             globals: HashMap::new(),
+            builder_constants: None,
         }
     }
 
     pub fn reindex(&mut self) {
+        self.builder_constants = None;
         self.index.clear();
         for (i, f) in self.module.functions.iter().enumerate() {
             self.index.insert(f.name.clone(), i);
+        }
+    }
+
+    /// Cache constants while the builder appends values to this function.
+    /// End the batch before any rewrite of the function.
+    pub fn index_builder_constants(&mut self, function: Option<usize>) {
+        self.builder_constants =
+            function.map(|id| (id, self.module.functions[id].constant_index()));
+    }
+
+    fn build_constant(&mut self, function: usize, constant: biara_ir::Constant) -> biara_ir::ValueId {
+        let f = &mut self.module.functions[function];
+        if let Some((owner, index)) = &mut self.builder_constants
+            && *owner == function
+        {
+            f.add_indexed_const(index, constant)
+        } else {
+            f.add_const(constant)
         }
     }
 }

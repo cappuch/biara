@@ -115,15 +115,7 @@ impl<'ctx> Builder<'ctx> {
             IntSource::Const(bits) => {
                 let func = self.func();
                 self.ctx.with_mut(self.ctx.module_id(), |m| {
-                    let f = match func {
-                        Some(i) => &mut m.module.functions[i],
-                        None => m
-                            .module
-                            .functions
-                            .first_mut()
-                            .expect("constants require a function"),
-                    };
-                    f.add_const(biara_ir::Constant::Int {
+                    m.build_constant(func.unwrap_or(0), biara_ir::Constant::Int {
                         bits,
                         width: v.bits,
                     })
@@ -552,11 +544,10 @@ impl<'ctx> Builder<'ctx> {
             })
             .collect();
         let callee_id = self.ctx.with_mut(self.ctx.module_id(), |m| {
-            let f = match self.func() {
-                Some(i) => &mut m.module.functions[i],
-                None => m.module.functions.first_mut().expect("a function"),
-            };
-            f.add_const(biara_ir::Constant::Function(name.to_owned()))
+            m.build_constant(
+                self.func().unwrap_or(0),
+                biara_ir::Constant::Function(name.to_owned()),
+            )
         });
         let id = self.emit(biara_ir::Inst::Call {
             callee: callee_id,
