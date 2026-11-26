@@ -1032,6 +1032,7 @@ impl Analysis {
 
         for (fi, f) in module.functions.iter().enumerate() {
             let fi = fi as u32;
+            frame_spill_aliases(f, fi, &mut same);
             let mut call_users = None;
             for b in &f.blocks {
                 for &id in &b.insts {
@@ -2350,6 +2351,92 @@ fn const_i64(f: &Function, v: ValueId) -> Option<i64> {
 
 /// Frame slots that only ever hold one frame address (spills at -O0): a load
 /// from one is that address, for typing.
+/// Recover equality through a unique, dominating stack spill.
+/// A frame address exposed anywhere in the function can be modified by a call.
+fn frame_spill_aliases(f: &Function, fi: u32, same: &mut Vec<(ValRef, ValRef)>) {
+    let frame_base = |id| {
+        let b = base(f, fi, id, 0);
+        let root = b.root?;
+        matches!(f.inst(root.value), Some(Inst::Alloca { .. })).then_some((root, b.off))
+    };
+    let mut stores: BTreeMap<_, Vec<_>> = BTreeMap::new();
+    let mut loads = Vec::new();
+    for (index, block) in f.blocks.iter().enumerate() {
+        let block_id = biara_ir::BlockId(index as u32);
+        for (position, &id) in block.insts.iter().enumerate() {
+            match f.inst(id) {
+                Some(Inst::Store { ptr, value, ty, .. }) => {
+                    if let Some((frame, offset)) = frame_base(*ptr) {
+                        stores.entry(frame).or_default().push((
+                            offset, i64::from(ty_bytes(ty)), block_id, position, *value,
+                        ));
+                    }
+                }
+                Some(Inst::Load { ptr, ty, .. }) if is_pointerish(ty) => {
+                    if let Some((frame, offset)) = frame_base(*ptr) {
+                        loads.push((frame, offset, ty, block_id, position, id));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if loads.is_empty() || stores.is_empty() {
+        return;
+    }
+    let mut escapes = BTreeSet::new();
+    for block in &f.blocks {
+        for &id in &block.insts {
+            let Some(inst) = f.inst(id) else { continue };
+            for operand in biara_ir::operands(inst) {
+                let Some((root, _)) = frame_base(operand) else { continue };
+                let internal = match inst {
+                    Inst::Load { ptr, .. } => operand == *ptr,
+                    Inst::Store { ptr, value, .. } => operand == *ptr && operand != *value,
+                    Inst::Gep { .. } | Inst::Cast { .. } | Inst::Bin { .. } => {
+                        is_pointerish(&f.ty(id)) && frame_base(id).is_some_and(|(r, _)| r == root)
+                    }
+                    _ => false,
+                };
+                if !internal {
+                    escapes.insert(root);
+                }
+            }
+        }
+        for operand in block.term.as_ref().into_iter().flat_map(biara_ir::term_operands) {
+            if let Some((root, _)) = frame_base(operand) {
+                escapes.insert(root);
+            }
+        }
+    }
+    let mut dom = None;
+    for (frame, offset, ty, block, position, load) in loads {
+        if escapes.contains(&frame) {
+            continue;
+        }
+        let Some(stores) = stores.get(&frame) else { continue };
+        let bytes = i64::from(ty_bytes(ty));
+        let mut overlapping = stores.iter().filter(|&&(start, width, ..)| {
+            offset < start.saturating_add(width) && start < offset.saturating_add(bytes)
+        });
+        let Some(&(start, width, from, before, value)) = overlapping.next() else { continue };
+        if start != offset || width != bytes || overlapping.next().is_some()
+            || f.ty(value) != *ty || !pointer_root(f, value)
+        {
+            continue;
+        }
+        let dominates = if from == block {
+            before < position
+        } else {
+            dom.get_or_insert_with(|| biara_ir::analysis::Dominators::new(f))
+                .dominates(from, block)
+        };
+        if dominates {
+            same.push((ValRef { func: fi, value: load }, ValRef { func: fi, value }));
+        }
+    }
+}
+
 fn type_base(module: &Module, v: &ValRef, holds: &BTreeMap<(ValRef, i64), Option<Base>>) -> Base {
     let f = f_of(module, *v);
     let b = base(f, v.func, v.value, 0);
