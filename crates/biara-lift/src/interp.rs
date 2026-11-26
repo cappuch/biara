@@ -69,6 +69,57 @@ fn x86_carry(dst: u64, src1: u64, src2: u64, op: u32) -> u64 {
     }
 }
 
+/// Materialize the arithmetic flags held in QEMU's lazy x86 state.
+fn x86_flags(dst: u64, src1: u64, src2: u64, op: u32) -> u64 {
+    const AF: u64 = 1 << 4;
+    const OF: u64 = 1 << 11;
+    let width = 8 << (op & 3);
+    let mask = u64::MAX >> (64 - width);
+    let sign = 1 << (width - 1);
+    let result = dst & mask;
+    let operand = src1 & mask;
+    let majority = |a, b, c| (a & b) | ((a | b) & c);
+    let carry_flags = |carry: u64| {
+        ((carry >> (width - 1)) & 1)
+            | ((carry << 1) & AF)
+            | (u64::from(((carry ^ (carry << 1)) & sign) != 0) * OF)
+    };
+    let arithmetic = match op {
+        0 => return src1,
+        1 => return (src1 & !1) | dst,
+        2 => return (src1 & !OF) | src2.wrapping_mul(OF),
+        3 => return (src1 & !(OF | 1)) | dst | src2.wrapping_mul(OF),
+        55 => return u64::from(dst == 0) << 6,
+        59 => return (dst & 0xd1) ^ 0x44,
+        4..=7 => u64::from(src1 != 0) * (OF | 1),
+        8..=15 => {
+            let carry = if op >= 12 { src2 } else { 0 };
+            let rhs = result.wrapping_sub(operand).wrapping_sub(carry);
+            carry_flags(majority(!result, operand, rhs))
+        }
+        16..=23 => {
+            let borrow = if op >= 20 { src2 } else { 0 };
+            let lhs = result.wrapping_add(operand).wrapping_add(borrow);
+            carry_flags(majority(!lhs, operand, result))
+        }
+        24..=27 => 0,
+        28..=31 => (operand as u32 as u64)
+            + ((result ^ result.wrapping_sub(1)) & AF)
+            + u64::from(result == sign) * OF,
+        32..=35 => (operand as u32 as u64)
+            + ((result ^ result.wrapping_add(1)) & AF)
+            + u64::from(result == sign - 1) * OF,
+        36..=43 => x86_carry(dst, src1, src2, op)
+            + u64::from(((operand ^ result) & sign) != 0) * OF,
+        44..=51 => x86_carry(dst, src1, src2, op),
+        _ => return 0,
+    };
+    u64::from((arithmetic as u32)
+        .wrapping_add(u32::from((dst as u8).count_ones() % 2 == 0) << 2)
+        .wrapping_add(u32::from(result == 0) << 6)
+        .wrapping_add(u32::from(result & sign != 0) << 7))
+}
+
 impl Interp<'_> {
     /// Run a QEMU helper the lifter left as a declaration.
     ///
@@ -82,6 +133,9 @@ impl Interp<'_> {
         match bare {
             "cc_compute_c" if args.len() == 4 => {
                 Some(u128::from(x86_carry(arg(0), arg(1), arg(2), arg(3) as u32)))
+            }
+            "cc_compute_all" if args.len() == 4 => {
+                Some(u128::from(x86_flags(arg(0), arg(1), arg(2), arg(3) as u32)))
             }
             "memset" => {
                 let (dst, c, n) = (arg(0), arg(1) as u8, arg(2));
