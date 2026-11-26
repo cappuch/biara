@@ -175,7 +175,7 @@ impl<'ctx> FloatType<'ctx> {
     ) -> FunctionType<'ctx> {
         FunctionType::new(
             self.ctx,
-            biara_ir::Type::Struct(Vec::new()),
+            biara_ir::Type::Float(self.bits),
             params,
             varargs,
         )
@@ -184,7 +184,7 @@ impl<'ctx> FloatType<'ctx> {
 
 impl<'ctx> BasicType<'ctx> for FloatType<'ctx> {
     fn to_ir(&self) -> biara_ir::Type {
-        biara_ir::Type::Struct(Vec::new())
+        biara_ir::Type::Float(self.bits)
     }
     fn get_context(&self) -> &'_ Context {
         self.ctx
@@ -193,7 +193,7 @@ impl<'ctx> BasicType<'ctx> for FloatType<'ctx> {
 
 impl<'ctx> AnyType<'ctx> for FloatType<'ctx> {
     fn to_any_ir(&self) -> biara_ir::Type {
-        biara_ir::Type::Struct(Vec::new())
+        biara_ir::Type::Float(self.bits)
     }
 }
 
@@ -452,6 +452,7 @@ impl<'ctx> AnyTypeEnum<'ctx> {
     pub fn from_ir(ctx: &'ctx Context, ty: &biara_ir::Type) -> Self {
         match ty {
             biara_ir::Type::Int(b) => Self::IntType(IntType::new(ctx, *b)),
+            biara_ir::Type::Float(b) => Self::FloatType(FloatType::new(ctx, *b)),
             biara_ir::Type::Ptr => Self::PointerType(PointerType::new(ctx)),
             biara_ir::Type::Void => Self::VoidType(VoidType::new(ctx)),
             biara_ir::Type::Func(_) => {
@@ -525,6 +526,7 @@ impl<'ctx> BasicTypeEnum<'ctx> {
     pub(crate) fn from_ir(ctx: &'ctx Context, ty: &biara_ir::Type) -> Option<Self> {
         Some(match ty {
             biara_ir::Type::Int(b) => Self::IntType(IntType::new(ctx, *b)),
+            biara_ir::Type::Float(b) => Self::FloatType(FloatType::new(ctx, *b)),
             biara_ir::Type::Ptr => Self::PointerType(PointerType::new(ctx)),
             biara_ir::Type::Vector(..) => Self::VectorType(VectorType::new(ctx, ty.clone())),
             biara_ir::Type::Array(..) => Self::ArrayType(StructType::new(ctx, ty.clone())),
@@ -628,6 +630,12 @@ impl<'ctx> From<IntType<'ctx>> for BasicMetadataTypeEnum<'ctx> {
 impl<'ctx> From<PointerType<'ctx>> for BasicMetadataTypeEnum<'ctx> {
     fn from(t: PointerType<'ctx>) -> Self {
         Self::PointerType(t)
+    }
+}
+
+impl<'ctx> From<FloatType<'ctx>> for BasicMetadataTypeEnum<'ctx> {
+    fn from(t: FloatType<'ctx>) -> Self {
+        Self::FloatType(t)
     }
 }
 

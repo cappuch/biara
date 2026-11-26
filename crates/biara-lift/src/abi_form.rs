@@ -52,12 +52,8 @@
 //! Documented conservative fallbacks, each forced by `biara_ir` modelling
 //! less than LLVM:
 //!
-//! - **No floating-point types.** `biara_ir::Type` has integers, pointers,
-//!   aggregates, vectors and functions but no `float`/`double`. `F32`,
-//!   `F64` and `VEC128` slots are spelled as their integer bit pattern
-//!   (`i32`, `i64`, the register width). A scalar store into a 128-bit register
-//!   lane touches the same bytes `CreateStore(float)` did, so no guest bits
-//!   move; only a printed C type would differ.
+//! - Scalar floating-point formals and results use their native C ABI.
+//!   Register storage remains integer bits.
 //! - **No function metadata.** `!biara.abi.args`, `!biara.abi.rets` and
 //!   `!biara.abi.ret_class` have no channel in `biara_ir::FuncAttrs`, so
 //!   they are not attached; the formals' IR types already carry the same
@@ -420,17 +416,17 @@ fn sig_ret_kind(s: &Sig, i: usize) -> u32 {
 
 /// The native type of ABI slot `kind` over register `r`: bool/i8/i16/
 /// i32-declared slots spell the IR directly; pointers stay pointers (never
-/// fp bitcasts); raw/conflict/integer slots stay the register type. FP and
-/// vector kinds are their integer bit pattern (see the module doc).
+/// fp bitcasts); raw/conflict/integer slots stay the register type.
+/// Scalar FP slots use the native floating-point ABI.
 fn slot_ty(regs: &[Reg], r: u32, kind: u32) -> Type {
     match kind {
         KIND_BOOL => Type::i1(),
         KIND_I8 => Type::i8(),
         KIND_I16 => Type::i16(),
         KIND_I32DECL => Type::i32(),
-        KIND_F32 => Type::i32(),
-        KIND_F64 => Type::i64(),
-        KIND_VEC128 => reg_ty(regs, r),
+        KIND_F32 => Type::Float(32),
+        KIND_F64 => Type::Float(64),
+        KIND_VEC128 => Type::Vector(Box::new(Type::Float(32)), 4),
         KIND_PTR | KIND_SRET => Type::Ptr,
         // Raw/conflict/integer slots stay the register's integer type: no
         // established float/vector/pointer fact to narrow them.
@@ -585,6 +581,16 @@ fn convert(f: &mut Function, at: &mut At, from: &Type, to: &Type, v: ValueId) ->
                     },
                 )
             }
+        }
+        (Type::Int(bits), Type::Float(width)) if bits != width => {
+            let word = Type::Int(*width);
+            let value = convert(f, at, from, &word, v);
+            convert(f, at, &word, to, value)
+        }
+        (Type::Float(width), Type::Int(bits)) if bits != width => {
+            let word = Type::Int(*width);
+            let value = convert(f, at, from, &word, v);
+            convert(f, at, &word, to, value)
         }
         (Type::Ptr, _) => {
             let i = emit(

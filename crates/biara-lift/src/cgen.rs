@@ -1596,11 +1596,13 @@ impl<'m, 'a, 'b> Emitter<'m, 'a, 'b> {
                     u
                 }
             }
+            Type::Float(32) => "float".into(),
+            Type::Float(64) => "double".into(),
             Type::Ptr => "uint8_t *".into(),
             Type::Struct(fields) => self.aggregate(fields),
             Type::Vector(elem, n) => {
                 let bits = match **elem {
-                    Type::Int(b) => b,
+                    Type::Int(b) | Type::Float(b) => b,
                     Type::Ptr => 64,
                     _ => 0,
                 };
@@ -1610,15 +1612,11 @@ impl<'m, 'a, 'b> Emitter<'m, 'a, 'b> {
                     && bytes <= 16
                     && (bytes & (bytes - 1)) == 0
                 {
-                    let name = format!(
-                        "biara_v{}{}",
-                        n,
-                        if bits == 32 {
-                            "u32".to_string()
-                        } else {
-                            format!("u{}", bits)
-                        }
-                    );
+                    let name = match **elem {
+                        Type::Float(32) => format!("biara_v{n}f"),
+                        Type::Float(64) => format!("biara_v{n}d"),
+                        _ => format!("biara_v{n}u{bits}"),
+                    };
                     if !self.support_defs.contains_key(&name) {
                         let elem_ty = self.cty(elem);
                         let def = format!(
@@ -1634,7 +1632,7 @@ impl<'m, 'a, 'b> Emitter<'m, 'a, 'b> {
                     "uint64_t /* unsupported type */".into()
                 }
             }
-            Type::Array(..) | Type::Func(_) => {
+            Type::Array(..) | Type::Func(_) | Type::Float(_) => {
                 self.unsupported += 1;
                 "uint64_t /* unsupported type */".into()
             }
@@ -1648,13 +1646,9 @@ impl<'m, 'a, 'b> Emitter<'m, 'a, 'b> {
     }
 
     fn declared_param(&self, attrs: &FuncAttrs, nparams: usize, i: usize) -> Option<String> {
-        // biara_ir models one `c_type` per function (no per-parameter list):
-        // apply it only where it is unambiguous, a single parameter.
-        if nparams == 1 && i == 0 {
-            attrs.c_type.clone()
-        } else {
-            None
-        }
+        attrs.c_params.get(&(i as u32)).cloned().or_else(|| {
+            (nparams == 1 && i == 0).then(|| attrs.c_type.clone()).flatten()
+        })
     }
 
     fn cty_of(&self, f: &Function, v: ValueId) -> String {
@@ -2332,6 +2326,14 @@ impl<'m, 'a, 'b> Emitter<'m, 'a, 'b> {
             Inst::Trunc { from, to, value } => self.cast_expr(f, v, "trunc", &from, &to, value),
             Inst::Zext { from, to, value } => self.cast_expr(f, v, "zext", &from, &to, value),
             Inst::Sext { from, to, value } => self.cast_expr(f, v, "sext", &from, &to, value),
+            Inst::Cast { from, to, value } if matches!((&from, &to),
+                (Type::Int(_), Type::Float(_) | Type::Vector(..))
+                    | (Type::Float(_) | Type::Vector(..), Type::Int(_))) => {
+                let from_type = self.cty(&from);
+                let to_type = self.cty(&to);
+                let value = self.val_as(f, value, &from_type);
+                format!("((union {{ {from_type} source; {to_type} target; }}){{ .source = {value} }}).target")
+            }
             Inst::Cast { to, value, .. } => {
                 let toty = self.cty(&to);
                 let fromty = self.cty_of(f, value);
@@ -3573,6 +3575,8 @@ fn cty_static(ty: &Type) -> String {
                 u
             }
         }
+        Type::Float(32) => "float".into(),
+        Type::Float(64) => "double".into(),
         Type::Ptr => "uint8_t *".into(),
         Type::Struct(fields) => format!("struct biara_tuple@{}", fields.len()),
         _ => "uint64_t /* unsupported type */".into(),

@@ -95,6 +95,9 @@ fn print_ty(t: &Type) -> String {
     match t {
         Type::Void => "void".to_owned(),
         Type::Int(w) => format!("i{w}"),
+        Type::Float(32) => "float".to_owned(),
+        Type::Float(64) => "double".to_owned(),
+        Type::Float(w) => format!("f{w}"),
         Type::Ptr => "ptr".to_owned(),
         Type::Array(e, n) => format!("[{} x {}]", n, print_ty(e)),
         Type::Struct(fields) => format!(

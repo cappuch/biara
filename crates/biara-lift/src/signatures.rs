@@ -21,7 +21,7 @@
 
 use biara_ir_compat::{
     module::Module,
-    types::{AnyType, AnyTypeEnum},
+    types::{AnyType, AnyTypeEnum, BasicType},
     values::AsValueRef,
 };
 
@@ -158,12 +158,18 @@ pub fn summarize(
         // A function without a guest address is not a lifted unit.
         let Some(entry) = entry_of(f) else { continue };
         let params: Vec<AbiTy> = f
-            .get_params()
+            .get_type()
+            .get_param_types()
             .iter()
             .enumerate()
             .map(|(i, p)| {
                 evidence_ty(
-                    param_ty(p.get_type().as_any_type_enum(), entry, i as u32, layouts),
+                    param_ty(
+                        AnyTypeEnum::from_ir(p.get_context(), &p.to_ir()),
+                        entry,
+                        i as u32,
+                        layouts,
+                    ),
                     abi_kind(f, i as u32),
                 )
             })
@@ -326,6 +332,7 @@ fn param_ty(
         AnyTypeEnum::FloatType(t) if t.get_bit_width() == 32 => AbiTy::F32,
         AnyTypeEnum::FloatType(t) if t.get_bit_width() == 64 => AbiTy::F64,
         AnyTypeEnum::PointerType(_) => AbiTy::Ptr { layout },
+        vector @ AnyTypeEnum::VectorType(_) => field_ty(vector),
         _ => AbiTy::RawWord,
     }
 }

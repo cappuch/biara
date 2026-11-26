@@ -181,6 +181,8 @@ pub enum Type {
     Void,
     /// `i1`, `i8`, `i16`, `i32`, `i64`, `i128`.
     Int(u32),
+    /// IEEE floating-point scalar, used at native ABI boundaries.
+    Float(u32),
     Ptr,
     Array(Box<Type>, u64),
     Struct(Vec<Type>),
@@ -445,6 +447,7 @@ pub struct FuncAttrs {
     pub memory: Option<MemoryEffect>,
     /// `biara.c_type` on a parameter, or `biara.c_return`.
     pub c_type: Option<String>,
+    pub c_params: std::collections::BTreeMap<u32, String>,
     pub c_return: Option<String>,
     /// `!biara.entry`: the guest address this function lifts.
     pub entry_addr: Option<u64>,

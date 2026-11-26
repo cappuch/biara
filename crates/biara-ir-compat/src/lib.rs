@@ -247,11 +247,12 @@ impl Context {
     pub fn create_string_attribute(
         &self,
         kind: impl Into<String>,
-        _value: &str,
+        value: &str,
     ) -> attributes::Attribute {
         attributes::Attribute {
             kind: Box::leak(kind.into().into_boxed_str()),
             value: 0,
+            string: Some(self.intern_str(value.to_owned())),
         }
     }
 
@@ -273,6 +274,7 @@ impl Context {
         attributes::Attribute {
             kind: Box::leak(kind.into().into_boxed_str()),
             value,
+            string: None,
         }
     }
 

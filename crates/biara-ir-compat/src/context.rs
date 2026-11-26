@@ -110,11 +110,12 @@ impl<'ctx> ContextRef<'ctx> {
     pub fn create_string_attribute(
         &self,
         kind: impl Into<String>,
-        _value: &str,
+        value: &str,
     ) -> crate::attributes::Attribute {
         crate::attributes::Attribute {
             kind: Box::leak(kind.into().into_boxed_str()),
             value: 0,
+            string: Some(self.0.intern_str(value.to_owned())),
         }
     }
 
@@ -135,6 +136,7 @@ impl<'ctx> ContextRef<'ctx> {
         crate::attributes::Attribute {
             kind: Box::leak(kind.into_boxed_str()),
             value,
+            string: None,
         }
     }
 }

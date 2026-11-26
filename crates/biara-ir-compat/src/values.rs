@@ -628,6 +628,7 @@ impl<'ctx> FunctionValue<'ctx> {
                 crate::attributes::AttributeLoc::Function => match attr.kind {
                     "noalias" => {}
                     "noreturn" => f.attrs.noreturn = true,
+                    "biara.c_return" => f.attrs.c_return = attr.string.map(str::to_owned),
                     "memory" => {
                         let v = attr.value;
                         f.attrs.memory = Some(biara_ir::MemoryEffect {
@@ -642,6 +643,11 @@ impl<'ctx> FunctionValue<'ctx> {
                 crate::attributes::AttributeLoc::Param(i) => match attr.kind {
                     "noalias" => {
                         f.attrs.noalias_params.insert(i);
+                    }
+                    "biara.c_type" => {
+                        if let Some(spelling) = attr.string {
+                            f.attrs.c_params.insert(i, spelling.to_owned());
+                        }
                     }
                     "captures" => {
                         f.attrs.nocapture_params.insert(i);
@@ -712,8 +718,10 @@ impl<'ctx> FunctionValue<'ctx> {
                 (crate::attributes::AttributeLoc::Function, "biara.c_return") => {
                     f.attrs.c_return.clone()
                 }
-                (crate::attributes::AttributeLoc::Param(_), "biara.c_type") => {
-                    f.attrs.c_type.clone()
+                (crate::attributes::AttributeLoc::Param(i), "biara.c_type") => {
+                    f.attrs.c_params.get(i).cloned().or_else(|| {
+                        (f.params.len() == 1 && *i == 0).then(|| f.attrs.c_type.clone()).flatten()
+                    })
                 }
                 _ => None,
             }?;
@@ -753,6 +761,7 @@ impl<'ctx> FunctionValue<'ctx> {
             Some(crate::attributes::Attribute {
                 kind: Box::leak(String::from(kind).into_boxed_str()),
                 value: v,
+                string: None,
             })
         })
     }

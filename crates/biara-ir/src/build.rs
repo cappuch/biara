@@ -321,7 +321,7 @@ impl Builder {
 /// Size in bytes of a type, for the default alignment.
 pub fn ty_bytes(t: &Type) -> u32 {
     match t {
-        Type::Int(w) => (w.div_ceil(8)).max(1),
+        Type::Int(w) | Type::Float(w) => (w.div_ceil(8)).max(1),
         Type::Ptr => 8,
         Type::Array(e, n) => ty_bytes(e) * (*n as u32),
         Type::Struct(fields) => fields.iter().map(ty_bytes).sum(),

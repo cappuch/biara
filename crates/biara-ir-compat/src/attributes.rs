@@ -13,6 +13,7 @@ pub enum AttributeLoc {
 pub struct Attribute {
     pub(crate) kind: &'static str,
     pub(crate) value: u64,
+    pub(crate) string: Option<&'static str>,
 }
 
 impl Attribute {
@@ -35,6 +36,6 @@ impl Attribute {
     }
 
     pub fn get_string_value(&self) -> Option<crate::values::StringRef> {
-        None
+        self.string.map(crate::values::StringRef)
     }
 }
