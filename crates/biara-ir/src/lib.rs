@@ -453,8 +453,12 @@ pub struct FuncAttrs {
     pub entry_addr: Option<u64>,
     /// `!biara.callee`: the guest address a declaration stands for.
     pub callee_addr: Option<u64>,
-    /// `!biara.present`: presentation ordinal.
+    /// `!biara.present`: presentation ordinal for a selected function.
     pub present: Option<u64>,
+    /// An empty `!biara.present` excludes the function from presentation.
+    pub omit_from_presentation: bool,
+    /// Unambiguous source names keyed by the entry register.
+    pub debug_param_names: std::collections::BTreeMap<String, String>,
     /// The `!biara.os` tag.
     pub os: Option<u32>,
     /// Per-formal ABI kinds (`biara.abi.args`), in formal order.
@@ -783,58 +787,71 @@ pub fn inst_ty(i: &Inst, f: &Function) -> Type {
 
 /// Iterate the value operands of an instruction.
 pub fn operands(i: &Inst) -> impl Iterator<Item = ValueId> + '_ {
-    let v: Vec<ValueId> = match i {
-        Inst::Bin { lhs, rhs, .. } | Inst::Icmp { lhs, rhs, .. } => vec![*lhs, *rhs],
-        Inst::Un { value, .. } => vec![*value],
-        Inst::Rot { value, amount, .. } => vec![*value, *amount],
-        Inst::Fence => Vec::new(),
-        Inst::Select { cond, yes, no, .. } => vec![*cond, *yes, *no],
-        Inst::Trunc { value, .. }
+    let mut args: &[ValueId] = &[];
+    let mut incoming: &[(ValueId, BlockId)] = &[];
+    let head = match *i {
+        Inst::Bin { lhs, rhs, .. } | Inst::Icmp { lhs, rhs, .. } => [Some(lhs), Some(rhs), None],
+        Inst::Rot { value, amount, .. } => [Some(value), Some(amount), None],
+        Inst::Select { cond, yes, no, .. } => [Some(cond), Some(yes), Some(no)],
+        Inst::Un { value, .. }
+        | Inst::Trunc { value, .. }
         | Inst::Zext { value, .. }
         | Inst::Sext { value, .. }
         | Inst::Cast { value, .. }
-        | Inst::Freeze { value, .. } => vec![*value],
-        Inst::Alloca { .. } | Inst::Marker { .. } => Vec::new(),
-        Inst::Load { ptr, .. } => vec![*ptr],
-        Inst::Store { value, ptr, .. } => vec![*value, *ptr],
-        Inst::Gep { base, .. } => vec![*base],
-        Inst::Call { callee, args, .. } => {
-            let mut v = vec![*callee];
-            v.extend(args.iter().copied());
-            v
+        | Inst::Freeze { value, .. } => [Some(value), None, None],
+        Inst::Alloca { .. } | Inst::Marker { .. } | Inst::Fence => [None; 3],
+        Inst::Load { ptr, .. } => [Some(ptr), None, None],
+        Inst::Store { value, ptr, .. } => [Some(value), Some(ptr), None],
+        Inst::Gep { base, .. } => [Some(base), None, None],
+        Inst::Call { callee, args: ref values, .. } => {
+            args = values;
+            [Some(callee), None, None]
         }
-        Inst::Phi { incoming, .. } => incoming.iter().map(|(v, _)| *v).collect(),
-        Inst::ExtractValue { agg, .. } => vec![*agg],
-        Inst::InsertValue { agg, value, .. } => vec![*agg, *value],
+        Inst::Phi { incoming: ref edges, .. } => {
+            incoming = edges;
+            [None; 3]
+        }
+        Inst::ExtractValue { agg, .. } => [Some(agg), None, None],
+        Inst::InsertValue { agg, value, .. } => [Some(agg), Some(value), None],
     };
-    v.into_iter()
+    head.into_iter()
+        .flatten()
+        .chain(args.iter().copied())
+        .chain(incoming.iter().map(|&(value, _)| value))
 }
 
-pub fn operands_mut(i: &mut Inst) -> Vec<&mut ValueId> {
-    match i {
-        Inst::Bin { lhs, rhs, .. } | Inst::Icmp { lhs, rhs, .. } => vec![lhs, rhs],
-        Inst::Un { value, .. } => vec![value],
-        Inst::Rot { value, amount, .. } => vec![value, amount],
-        Inst::Fence => Vec::new(),
-        Inst::Select { cond, yes, no, .. } => vec![cond, yes, no],
+pub fn operands_mut(i: &mut Inst) -> impl Iterator<Item = &mut ValueId> {
+    let mut args: &mut [ValueId] = &mut [];
+    let mut incoming: &mut [(ValueId, BlockId)] = &mut [];
+    let head = match i {
+        Inst::Bin { lhs, rhs, .. } | Inst::Icmp { lhs, rhs, .. } => [Some(lhs), Some(rhs), None],
+        Inst::Un { value, .. } => [Some(value), None, None],
+        Inst::Rot { value, amount, .. } => [Some(value), Some(amount), None],
+        Inst::Select { cond, yes, no, .. } => [Some(cond), Some(yes), Some(no)],
         Inst::Trunc { value, .. }
         | Inst::Zext { value, .. }
         | Inst::Sext { value, .. }
         | Inst::Cast { value, .. }
-        | Inst::Freeze { value, .. } => vec![value],
-        Inst::Alloca { .. } | Inst::Marker { .. } => Vec::new(),
-        Inst::Load { ptr, .. } => vec![ptr],
-        Inst::Store { value, ptr, .. } => vec![value, ptr],
-        Inst::Gep { base, .. } => vec![base],
-        Inst::Call { callee, args, .. } => {
-            let mut v: Vec<&mut ValueId> = vec![callee];
-            v.extend(args.iter_mut());
-            v
+        | Inst::Freeze { value, .. } => [Some(value), None, None],
+        Inst::Alloca { .. } | Inst::Marker { .. } | Inst::Fence => [None, None, None],
+        Inst::Load { ptr, .. } => [Some(ptr), None, None],
+        Inst::Store { value, ptr, .. } => [Some(value), Some(ptr), None],
+        Inst::Gep { base, .. } => [Some(base), None, None],
+        Inst::Call { callee, args: values, .. } => {
+            args = values;
+            [Some(callee), None, None]
         }
-        Inst::Phi { incoming, .. } => incoming.iter_mut().map(|(v, _)| v).collect(),
-        Inst::ExtractValue { agg, .. } => vec![agg],
-        Inst::InsertValue { agg, value, .. } => vec![agg, value],
-    }
+        Inst::Phi { incoming: edges, .. } => {
+            incoming = edges;
+            [None, None, None]
+        }
+        Inst::ExtractValue { agg, .. } => [Some(agg), None, None],
+        Inst::InsertValue { agg, value, .. } => [Some(agg), Some(value), None],
+    };
+    head.into_iter()
+        .flatten()
+        .chain(args.iter_mut())
+        .chain(incoming.iter_mut().map(|(value, _)| value))
 }
 
 pub fn term_operands(t: &Terminator) -> Vec<ValueId> {

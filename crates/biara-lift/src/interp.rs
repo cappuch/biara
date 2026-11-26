@@ -49,11 +49,16 @@ fn x86_carry(dst: u64, src1: u64, src2: u64, op: u32) -> u64 {
         1 | 3 => dst,
         4..=7 => u64::from(src1 != 0),
         8..=11 => u64::from(result < operand),
-        12..=15 => u64::from(u128::from(result) < with_carry),
+        12..=14 => u64::from(u128::from(result) < with_carry),
+        15 => u64::from(if src2 != 0 { dst <= src1 } else { dst < src1 }),
         16..=19 => u64::from((result.wrapping_add(operand) & mask) < operand),
-        20..=23 => {
+        20..=22 => {
             let minuend = result.wrapping_add(with_carry as u64) & mask;
             u64::from(u128::from(minuend) < with_carry)
+        }
+        23 => {
+            let minuend = dst.wrapping_add(src1).wrapping_add(src2);
+            u64::from(if src2 != 0 { minuend <= src1 } else { minuend < src1 })
         }
         28..=35 => src1,
         36..=39 => operand >> (width - 1),

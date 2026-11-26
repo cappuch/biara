@@ -40,9 +40,8 @@
 //! Names: arguments default to neutral `arg0...` (the architectural name is
 //! kept in `names[].original` from the IR parameter name), values to neutral
 //! `vN` except justified producer names (`<callee>_result`, evidence
-//! `inferred`). `!biara.debug_name` is not part of `biara_ir`; no argument
-//! debug renaming is applied, so every non-producer name stays `unknown`
-//! (or `symbol` when the final name preserves a non-architectural symbol).
+//! `inferred`). Unique source bindings for entry registers have evidence
+//! `debug` and retain the original architectural name in the report.
 //! Frame fields from `!biara.debug_objects` are not modelled either.
 //!
 //! Types: every address is reduced to a root plus a constant offset (through
@@ -1509,7 +1508,12 @@ impl<'m, 'a, 'b> Emitter<'m, 'a, 'b> {
                 Value::Param { name, .. } => name.clone(),
                 _ => String::new(),
             };
-            self.declare_name(p, &format!("arg{}", i), original);
+            if let Some(debug_name) = f.attrs.debug_param_names.get(&original) {
+                self.declare_name(p, debug_name, original);
+                self.name_evidence.insert(p, "debug");
+            } else {
+                self.declare_name(p, &format!("arg{}", i), original);
+            }
         }
     }
 
@@ -4688,14 +4692,32 @@ impl<'m, 'a, 'b> Emitter<'m, 'a, 'b> {
 /// the emitted C must define it, or the program cannot link.
 const CC_COMPUTE_C: &str = "\
 #ifndef helper_cc_compute_c
-uint64_t helper_cc_compute_c(uint64_t a, uint64_t b, uint64_t dst, uint32_t op) {
-    /* CC_OP_EFLAGS reads the stored flags; add/sub/logic derive carry from
-     * operands, matching QEMU's helper_cc_compute_c. */
+uint64_t helper_cc_compute_c(uint64_t dst, uint64_t src1, uint64_t src2, uint32_t op) {
+    uint32_t width = 8U << (op & 3);
+    uint64_t mask = UINT64_MAX >> (64U - width);
+    uint64_t result = dst & mask;
+    uint64_t operand = src1 & mask;
+    unsigned __int128 with_carry = (unsigned __int128)operand + (src2 & mask);
     switch (op) {
-    case 0: return dst & 1;
-    case 5: case 6: case 7: case 8: return (a + b) < a;
-    case 9: case 10: case 11: case 12: return a < b;
-    case 13: case 14: case 15: case 16: return 0;
+    case 0: case 2: case 40: case 41: case 42: case 43: return src1 & 1;
+    case 1: case 3: return dst;
+    case 4: case 5: case 6: case 7: return src1 != 0;
+    case 8: case 9: case 10: case 11: return result < operand;
+    case 12: case 13: case 14: return result < with_carry;
+    case 15: return src2 ? dst <= src1 : dst < src1;
+    case 16: case 17: case 18: case 19: return ((result + operand) & mask) < operand;
+    case 20: case 21: case 22:
+        return ((result + (uint64_t)with_carry) & mask) < with_carry;
+    case 23: {
+        uint64_t minuend = dst + src1 + src2;
+        return src2 ? minuend <= src1 : minuend < src1;
+    }
+    case 28: case 29: case 30: case 31:
+    case 32: case 33: case 34: case 35: return src1;
+    case 36: case 37: case 38: case 39: return operand >> (width - 1);
+    case 44: case 45: case 46: case 47: return operand == 0;
+    case 48: case 49: case 50: case 51: return operand != 0;
+    case 58: case 59: return dst & 1;
     default: return 0;
     }
 }
@@ -5550,7 +5572,7 @@ impl<'m, 'a, 'b> Emitter<'m, 'a, 'b> {
             .module
             .functions
             .iter()
-            .any(|f| f.attrs.present.is_some());
+            .any(|f| f.attrs.present.is_some() || f.attrs.omit_from_presentation);
         let mut functions: Vec<usize> = self
             .module
             .functions

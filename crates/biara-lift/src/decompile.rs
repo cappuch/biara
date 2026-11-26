@@ -385,21 +385,25 @@ fn guest_strings(
     // chosen by a branch, a table of messages): any pointer-width constant
     // operand that reads as a string. Only used strings are emitted, so
     // extras only cost reads.
-    for f in module.get_functions() {
-        for bb in f.get_basic_blocks() {
-            for inst in bb.get_instructions() {
-                for op in inst.get_operands() {
-                    if let Some(biara_ir_compat::values::Operand::Value(BasicValueEnum::IntValue(v))) = op {
-                        if v.get_type().get_bit_width() != ptr_bits {
-                            continue;
-                        }
-                        if let Some(a) = v.get_zero_extended_constant() {
-                            try_addr(a);
-                        }
+    let addresses = module.update(|m| {
+        let mut addresses = Vec::new();
+        for function in &m.module.functions {
+            for &id in function.blocks.iter().flat_map(|block| &block.insts) {
+                let Some(inst) = function.inst(id) else { continue };
+                for operand in biara_ir::operands(inst) {
+                    if let Some(biara_ir::Constant::Int { bits, width }) = function.constant(operand)
+                        && *width == ptr_bits
+                        && let Ok(address) = u64::try_from(*bits)
+                    {
+                        addresses.push(address);
                     }
                 }
             }
         }
+        addresses
+    });
+    for address in addresses {
+        try_addr(address);
     }
     (out, protos)
 }
@@ -1349,52 +1353,25 @@ fn prepare_c_with<'ctx>(
                 cx.get_kind_id("biara.callee"),
             );
     }
-    // Tag actual ABI-form guest identities, before display sanitization and
-    // scalar passes. Generated dispatchers and import declarations stay untagged.
-    let entries: BTreeMap<_, _> = names
-        .into_iter()
-        .filter(|(_, name)| {
-            module
-                .get_function(name)
-                .is_some_and(|f| f.count_basic_blocks() != 0)
-        })
-        .collect();
-    // MetadataAsValue unwraps single-scalar tuples. A version operand keeps
-    // these global attachments as MDNodes, as LLVMGlobalSetMetadata requires.
-    for (&entry, name) in &entries {
+    // ABI lowering assigns each guest definition its entry address.
+    let os = match cfg.os {
+        "linux" => 1,
+        "darwin" => 2,
+        "windows" => 3,
+        _ => 0,
+    };
+    let entries = module.update(|module| {
         module
-            .get_function(name)
-            .unwrap()
-            .as_global_value()
-            .set_metadata(
-                cx.metadata_node(&[
-                    cx.i64_type().const_int(entry, false).into(),
-                    cx.i32_type().const_int(1, false).into(),
-                ]),
-                cx.get_kind_id("biara.entry"),
-            );
-        module
-            .get_function(name)
-            .unwrap()
-            .as_global_value()
-            .set_metadata(
-                cx.metadata_node(&[
-                    cx.i32_type()
-                        .const_int(
-                            match cfg.os {
-                                "linux" => 1,
-                                "darwin" => 2,
-                                "windows" => 3,
-                                _ => 0,
-                            },
-                            false,
-                        )
-                        .into(),
-                    cx.i32_type().const_int(1, false).into(),
-                ]),
-                cx.get_kind_id("biara.os"),
-            );
-    }
+            .module
+            .functions
+            .iter_mut()
+            .filter_map(|function| {
+                let entry = function.attrs.entry_addr?;
+                function.attrs.os = Some(os);
+                Some((entry, function.name.clone()))
+            })
+            .collect()
+    });
 
     // Names in the CPU state: every global in env.
     let cpu: Vec<(i64, u32, String)> = info
@@ -2028,76 +2005,49 @@ impl<'ctx> TransformedC<'ctx> {
     /// Select analysis bodies only, in the supplied root/context order.
     /// Code and call declarations remain intact for faithful C rendering.
     pub fn select_functions(&mut self, entries: &[u64]) {
-        let cx = self.module.get_context();
-        let kind = cx.get_kind_id("biara.present");
-        for name in self.entries.values() {
-            self.module
-                .get_function(name)
-                .unwrap()
-                .as_global_value()
-                .set_metadata(cx.metadata_node(&[]), kind);
+        let mut order = BTreeMap::new();
+        for (index, &entry) in entries.iter().enumerate() {
+            order.entry(entry).or_insert(index as u64);
         }
-        let mut seen = BTreeSet::new();
-        for (order, entry) in entries.iter().enumerate() {
-            if !seen.insert(entry) {
-                continue;
+        self.module.update(|module| {
+            for function in &mut module.module.functions {
+                if let Some(entry) = function.attrs.entry_addr {
+                    function.attrs.present = order.get(&entry).copied();
+                    function.attrs.omit_from_presentation = function.attrs.present.is_none();
+                }
             }
-            if let Some(f) = self
-                .entries
-                .get(entry)
-                .and_then(|name| self.module.get_function(name))
-            {
-                f.as_global_value().set_metadata(
-                    cx.metadata_node(&[
-                        cx.i64_type().const_int(order as u64, false).into(),
-                        cx.i32_type().const_int(1, false).into(),
-                    ]),
-                    kind,
-                );
-            }
-        }
+        });
     }
 
-    /// Annotate unique entry-register bindings; do not rename LLVM values or
-    /// alter signatures. The renderer preserves original names as evidence.
+    /// Attach source names for unique entry-register bindings.
     pub fn apply_debug_names(&mut self, names: &[DebugName]) {
-        let cx = self.module.get_context();
-        let kind = cx.get_kind_id("biara.debug_name");
-        for (&entry, symbol) in &self.entries {
-            let mut bindings: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
-            let mut used: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
-            for n in names
-                .iter()
-                .filter(|n| n.function == entry && !n.name.is_empty())
-            {
-                bindings.entry(&n.register).or_default().insert(&n.name);
-                used.entry(&n.name).or_default().insert(&n.register);
-            }
-            let nodes: Vec<_> = bindings
-                .into_iter()
-                .filter_map(|(reg, names)| {
-                    if names.len() != 1 {
-                        return None;
-                    }
-                    let name = names.into_iter().next().unwrap();
-                    if used[name].len() != 1 {
-                        return None;
-                    }
-                    Some(
-                        cx.metadata_node(&[
-                            cx.metadata_string(reg).into(),
-                            cx.metadata_string(name).into(),
-                        ])
-                        .into(),
-                    )
-                })
-                .collect();
-            self.module
-                .get_function(symbol)
-                .unwrap()
-                .as_global_value()
-                .set_metadata(cx.metadata_node(&nodes), kind);
+        let mut by_entry: BTreeMap<u64, Vec<&DebugName>> = BTreeMap::new();
+        for name in names.iter().filter(|name| !name.name.is_empty()) {
+            by_entry.entry(name.function).or_default().push(name);
         }
+        self.module.update(|module| {
+            for function in &mut module.module.functions {
+                function.attrs.debug_param_names.clear();
+                let Some(names) = function.attrs.entry_addr.and_then(|entry| by_entry.get(&entry))
+                else {
+                    continue;
+                };
+                let mut bindings: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+                let mut registers: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+                for name in names {
+                    bindings.entry(&name.register).or_default().insert(&name.name);
+                    registers.entry(&name.name).or_default().insert(&name.register);
+                }
+                for (register, names) in bindings {
+                    if let Some(&name) = names.first()
+                        && names.len() == 1
+                        && registers[name].len() == 1
+                    {
+                        function.attrs.debug_param_names.insert(register.into(), name.into());
+                    }
+                }
+            }
+        });
     }
 
     /// Supply range-specific declared objects. The renderer requires an exact
