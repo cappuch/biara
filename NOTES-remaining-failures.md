@@ -3,8 +3,14 @@
 State of the tree when this was written: `HEAD = db46187`, working tree clean,
 `cargo build --workspace` succeeds with 0 errors.
 
-Start with §1 if you only read one section. §2 is the blocking defect and the
-one worth fixing first. §3 and §4 are the other two, independent.
+Start with §1 if you only read one section. §2 is the one worth fixing first.
+§3 and §4 are the other two, independent.
+
+**Status:** a fix for the `get_operand` half of the compat layer is in the
+working tree and is being gated on aarch64 as this was written. It replaces
+`get_operand`'s own instruction search with a call to `resolve_inst`, which is
+the version that checks the stated owner actually lists the id. That fix alone
+made `tail` pass where two earlier attempts had broken it.
 
 ---
 
@@ -59,10 +65,86 @@ behaviour from `--emit llvm` output has misled every attempt so far.
 
 ---
 
-## 2. BLOCKING: instruction handles carry the wrong owning function
+## 2. audit: `args[1]` (the buffer pointer) is `Arg::Unknown`
 
-This is the defect to fix first. It is the reason `audit` fails, and it is the
-reason a previous attempt to fix `audit` had to be reverted (see §5).
+**Correction.** An earlier revision of this file claimed the analysis modules
+were malformed — that functions referenced value ids from other functions'
+arenas. That was wrong. It came from reading a stale `/tmp` dump, and from
+confusing two different modules. Both are explained below; do not repeat that
+mistake.
+
+### The two modules, and why they are easy to confuse
+
+Two separate `lift_with` calls produce modules that both reach
+`CallSites::collect_unindexed`:
+
+1. `crates/biara-lift/src/calls.rs` — module name `"calls"`, built with
+   `abis: Some(...)` and `only: batch` (31 entries for the audit corpus).
+   `CallSites::add` drives this one. **This is the module `audit.rs` asserts
+   on.** Every one of its 31 functions gets a body (`sub_1a10` has 6 blocks).
+2. `crates/biara-lift/src/tables.rs` — module name `"targets"`, built with
+   `abis: None` and `only: pending`, then `calls.collect(&module)` on it.
+   For the audit corpus `pending` holds very few entries, so this module has
+   ~32 functions of which only 3 have bodies.
+
+Both write `BIARA_DUMP_ANALYSIS_IR` to the same path, so the file you get is
+whichever ran last — and the `"targets"` one is nearly empty. Reading it and
+concluding the lifter was dropping bodies cost a long detour.
+
+Verified: `lift_with` returns 31 functions **all with bodies** for the `"calls"`
+module, and `memory::simplify` does not change that (measured: 33 with blocks
+before, 33 after). The printer, the verifier and `dce` are all innocent.
+
+### Actual state of the `audit` failure
+
+With the `operand` fix now in the tree, `read(0, buf, 64)` resolves as:
+
+- `args[0]` → `Const(0)`  ✅ (was `Unknown`)
+- `args[1]` → `Unknown`   ❌ (needs `Arg::Stack(o)` with `o <= -16`)
+- `args[2]` → `Const(64)` ✅ (was `Unknown`)
+
+So `audit.rs:87` is the only remaining assertion.
+
+`args[1]` is the buffer pointer. In the `"calls"` module for `sub_1a10`:
+
+```llvm
+%v31 = load i64, ptr %v173        ; entry rsp
+%v52 = add i64 %v31, -8
+%v66 = add i64 %v52, -16          ; = rsp - 24, the buffer
+%v113 = store i64 %v66, ptr %v37  ; %v37 = gep %v0, 48 = rsi home
+%v118 = call void @sub_2180(%v0)  ; the read() call
+```
+
+`reaching_store(call, 48)` does find `%v113` and does hand back `%v66`
+(confirmed by instrumentation: correct id, opcode `Add`). The failure is in
+folding `%v66` to `Sym::Reg(rsp, -24)` / `Arg::Stack(-24)`. Instrumentation
+showed `fx.symbolic(%v66)` returning `None` while `symbolic` on the *inner*
+`add %v31, -8` succeeded — so the chain breaks at one link. Next step: run
+`symbolic_at` on `%v66` specifically and print which sub-step returns `None`.
+Likely suspects: `entry_loads` lookup for `%v31`, or the `constant(1)` helper
+for the `-16` literal.
+
+### Why the previous attempt was reverted (still relevant)
+
+`db46187` reverted `0e57599`, which had widened the `listed` closure inside
+`InstructionValue::operand` to accept constants. That change broke aarch64
+from 18/18 to 1/17. Bisect: `tail` passes at `a725eb6`, fails at `0e57599`;
+reverting `is_const` alone still failed; reverting `listed` as well made it
+pass. Narrowing to `Value::Const` did not help either.
+
+**The fix that works instead**, and is in the tree now: `operand` uses
+`self.func` whenever that function's arena contains `id`
+(`(id.0 as usize) < f.values.len()`), leaving `listed` untouched. This is
+sound because `operand` is only ever called with ids from
+`biara_ir::operands(inst)`, which belong to the instruction's own function.
+
+---
+
+## 2b. Symptom: instruction handles carry the wrong owning function
+
+Everything below describes a real but secondary defect. Fix it only after §2's
+malformation is resolved, because a wrong owner is what *makes* a leaked id
+resolve to something plausible instead of failing loudly.
 
 ### Symptom
 
