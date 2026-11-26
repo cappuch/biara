@@ -1329,32 +1329,27 @@ fn prepare_c_with<'ctx>(
             }
         }
     }
-    // Callees that are declarations (outside the selection, or PLT stubs) keep their guest
-    // address in `!biara.callee`, never `!biara.entry`: carriers of that are emitted as
-    // definitions, but the renderer's symbol table still needs the address so a client can
-    // navigate from a call to its target.
-    let callees: Vec<(u64, String)> = names
+    // Keep known guest addresses on declarations for navigating calls
+    // outside the presentation selection.
+    let callee_entries: BTreeMap<_, _> = names
         .iter()
-        .filter(|(_, name)| {
-            module
-                .get_function(name)
-                .is_some_and(|f| f.count_basic_blocks() == 0)
-        })
-        .map(|(&entry, name)| (entry, name.clone()))
+        .map(|(&entry, name)| (name.as_str(), entry))
         .collect();
-    for (entry, name) in &callees {
-        module
-            .get_function(name)
-            .unwrap()
-            .as_global_value()
-            .set_metadata(
-                cx.metadata_node(&[
-                    cx.i64_type().const_int(*entry, false).into(),
-                    cx.i32_type().const_int(1, false).into(),
-                ]),
-                cx.get_kind_id("biara.callee"),
-            );
-    }
+    module.update(|module| {
+        for declaration in &mut module.module.decls {
+            if let Some(&entry) = callee_entries.get(declaration.name.as_str()) {
+                declaration.attrs.callee_addr = Some(entry);
+            }
+        }
+        for function in &mut module.module.functions {
+            if function.entry.is_none()
+                && function.blocks.is_empty()
+                && let Some(&entry) = callee_entries.get(function.name.as_str())
+            {
+                function.attrs.callee_addr = Some(entry);
+            }
+        }
+    });
     // ABI lowering assigns each guest definition its entry address.
     let os = match cfg.os {
         "linux" => 1,

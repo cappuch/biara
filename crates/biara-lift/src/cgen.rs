@@ -1895,7 +1895,32 @@ impl<'m, 'a, 'b> Emitter<'m, 'a, 'b> {
         let Root::Value(rv) = b.root else {
             unreachable!()
         };
-        let is_ptr = matches!(f.ty(rv), Type::Ptr);
+        let declared = match f.value(rv) {
+            Value::Param { index, .. } => {
+                self.declared_param(&f.attrs, f.params.len(), *index as usize)
+            }
+            _ => None,
+        };
+        let pointee = declared
+            .as_deref()
+            .and_then(|spelling| spelling.trim().strip_suffix('*'))
+            .map(str::trim_end);
+        if let Some(pointee) = pointee
+            && let Some(field) = self
+                .opts
+                .layouts
+                .layouts
+                .iter()
+                .find(|layout| layout.name == pointee)
+                .and_then(|layout| {
+                    layout.fields.iter().find(|field| {
+                        field.off == b.off && field.bytes == bytes && uint_ty(bytes * 8) == raw
+                    })
+                })
+        {
+            let member = field.name.clone();
+            return (format!("{}->{member}", self.val(f, rv)), raw);
+        }
         let p = self.val(f, rv);
         let off = if b.off == 0 {
             String::new()
@@ -1904,7 +1929,12 @@ impl<'m, 'a, 'b> Emitter<'m, 'a, 'b> {
         } else {
             format!(" + {}", hexv(b.off as u64))
         };
-        if is_ptr {
+        if pointee.is_some() || matches!(f.ty(rv), Type::Ptr) {
+            let p = if b.off != 0 && pointee.is_some_and(|ty| ty != "uint8_t") {
+                format!("((uint8_t *)({p}))")
+            } else {
+                p
+            };
             (
                 format!("*({} *)({}{})", raw, p, off),
                 raw,
@@ -5601,6 +5631,11 @@ impl<'m, 'a, 'b> Emitter<'m, 'a, 'b> {
                 if let Some(c) = d.attrs.callee_addr {
                     self.emitted_functions.entry(name).or_insert(c);
                 }
+            }
+        }
+        for (name, declaration) in &declarations {
+            if let Some(entry) = declaration.attrs.callee_addr {
+                self.emitted_functions.entry(name.clone()).or_insert(entry);
             }
         }
         for d in &self.data {
