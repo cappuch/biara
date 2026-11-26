@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use biara_tcg::TempId;
-use inkwell::{
+use biara_ir_compat::{
     AtomicOrdering,
     basic_block::BasicBlock,
     values::{BasicValueEnum, FunctionValue, InstructionOpcode, InstructionValue, Operand},

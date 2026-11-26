@@ -19,21 +19,11 @@
 //! deterministic module order. Results are owned serde data: no LLVM
 //! references escape.
 
-use inkwell::{
+use biara_ir_compat::{
     module::Module,
     types::{AnyType, AnyTypeEnum},
     values::AsValueRef,
 };
-
-unsafe extern "C" {
-    fn biara_layouts_entry(function: *mut std::ffi::c_void, entry: *mut u64) -> std::ffi::c_int;
-    fn biara_layouts_u32_metadata(
-        function: *mut std::ffi::c_void,
-        key: *const std::ffi::c_char,
-        index: u32,
-        value: *mut u32,
-    ) -> std::ffi::c_int;
-}
 
 /// How a typed summary result travels back to the caller.
 ///
@@ -165,10 +155,8 @@ pub fn summarize(
         if f.count_basic_blocks() == 0 {
             continue;
         }
-        let mut entry = 0;
-        if unsafe { biara_layouts_entry(f.as_value_ref().cast(), &mut entry) } == 0 {
-            continue;
-        };
+        // A function without a guest address is not a lifted unit.
+        let Some(entry) = entry_of(f) else { continue };
         let params: Vec<AbiTy> = f
             .get_params()
             .iter()
@@ -176,7 +164,7 @@ pub fn summarize(
             .map(|(i, p)| {
                 evidence_ty(
                     param_ty(p.get_type().as_any_type_enum(), entry, i as u32, layouts),
-                    abi_metadata(f, c"biara.abi.args", i as u32),
+                    abi_kind(f, i as u32),
                 )
             })
             .collect();
@@ -190,7 +178,7 @@ pub fn summarize(
             .get_type()
             .get_return_type()
             .map_or((AbiResult::Void, RetClass::Direct), result_ty);
-        let result_slot = |ty, i| evidence_ty(ty, abi_metadata(f, c"biara.abi.rets", i));
+        let result_slot = |ty, i| evidence_ty(ty, abi_ret_kind(f, i));
         result = match result {
             AbiResult::Void => AbiResult::Void,
             AbiResult::One(ty) => AbiResult::One(result_slot(ty, 0)),
@@ -203,7 +191,7 @@ pub fn summarize(
                     .collect(),
             ),
         };
-        if abi_metadata(f, c"biara.abi.ret_class", 0) == Some(2) {
+        if f.attrs().abi_ret_class == Some(2) {
             ret_class = RetClass::Memory;
         }
         if matches!(result, AbiResult::One(AbiTy::I64 | AbiTy::Ptr { .. }))
@@ -230,21 +218,27 @@ pub fn summarize(
     }
     Ok(out)
 }
-fn abi_metadata(
-    function: inkwell::values::FunctionValue<'_>,
-    key: &std::ffi::CStr,
-    index: u32,
-) -> Option<u32> {
-    let mut value = 0;
-    (unsafe {
-        biara_layouts_u32_metadata(
-            function.as_value_ref().cast(),
-            key.as_ptr(),
-            index,
-            &mut value,
-        )
-    } != 0)
-        .then_some(value)
+/// The guest address a function lifts, from its IR attributes.
+fn entry_of(function: biara_ir_compat::values::FunctionValue<'_>) -> Option<u64> {
+    function.attrs().entry_addr
+}
+
+/// The ABI kind recorded for result slot `index` by the ABI form.
+fn abi_ret_kind(function: biara_ir_compat::values::FunctionValue<'_>, index: u32) -> Option<u32> {
+    function
+        .attrs()
+        .abi_ret_kinds
+        .get(index as usize)
+        .copied()
+}
+
+/// The ABI kind recorded for formal `index` by the ABI form.
+fn abi_kind(function: biara_ir_compat::values::FunctionValue<'_>, index: u32) -> Option<u32> {
+    function
+        .attrs()
+        .abi_arg_kinds
+        .get(index as usize)
+        .copied()
 }
 
 // Declared-type attribute names (see annotations `CType::spelling` and
@@ -257,8 +251,8 @@ pub const DECLARED_RETURN_ATTR: &str = "biara.c_return";
 
 /// Canonical declared C spelling per LLVM parameter, in order (empty
 /// where the parameter carries no `biara.c_type` attribute).
-fn declared_params(function: inkwell::values::FunctionValue<'_>) -> Vec<String> {
-    use inkwell::attributes::AttributeLoc;
+fn declared_params(function: biara_ir_compat::values::FunctionValue<'_>) -> Vec<String> {
+    use biara_ir_compat::attributes::AttributeLoc;
     let n = function.count_params();
     (0..n)
         .map(|i| {
@@ -272,8 +266,8 @@ fn declared_params(function: inkwell::values::FunctionValue<'_>) -> Vec<String> 
 
 /// Canonical declared C return spelling (empty where the function
 /// carries no `biara.c_return` attribute).
-fn declared_return(function: inkwell::values::FunctionValue<'_>) -> String {
-    use inkwell::attributes::AttributeLoc;
+fn declared_return(function: biara_ir_compat::values::FunctionValue<'_>) -> String {
+    use biara_ir_compat::attributes::AttributeLoc;
     function
         .get_string_attribute(AttributeLoc::Function, DECLARED_RETURN_ATTR)
         .map(|a| a.get_string_value().to_string_lossy().into_owned())
@@ -337,8 +331,8 @@ fn param_ty(
 }
 
 /// Preserve the executable result type, including all register-tuple fields.
-fn result_ty(ty: inkwell::types::BasicTypeEnum<'_>) -> (AbiResult, RetClass) {
-    if let inkwell::types::BasicTypeEnum::StructType(s) = ty {
+fn result_ty(ty: biara_ir_compat::types::BasicTypeEnum<'_>) -> (AbiResult, RetClass) {
+    if let biara_ir_compat::types::BasicTypeEnum::StructType(s) = ty {
         let field = |i| {
             s.get_field_type_at_index(i)
                 .map_or(AbiTy::RawWord, |ty| field_ty(ty.as_any_type_enum()))
@@ -373,7 +367,7 @@ fn field_ty(ty: AnyTypeEnum<'_>) -> AbiTy {
         AnyTypeEnum::FloatType(t) if t.get_bit_width() == 64 => AbiTy::F64,
         AnyTypeEnum::VectorType(v)
             if v.get_size() == 4
-                && matches!(v.get_element_type(), inkwell::types::BasicTypeEnum::FloatType(f) if f.get_bit_width() == 32) =>
+                && matches!(v.get_element_type(), biara_ir_compat::types::BasicTypeEnum::FloatType(f) if f.get_bit_width() == 32) =>
         {
             AbiTy::Vec128
         }

@@ -12,15 +12,13 @@ biara-proto.workspace = true
 biara-cfg.workspace = true
 biara-tcg.workspace = true
 biara-loader.workspace = true
-inkwell.workspace = true
+biara-ir-compat = { path = "../biara-ir-compat" }
+biara-ir.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 postcard.workspace = true
 blake3.workspace = true
-
-[build-dependencies]
-cc.workspace = true
 
 [dev-dependencies]
 parking_lot.workspace = true

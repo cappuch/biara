@@ -14,7 +14,7 @@ use biara_lift::{ResolveOptions, analysis_machine, recover_resolving};
 use biara_loader::Image;
 use biara_tcg::Libtcg;
 use common::{linker, tmp};
-use inkwell::{OptimizationLevel, context::Context};
+use biara_ir_compat::{OptimizationLevel, context::Context};
 
 const MANY: usize = 600;
 

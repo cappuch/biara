@@ -14,7 +14,7 @@ use std::{arch::global_asm, collections::BTreeSet, ptr::addr_of};
 use biara_cfg::{Cfg, ExitKind};
 use biara_lift::{RUN, ResolveOptions, analysis_machine, lift, optimize, recover_resolving};
 use biara_tcg::Libtcg;
-use inkwell::{OptimizationLevel, context::Context};
+use biara_ir_compat::{OptimizationLevel, context::Context};
 
 global_asm!(
     r#"
@@ -409,15 +409,15 @@ fn check(name: &str, f: TestFn) {
         if opt > 0 {
             optimize(&module, &machine, opt).unwrap();
         }
-        let ee = module
-            .create_jit_execution_engine /* native JIT: module under test was lifted with analysis_machine */(OptimizationLevel::None)
-            .unwrap();
+        // Interpret (the JIT LLVM provided is gone).
+        let module_ir = module.ir();
+        let mut interp = biara_lift::interp::Interp::new(
+            &module_ir,
+            (env as u64, env as u64 + info.env_size as u64 + 0x40_0000),
+        );
         for h in cfg.helpers() {
-            if let Some(decl) = module.get_function(&h.symbol()) {
-                ee.add_global_mapping(&decl, h.addr);
-            }
+            interp.bind(h.symbol(), h.addr as u64);
         }
-        let run = unsafe { ee.get_function::<unsafe extern "C" fn(*mut u8)>(RUN) }.unwrap();
 
         let mut stack = vec![0u64; 1024];
         for (a, b) in inputs() {
@@ -433,7 +433,7 @@ fn check(name: &str, f: TestFn) {
                 w(rsi, b);
                 w(rsp, sp);
                 w(rip, entry);
-                run.call(env);
+                interp.call(RUN, &[env as u128]).unwrap();
             }
             let r = |off: usize| unsafe { env.add(off).cast::<u64>().read_unaligned() };
             assert_eq!(

@@ -38,7 +38,7 @@ use std::{
 use biara_abi::FunctionAbi;
 use biara_cfg::{Cfg, ExitKind};
 use biara_tcg::{ContextInfo, TempId, TempKind};
-use inkwell::{
+use biara_ir_compat::{
     attributes::{Attribute, AttributeLoc},
     basic_block::BasicBlock,
     context::Context,
@@ -299,18 +299,6 @@ impl CallSite {
     }
 }
 
-unsafe extern "C" {
-    fn biara_value_ranges(
-        func: *mut std::ffi::c_void,
-        n: usize,
-        values: *const *mut std::ffi::c_void,
-        ctx: *const *mut std::ffi::c_void,
-        lo: *mut u64,
-        hi: *mut u64,
-        known: *mut i32,
-    );
-}
-
 /// Every call to an import (through its PLT stub or GOT slot) in the
 /// functions of `cfg`, by caller and pc.
 pub fn import_calls(
@@ -554,7 +542,7 @@ impl<'a> CallSites<'a> {
                 only: &batch,
                 target_markers: false,
             };
-            let module = crate::lift_with(
+                let module = crate::lift_with(
                 &cx,
                 self.machine,
                 self.info,
@@ -571,12 +559,16 @@ impl<'a> CallSites<'a> {
         Ok(())
     }
 
-    pub(crate) fn collect(&mut self, module: &inkwell::module::Module<'_>) {
+    pub(crate) fn collect(&mut self, module: &biara_ir_compat::module::Module<'_>) {
         self.collect_unindexed(module);
         self.index_sites();
     }
 
-    fn collect_unindexed(&mut self, module: &inkwell::module::Module<'_>) {
+    fn collect_unindexed(&mut self, module: &biara_ir_compat::module::Module<'_>) {
+        if let Some(path) = std::env::var_os("BIARA_DUMP_ANALYSIS_IR") {
+            let text = biara_ir::print_module(&module.ir());
+            let _ = std::fs::write(path, text);
+        }
         let pc_kind = module.get_context().get_kind_id(PC_MD);
         for f in module.get_functions() {
             let Some(caller) = f
@@ -797,31 +789,25 @@ impl<'a> CallSites<'a> {
         if ranges.is_empty() {
             return;
         }
-        let vals: Vec<_> = ranges.iter().map(|r| r.2.as_value_ref().cast()).collect();
-        let ctx: Vec<_> = ranges.iter().map(|r| r.3.as_value_ref().cast()).collect();
-        let (mut lo, mut hi, mut known) = (
-            vec![0; ranges.len()],
-            vec![0; ranges.len()],
-            vec![0; ranges.len()],
-        );
-        unsafe {
-            biara_value_ranges(
-                f.as_value_ref().cast(),
-                ranges.len(),
-                vals.as_ptr(),
-                ctx.as_ptr(),
-                lo.as_mut_ptr(),
-                hi.as_mut_ptr(),
-                known.as_mut_ptr(),
-            );
-        }
-        for (k, &(site, i, ..)) in ranges.iter().enumerate() {
-            if known[k] != 0 {
-                self.sites[site].args[i] = Arg::Range {
-                    lo: lo[k],
-                    hi: hi[k],
-                };
+        // Refine each queried value's range from the CFG edges that must have
+        // held at its use. The baseline is the value's own definition.
+        // The ranges belong to the function being lifted, not to whichever
+        // function the builder currently names.
+        let ir = f.ctx().with(f.module_id(), |m| m.module.functions[f.index()].clone());
+        let edges = crate::ranges::EdgeRanges::new(&ir);
+        for &(site, i, value, ctx) in &ranges {
+            let id = value.as_instruction_value().map(|v| v.ir_id()).unwrap_or(biara_ir::ValueId(u32::MAX));
+            if (id.0 as usize) >= ir.values.len() {
+                continue;
             }
+            let ctx_id = ctx.ir_id();
+            let width = value.get_bit_width();
+            let base = biara_ir::ConstantRange::full(width);
+            let r = edges.refine(id, ctx_id, base);
+            if r.full || r.width == 0 {
+                continue;
+            }
+            self.sites[site].args[i] = Arg::Range { lo: r.lo as u64, hi: r.hi as u64 };
         }
     }
     /// Follow internal return summaries and aliases. Missing summaries and
@@ -1581,7 +1567,7 @@ impl<'ctx> FunctionFacts<'ctx> {
     }
 
     /// Offset into env of a pointer `env` or `getelementptr i8, env, C`.
-    fn home_offset(&self, op: Option<inkwell::values::Operand<'ctx>>) -> Option<i64> {
+    fn home_offset(&self, op: Option<biara_ir_compat::values::Operand<'ctx>>) -> Option<i64> {
         let v = op?.value()?;
         if v.as_value_ref() == self.env.as_value_ref() {
             return Some(0);
@@ -1593,18 +1579,49 @@ impl<'ctx> FunctionFacts<'ctx> {
         {
             return None;
         }
-        let base = gep.get_operand(0)?.value()?;
-        if base.as_value_ref() != self.env.as_value_ref() {
+        // The base must be env, possibly behind a cast; anything else is a
+        // different object.
+        if !self.is_env(gep.get_operand(0)?.value()?, 0) {
             return None;
         }
-        let off = gep.get_operand(1)?.value()?.into_int_value();
+        // The offset is a constant integer; anything else is not a home.
+        let BasicValueEnum::IntValue(off) = gep.get_operand(1)?.value()? else {
+            return None;
+        };
         off.get_sign_extended_constant()
+    }
+
+    /// Is `v` the env pointer, possibly cast? Bounded so a cycle cannot
+    /// recurse for ever.
+    pub fn is_env(&self, v: BasicValueEnum<'ctx>, depth: u32) -> bool {
+        if depth > 8 {
+            return false;
+        }
+        if v.as_value_ref() == self.env.as_value_ref() {
+            return true;
+        }
+        let Some(inst) = v.as_instruction_value() else {
+            return false;
+        };
+        if !matches!(
+            inst.get_opcode(),
+            InstructionOpcode::IntToPtr | InstructionOpcode::PtrToInt
+        ) {
+            return false;
+        }
+        inst.get_operand(0)
+            .and_then(|o| o.value())
+            .is_some_and(|inner| self.is_env(inner, depth + 1))
     }
 
     /// The last definition of env slot `off` before `at`. A control-flow
     /// join retains provenance only when all incoming paths agree.
     fn reaching_store(&self, at: InstructionValue<'ctx>, off: i64) -> Reaching<'ctx> {
-        let mut bb = at.get_parent().unwrap();
+        // A value the IR cannot place has no reaching store; say so rather
+        // than taking the analysis down.
+        let Some(mut bb) = at.get_parent() else {
+            return Reaching::Unknown;
+        };
         let mut cur = at.get_previous_instruction();
         let mut seen = HashSet::new();
         let mut pending = Vec::new();
@@ -1619,7 +1636,28 @@ impl<'ctx> FunctionFacts<'ctx> {
                 }
                 match i.get_opcode() {
                     InstructionOpcode::Store if self.home_offset(i.get_operand(1)) == Some(off) => {
+                        // The frame writes a register back from the local
+                        // alloca it was spilled to (`store (load slot), home`).
+                        // The alloca holds the live value, so the store that
+                        // filled it answers for the argument.
                         found = Some(match i.get_operand(0).and_then(|o| o.value()) {
+                            Some(BasicValueEnum::IntValue(v))
+                                if let Some(load) = v.as_instruction_value()
+                                    && load.get_opcode() == InstructionOpcode::Load =>
+                            {
+                                let alloca = load
+                                    .get_operand(0)
+                                    .and_then(|o| o.value())
+                                    .filter(|p| {
+                                        p.as_instruction_value().is_some_and(|i| {
+                                            i.get_opcode() == InstructionOpcode::Alloca
+                                        })
+                                    });
+                                match alloca.and_then(|p| self.reaching_alloca(load, p)) {
+                                    Some(v) => Reaching::Stored(v),
+                                    None => Reaching::Stored(BasicValueEnum::IntValue(v)),
+                                }
+                            }
                             Some(v) => Reaching::Stored(v),
                             None => Reaching::Unknown,
                         });
@@ -1770,6 +1808,134 @@ impl<'ctx> FunctionFacts<'ctx> {
         found
     }
 
+    /// The last value stored into the `alloca` `slot` before `at`, when one
+    /// store dominates the walk. An `alloca` is not frame-relative, so the
+    /// stack-slot search cannot see it; matching the pointer operand is the
+    /// exact test.
+    fn reaching_alloca(
+        &self,
+        at: InstructionValue<'ctx>,
+        slot: BasicValueEnum<'ctx>,
+    ) -> Option<BasicValueEnum<'ctx>> {
+        let same = |i: &InstructionValue<'ctx>| {
+            i.get_operand(1)
+                .and_then(|o| o.value())
+                .is_some_and(|v| v.as_value_ref() == slot.as_value_ref())
+        };
+        // The filling store may live in a predecessor, so every path back to
+        // the entry is walked; the value must be the same on all of them.
+        // A store earlier in the load's own block dominates it, so it settles
+        // the value without consulting predecessors; only a block with no
+        // such store needs the path walk, where every path must agree.
+        {
+            let mut cur = at.get_previous_instruction();
+            while let Some(i) = cur {
+                if i.get_opcode() == InstructionOpcode::Store && same(&i) {
+                    return i.get_operand(0).and_then(|o| o.value());
+                }
+                cur = i.get_previous_instruction();
+            }
+        }
+        let mut found: Option<BasicValueEnum<'ctx>> = None;
+        let mut pending = Vec::new();
+        let mut seen = HashSet::new();
+        let mut bb = at.get_parent()?;
+        let mut cur = at.get_previous_instruction();
+        let mut budget = MAX_SLOT_WALK;
+        loop {
+            let mut hit = None;
+            while let Some(i) = cur {
+                budget = budget.checked_sub(1)?;
+                if i.get_opcode() == InstructionOpcode::Store && same(&i) {
+                    hit = Some(i.get_operand(0).and_then(|o| o.value())?);
+                    break;
+                }
+                cur = i.get_previous_instruction();
+            }
+            let mut next = None;
+            if hit.is_none() {
+                if bb == self.entry {
+                    return None;
+                }
+                let preds = self.preds.get(&bb).filter(|p| !p.is_empty())?;
+                for &p in preds {
+                    if seen.insert(p)
+                        && let Some(previous) = next.replace(p)
+                    {
+                        pending.push(previous);
+                    }
+                }
+            }
+            if let Some(v) = hit {
+                if found.is_some_and(|old| old.as_value_ref() != v.as_value_ref()) {
+                    return None;
+                }
+                found = Some(v);
+            }
+            match next.or_else(|| pending.pop()) {
+                Some(p) => {
+                    bb = p;
+                    cur = p.get_last_instruction();
+                }
+                None => return found,
+            }
+        }
+    }
+
+    /// Evaluate an integer-valued instruction whose operands are all
+    /// constants, following operands that are themselves such instructions.
+    fn fold_constant_binop(&self, inst: InstructionValue<'ctx>, bits: u32) -> Option<u64> {
+        self.fold_constant(inst, bits, 0)
+    }
+
+    fn fold_constant(
+        &self,
+        inst: InstructionValue<'ctx>,
+        bits: u32,
+        depth: u32,
+    ) -> Option<u64> {
+        use InstructionOpcode::*;
+        if depth > 16 || bits == 0 || bits > 64 {
+            return None;
+        }
+        let operand = |k: u32| -> Option<u64> {
+            match inst.get_operand(k).and_then(|o| o.value())? {
+                BasicValueEnum::IntValue(v) => match v.as_instruction_value() {
+                    Some(i) => self.fold_constant(i, v.get_type().get_bit_width(), depth + 1),
+                    None => v.get_zero_extended_constant(),
+                },
+                _ => None,
+            }
+        };
+        let mask = if bits >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << bits) - 1
+        };
+        // Conversions take one operand of a possibly different width; their
+        // result is that operand masked to this width.
+        if matches!(inst.get_opcode(), ZExt | Trunc | SExt) {
+            return Some(operand(0)? & mask);
+        }
+        let (l, r) = (operand(0)? & mask, operand(1)? & mask);
+        Some(match inst.get_opcode() {
+            Add => l.wrapping_add(r) & mask,
+            Sub => l.wrapping_sub(r) & mask,
+            Mul => l.wrapping_mul(r) & mask,
+            And => l & r,
+            Or => l | r,
+            Xor => l ^ r,
+            Shl if r < u64::from(bits) => (l << r) & mask,
+            LShr if r < u64::from(bits) => l >> r,
+            AShr if r < u64::from(bits) => {
+                let sign = 1u64 << (bits - 1);
+                let ext = if l & sign != 0 { !mask } else { 0 };
+                (((l | ext) as i64) >> r) as u64 & mask
+            }
+            _ => return None,
+        })
+    }
+
     fn search_slot(
         &self,
         at: InstructionValue<'ctx>,
@@ -1789,7 +1955,7 @@ impl<'ctx> FunctionFacts<'ctx> {
                     InstructionOpcode::Store if self.home_offset(i.get_operand(1)).is_none() => {
                         if i.get_volatile().unwrap_or(true)
                             || i.get_atomic_ordering().ok()
-                                != Some(inkwell::AtomicOrdering::NotAtomic)
+                                != Some(biara_ir_compat::AtomicOrdering::NotAtomic)
                         {
                             return None;
                         }
@@ -1871,7 +2037,7 @@ impl<'ctx> FunctionFacts<'ctx> {
     /// An x87 store helper's (guest address operand, width in bits), if
     /// `i` calls one (`HelperFootprint::FpStore`).
     fn fp_store(&self, i: InstructionValue<'ctx>) -> Option<(BasicValueEnum<'ctx>, u32)> {
-        let called = inkwell::values::CallSiteValue::try_from(i)
+        let called = biara_ir_compat::values::CallSiteValue::try_from(i)
             .ok()?
             .get_called_fn_value()?;
         let name = called.get_name().to_str().ok()?;
@@ -1929,15 +2095,35 @@ impl<'ctx> FunctionFacts<'ctx> {
         {
             return Arg::Const(c);
         }
+        // A binary operation over constants is a constant. The lifter leaves
+        // these in place (it truncates through `lshr`/`and` pairs), so an
+        // argument written as a small literal arrives in this form.
+        if let BasicValueEnum::IntValue(v) = value
+            && let Some(inst) = v.as_instruction_value()
+            && let Some(c) = self.fold_constant_binop(inst, bits)
+        {
+            return Arg::Const(c);
+        }
         let Some(inst) = value.as_instruction_value() else {
             return Arg::Unknown;
         };
         let operand = |k| inst.get_operand(k).and_then(|o| o.value());
         if inst.get_opcode() == InstructionOpcode::Load {
             if inst.get_volatile().unwrap_or(true)
-                || inst.get_atomic_ordering().ok() != Some(inkwell::AtomicOrdering::NotAtomic)
+                || inst.get_atomic_ordering().ok() != Some(biara_ir_compat::AtomicOrdering::NotAtomic)
             {
                 return Arg::Unknown;
+            }
+            // A store into this exact slot is better evidence than the
+            // entry load: the register's value may have been replaced since.
+            if let Some(ptr) = operand(0)
+                && ptr
+                    .as_instruction_value()
+                    .is_some_and(|p| p.get_opcode() == InstructionOpcode::Alloca)
+            {
+                if let Some(v) = self.reaching_alloca(inst, ptr) {
+                    return self.argument_at(v, info, returned, depth + 1, budget);
+                }
             }
             if let Some(&g) = self.entry_loads.get(&inst) {
                 return if g == self.sp {
@@ -2211,7 +2397,7 @@ impl<'ctx> FunctionFacts<'ctx> {
                     };
                 }
                 let bits = match inst.get_type() {
-                    inkwell::types::AnyTypeEnum::IntType(t) => t.get_bit_width(),
+                    biara_ir_compat::types::AnyTypeEnum::IntType(t) => t.get_bit_width(),
                     _ => return None,
                 };
                 // A slot of the frame: what was stored there.
@@ -2473,7 +2659,7 @@ mod tests {
         let cx = Context::create();
         let module = cx.create_module("memory-effects");
         let builder = cx.create_builder();
-        let pointer_type = cx.ptr_type(inkwell::AddressSpace::default());
+        let pointer_type = cx.ptr_type(biara_ir_compat::AddressSpace::default());
         let function = module.add_function(
             "fragment",
             cx.void_type().fn_type(&[pointer_type.into()], false),

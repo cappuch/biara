@@ -21,11 +21,11 @@ use common::corpus::{self, *};
 
 use biara_cfg::Cfg;
 use biara_lift::{
-    RUN, ResolveOptions, analysis_machine, lift, native_machine, optimize, recover_resolving,
+    RUN, ResolveOptions, analysis_machine, lift, optimize, recover_resolving,
 };
 use biara_loader::Image;
 use biara_tcg::Libtcg;
-use inkwell::{OptimizationLevel, context::Context};
+use biara_ir_compat::context::Context;
 use parking_lot::Mutex;
 
 const RETURN_SENTINEL: u64 = 0xdead_beef_0000;
@@ -117,23 +117,35 @@ fn check(name: &str, reference: Ref) {
             if jit > 0 {
                 optimize(&module, &machine, jit).unwrap();
             }
-            // Run it natively: lifted for the analysis target (x86-64), the
-            // module is retargeted to the host before the JIT compiles it.
-            let native = native_machine().unwrap();
-            module.set_triple(&native.get_triple());
-            module.set_data_layout(&native.get_target_data().get_data_layout());
-            let ee = module
-                .create_jit_execution_engine(OptimizationLevel::None)
-                .unwrap();
+            // Interpret the module (the JIT LLVM provided is gone).
+            let module_ir = module.ir();
+            let mut interp = biara_lift::interp::Interp::new(
+                &module_ir,
+                // `libtcg_env` points into the CPU state, and the ABI form
+                // addresses the bytes before it (the icount/IO flags), so the
+                // mapped range starts at the CPU state's own base.
+                (
+                    env as u64 - biara_lift::CPU_STATE_MARGIN,
+                    env as u64 + info.env_size as u64,
+                ),
+            );
             for h in cfg.helpers() {
-                if let Some(decl) = module.get_function(&h.symbol()) {
-                    ee.add_global_mapping(&decl, h.addr);
-                }
+                interp.bind(h.symbol(), h.addr as u64);
             }
-            let run = unsafe { ee.get_function::<unsafe extern "C" fn(*mut u8)>(RUN) }.unwrap();
 
             let mut stack = vec![0u128; 1024];
             let top = stack.as_mut_ptr_range().end as u64 - 256;
+            // The guest stack is the caller's own allocation, outside env.
+            interp.map((
+                stack.as_ptr() as u64,
+                stack.as_mut_ptr_range().end as u64,
+            ));
+            // The corpus is mapped in this process, so its own data — the
+            // GOT and read-only tables PIE code reads through — is addressable
+            // too. Without this the interpreter rejects those loads.
+            for seg in &c.image.segments {
+                interp.map((seg.addr, seg.addr + seg.size));
+            }
             for (a, b) in inputs() {
                 let expected = reference(a, b);
                 let w =
@@ -150,9 +162,11 @@ fn check(name: &str, reference: Ref) {
                 for (i, &s) in saved.iter().enumerate() {
                     w(s, 0x5ead_0000 + i as u64);
                 }
-                unsafe { run.call(env) };
                 let abi = if abis.is_some() { " abi" } else { "" };
                 let at = format!("{name} -O{opt} JIT O{jit}{abi} ({a:#x}, {b:#x})");
+                if let Err(e) = interp.call(RUN, &[env as u128]) {
+                    panic!("{at}: {e:?}");
+                }
                 assert_eq!(r(pc), RETURN_SENTINEL, "{at}: did not return");
                 assert_eq!(r(sp), top, "{at}: sp");
                 for (i, &s) in saved.iter().enumerate() {
@@ -330,3 +344,4 @@ fn control_flow_and_abi() {
         assert!(f.preserved.contains(&reg("x19")), "{at}");
     }
 }
+

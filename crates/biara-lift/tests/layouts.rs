@@ -30,7 +30,7 @@
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod layouts {
     use biara_lift::layouts::analyze_layouts;
-    use inkwell::{
+    use biara_ir_compat::{
         AddressSpace, context::Context, targets::TargetMachine, types::BasicType,
         values::BasicValueEnum,
     };
@@ -39,7 +39,7 @@ mod layouts {
         biara_lift::analysis_machine().unwrap()
     }
 
-    fn tag(cx: &Context, m: &inkwell::module::Module, f: inkwell::values::FunctionValue, e: u64) {
+    fn tag(cx: &Context, m: &biara_ir_compat::module::Module, f: biara_ir_compat::values::FunctionValue, e: u64) {
         let i64t = cx.i64_type();
         f.as_global_value().set_metadata(
             cx.metadata_node(&[
@@ -52,8 +52,8 @@ mod layouts {
 
     fn load_at<'c>(
         cx: &'c Context,
-        b: &inkwell::builder::Builder<'c>,
-        arg: inkwell::values::IntValue<'c>,
+        b: &biara_ir_compat::builder::Builder<'c>,
+        arg: biara_ir_compat::values::IntValue<'c>,
         off: u64,
         bits: u32,
         name: &str,
@@ -75,7 +75,7 @@ mod layouts {
 
     fn widen32<'c>(
         cx: &'c Context,
-        b: &inkwell::builder::Builder<'c>,
+        b: &biara_ir_compat::builder::Builder<'c>,
         v: BasicValueEnum<'c>,
     ) -> BasicValueEnum<'c> {
         match v {
@@ -261,7 +261,7 @@ mod layouts {
         b.position_at_end(cx.append_basic_block(go, "entry"));
         let p = go.get_nth_param(0).unwrap();
         let qv = b.build_call(id, &[p.into()], "q").unwrap();
-        let qi: inkwell::values::IntValue = match qv.try_as_basic_value().basic().unwrap() {
+        let qi: biara_ir_compat::values::IntValue = match qv.try_as_basic_value().basic().unwrap() {
             BasicValueEnum::IntValue(v) => v,
             _ => panic!("expected int"),
         };
@@ -378,7 +378,7 @@ mod layouts {
             let qv = b
                 .build_call(id2, &[f.get_nth_param(0).unwrap().into()], "q")
                 .unwrap();
-            let qi: inkwell::values::IntValue = match qv.try_as_basic_value().basic().unwrap() {
+            let qi: biara_ir_compat::values::IntValue = match qv.try_as_basic_value().basic().unwrap() {
                 BasicValueEnum::IntValue(v) => v,
                 _ => panic!("expected int"),
             };
@@ -633,7 +633,7 @@ mod layouts {
         let gpp = b
             .build_int_to_ptr(ga, cx.ptr_type(AddressSpace::default()), "gpp")
             .unwrap();
-        let child: inkwell::values::IntValue =
+        let child: biara_ir_compat::values::IntValue =
             match b.build_load(i64t.as_basic_type_enum(), gpp, "ch").unwrap() {
                 BasicValueEnum::IntValue(v) => v,
                 _ => panic!("expected int"),

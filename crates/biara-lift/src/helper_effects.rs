@@ -27,22 +27,6 @@ pub(crate) struct Access {
 /// Helper symbol (`helper_<name>`) to its access.
 pub(crate) type Effects = HashMap<String, Arc<Access>>;
 
-unsafe extern "C" {
-    fn biara_helper_effects(
-        path: *const c_char,
-        symbols: *const *const c_char,
-        n: usize,
-        offsets: *const i64,
-        sizes: *const u32,
-        m: usize,
-        reads: *mut u8,
-        writes: *mut u8,
-        err: *mut *mut c_char,
-    ) -> i32;
-    #[link_name = "free"]
-    fn libc_free(p: *mut std::ffi::c_void);
-}
-
 static KNOWN: LazyLock<Mutex<HashMap<PathBuf, Effects>>> = LazyLock::new(Default::default);
 
 /// The accesses of `symbols` through env, from `info.helpers`; empty without
@@ -73,41 +57,18 @@ pub(crate) fn effects<'a>(
         .collect())
 }
 
-fn analyze(path: &Path, info: &ContextInfo, symbols: &[&str]) -> Result<Vec<Access>, Error> {
-    let path_c = CString::new(path.as_os_str().as_encoded_bytes())
-        .map_err(|_| Error::Llvm(format!("{}: NUL in path", path.display())))?;
-    let names: Vec<CString> = symbols.iter().map(|s| CString::new(*s).unwrap()).collect();
-    let name_ptrs: Vec<*const c_char> = names.iter().map(|s| s.as_ptr()).collect();
-    let offsets: Vec<i64> = info.globals.iter().map(|g| g.mem_offset).collect();
-    let sizes: Vec<u32> = info.globals.iter().map(|g| g.ty.bits() / 8).collect();
-    let m = offsets.len();
-    let mut reads = vec![1u8; symbols.len() * m];
-    let mut writes = vec![1u8; symbols.len() * m];
-    let mut error = std::ptr::null_mut();
-    let failed = unsafe {
-        biara_helper_effects(
-            path_c.as_ptr(),
-            name_ptrs.as_ptr(),
-            name_ptrs.len(),
-            offsets.as_ptr(),
-            sizes.as_ptr(),
-            m,
-            reads.as_mut_ptr(),
-            writes.as_mut_ptr(),
-            &mut error,
-        )
-    };
-    if failed != 0 {
-        let message = unsafe { CStr::from_ptr(error) }
-            .to_string_lossy()
-            .into_owned();
-        unsafe { libc_free(error.cast()) };
-        return Err(Error::Llvm(message));
-    }
+/// Helper effects came from decoding the helper bitcode and following each
+/// helper's pointer parameters to its accesses. That needs LLVM's bitcode
+/// reader and value tracking, which are gone, so every helper is reported
+/// conservatively: it may read and write every global. That is what the
+/// analysis did before a helper's bitcode was available, and it is the safe
+/// direction — lifted code stores and reloads more, never fewer, values.
+fn analyze(_path: &Path, info: &ContextInfo, symbols: &[&str]) -> Result<Vec<Access>, Error> {
+    let m = info.globals.len();
     Ok((0..symbols.len())
-        .map(|i| Access {
-            reads: reads[i * m..(i + 1) * m].iter().map(|&b| b != 0).collect(),
-            writes: writes[i * m..(i + 1) * m].iter().map(|&b| b != 0).collect(),
+        .map(|_| Access {
+            reads: vec![true; m],
+            writes: vec![true; m],
         })
         .collect())
 }

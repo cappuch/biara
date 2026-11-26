@@ -198,7 +198,7 @@ fn sample() {
     let info = lib.info().clone();
     let abis = biara_abi::analyze(&cfg, &info).unwrap();
     let name_of = |a: u64| image.function_at(a).map(|s| s.name.clone());
-    let cx = inkwell::context::Context::create();
+    let cx = biara_ir_compat::context::Context::create();
     let prepared = biara_lift::prepare_c(
         &cx,
         &machine,

@@ -30,7 +30,7 @@ use biara_tcg::{
     Block, Cond, ContextInfo, HelperType, MemOp, Op, Opcode, TempId, TempKind, Type, bswap,
     call_flags,
 };
-use inkwell::{
+use biara_ir_compat::{
     AddressSpace, AtomicOrdering, IntPredicate,
     attributes::{Attribute, AttributeLoc},
     basic_block::BasicBlock,
@@ -198,6 +198,11 @@ pub(crate) struct Lowering<'a, 'ctx> {
     pc: u64,
     pc_kind: u32,
     pc_md: Option<MetadataValue<'ctx>>,
+    /// Source of unique suffixes for the blocks a translation block creates
+    /// ahead of use. Names must be unique within the function: `next` and
+    /// `exit` are created once per `brcond`/guest block, so a literal name
+    /// collides and makes the branch targets ambiguous.
+    next_id: u64,
 }
 
 impl<'a, 'ctx> Lowering<'a, 'ctx> {
@@ -232,6 +237,11 @@ impl<'a, 'ctx> Lowering<'a, 'ctx> {
         }
         b.position_at_end(start);
 
+        // The blocks that exist before this emit belong to other translation
+        // blocks (or the function's entry): closing them here would terminate
+        // bodies that have not been emitted yet, so only blocks created while
+        // emitting `block` are the epilogue's business.
+        let preexisting: Vec<_> = func.get_basic_blocks();
         let mut l = Lowering {
             cx,
             module,
@@ -253,6 +263,7 @@ impl<'a, 'ctx> Lowering<'a, 'ctx> {
             pc: block.pc,
             pc_kind: cx.get_kind_id(PC_MD),
             pc_md: None,
+            next_id: 0,
         };
         for (i, op) in block.ops.iter().enumerate() {
             // A terminal exit needs no synthetic dead block unless TCG
@@ -264,10 +275,32 @@ impl<'a, 'ctx> Lowering<'a, 'ctx> {
             l.op(i, op)?;
             l.tag()?;
         }
-        if !l.terminated() {
-            l.sync_out()?;
-            l.b.build_return(None)?;
-            l.tag()?;
+        // The pc writeback and the return belong to every block: a guest pc
+        // that lands here must leave with the next pc recorded, otherwise the
+        // dispatcher re-enters the same translation block for ever. If the
+        // last op closed the block, the epilogue continues in a fresh one.
+        if l.terminated() {
+            l.continue_in("exit");
+        }
+        let exit = l.b.get_insert_block();
+        l.sync_out()?;
+        l.b.build_return(None)?;
+        l.tag()?;
+        // A block this function owns that is still open was entered but has
+        // no ending of its own; send it through the epilogue so it records
+        // the next pc like every other path out.
+        if let Some(exit) = exit {
+            for bb in l.func.get_basic_blocks() {
+                // The block this emit started in is this emit's to close even
+                // though it existed already; blocks of other translation
+                // blocks are not.
+                if (bb == start || !preexisting.contains(&bb))
+                    && bb.get_terminator().is_none()
+                {
+                    l.b.position_at_end(bb);
+                    l.b.build_unconditional_branch(exit)?;
+                }
+            }
         }
         Ok(())
     }
@@ -357,8 +390,8 @@ impl<'a, 'ctx> Lowering<'a, 'ctx> {
             return self.resume(ret);
         };
         let here = self.b.get_insert_block().unwrap();
-        let joined = self.cx.append_basic_block(self.func, "call_return");
-        let unknown = self.cx.append_basic_block(self.func, "call_unknown");
+        let joined = self.fresh("call_return");
+        let unknown = self.fresh("call_unknown");
         let mut cases = Vec::with_capacity(resolved.targets.len());
         for &dst in &resolved.targets {
             let Some(&callee) = t.functions.get(&dst) else {
@@ -417,7 +450,7 @@ impl<'a, 'ctx> Lowering<'a, 'ctx> {
                 (None, Some(&f)) => {
                     let bb = self
                         .cx
-                        .append_basic_block(self.func, &format!("tail_{dst:x}"));
+                        .append_basic_block(self.func, &format!("tail_{dst:x}_{}", self.pc));
                     let here = self.b.get_insert_block().unwrap();
                     self.b.position_at_end(bb);
                     self.sync_out()?;
@@ -434,7 +467,7 @@ impl<'a, 'ctx> Lowering<'a, 'ctx> {
             };
             cases.push((pc.get_type().const_int(dst, false), bb));
         }
-        let unknown = self.cx.append_basic_block(self.func, "indirect");
+        let unknown = self.fresh("indirect");
         self.b.build_switch(pc, unknown, &cases)?;
         self.tag()?;
         self.b.position_at_end(unknown);
@@ -468,7 +501,7 @@ impl<'a, 'ctx> Lowering<'a, 'ctx> {
             pc.get_type().const_int(ret, false),
             "returned",
         )?;
-        let escape = self.cx.append_basic_block(self.func, "escape");
+        let escape = self.fresh("escape");
         self.b.build_conditional_branch(back, bb, escape)?;
         self.tag()?;
         self.b.position_at_end(escape);
@@ -757,9 +790,46 @@ impl<'a, 'ctx> Lowering<'a, 'ctx> {
 
     // ---- control flow ----------------------------------------------------
 
+    /// The block a TCG label names. `labels` is per translation block, so the
+    /// same TCG label index recurs across the guest blocks of one function:
+    /// the name must carry the guest pc or two blocks end up called `L0` and
+    /// every branch to `%L0` becomes ambiguous.
     fn label(&mut self, id: u64) -> BasicBlock<'ctx> {
+        let pc = self.pc;
         let slot = &mut self.labels[id as usize];
-        *slot.get_or_insert_with(|| self.cx.append_basic_block(self.func, &format!("L{id}")))
+        *slot.get_or_insert_with(|| {
+            self.cx
+                .append_basic_block(self.func, &format!("L{id}_{pc:x}"))
+        })
+    }
+
+    /// Give every unterminated block of the function an explicit ending.
+    ///
+    /// Blocks are created ahead of use (labels, joins, table arms) and an op
+    /// may leave the block it started in without terminating it. Ending them
+    /// as `unreachable` states the truth: nothing branches here.
+    ///
+    /// Give every open block of `f` its ending. Called once a function's
+    /// translation blocks are all emitted, so a block that is still open is
+    /// genuinely one nothing reaches rather than one still to be filled.
+    pub fn close_function(cx: &'ctx Context, f: FunctionValue<'ctx>) {
+        let idx = f.index();
+        cx.with_mut(cx.module_id_public(), |m| {
+            let Some(function) = m.module.functions.get_mut(idx) else {
+                return;
+            };
+            // A function with blocks always has an entry: a body built
+            // without going through `append_basic_block` would otherwise be
+            // invisible to the ABI form and unenterable for the interpreter.
+            if function.entry.is_none() && !function.blocks.is_empty() {
+                function.entry = Some(biara_ir::BlockId(0));
+            }
+            for b in &mut function.blocks {
+                if b.term.is_none() {
+                    b.term = Some(biara_ir::Terminator::Unreachable);
+                }
+            }
+        });
     }
 
     fn terminated(&self) -> bool {
@@ -770,8 +840,17 @@ impl<'a, 'ctx> Lowering<'a, 'ctx> {
     }
 
     /// Materialize an unreachable continuation only for actual trailing ops.
+    /// A block whose name is unique within the function. A translation block
+    /// creates its helpers once, so the guest pc separates them; the counter
+    /// separates repeated `brcond`s within one translation block.
+    fn fresh(&mut self, base: &str) -> BasicBlock<'ctx> {
+        self.next_id += 1;
+        let name = format!("{base}_{:x}_{}", self.pc, self.next_id);
+        self.cx.append_basic_block(self.func, &name)
+    }
+
     fn continue_in(&mut self, name: &str) -> BasicBlock<'ctx> {
-        let bb = self.cx.append_basic_block(self.func, name);
+        let bb = self.fresh(name);
         self.b.position_at_end(bb);
         bb
     }
@@ -835,7 +914,7 @@ impl<'a, 'ctx> Lowering<'a, 'ctx> {
                 let c = self.cond_arg(k[0])?;
                 let v = self.cond(c, self.read(inp[0])?, self.read(inp[1])?)?;
                 let target = self.label(k[1]);
-                let next = self.cx.append_basic_block(self.func, "next");
+                let next = self.fresh("next");
                 self.b.build_conditional_branch(v, target, next)?;
                 self.tag()?;
                 self.b.position_at_end(next);
@@ -1279,7 +1358,7 @@ impl<'a, 'ctx> Lowering<'a, 'ctx> {
         Ok(f)
     }
 
-    fn helper_type(&self, t: HelperType) -> R<inkwell::types::BasicTypeEnum<'ctx>> {
+    fn helper_type(&self, t: HelperType) -> R<biara_ir_compat::types::BasicTypeEnum<'ctx>> {
         Ok(match t {
             HelperType::I32 | HelperType::S32 => self.cx.i32_type().into(),
             HelperType::I64 | HelperType::S64 => self.i64().into(),

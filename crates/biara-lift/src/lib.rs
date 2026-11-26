@@ -32,14 +32,22 @@
 //! Early canonicalization preserves behavior but can change optimized fold
 //! shapes relative to running the passes only after the module is complete.
 
+pub mod abi_form;
 pub mod audit;
 mod call_memory;
 mod calls;
+pub mod cgen;
 mod concurrency;
 mod decompile;
 mod helper_effects;
 mod integer;
+pub mod index_switches;
+pub mod indirect;
+pub mod interp;
+pub mod ranges;
+pub mod rewrite;
 pub mod layouts;
+pub mod layouts_core;
 mod lower;
 mod memory;
 mod notes;
@@ -76,7 +84,7 @@ use std::{
 use biara_abi::FunctionAbi;
 use biara_cfg::Cfg;
 use biara_tcg::ContextInfo;
-use inkwell::{
+use biara_ir_compat::{
     AddressSpace, OptimizationLevel,
     attributes::{Attribute, AttributeLoc},
     builder::{Builder, BuilderError},
@@ -89,6 +97,10 @@ use inkwell::{
 
 /// Run until the pc leaves the lifted functions.
 pub const RUN: &str = "biara.run";
+/// Bytes of CPU state before env (`CPUArchState` sits inside `ArchCPU`;
+/// lifted code touches the icount and I/O flags just before it).
+pub use decompile::MARGIN as CPU_STATE_MARGIN;
+
 /// Call the lifted function at the current pc, if any.
 pub const DISPATCH: &str = "biara.dispatch";
 /// System call with arguments in the guest state.
@@ -119,7 +131,7 @@ use biara_proto::ANALYSIS_TRIPLE;
 const ANALYSIS_DATA_LAYOUT_PREFIX: &str = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128";
 pub fn analysis_machine() -> Result<TargetMachine, Error> {
     Target::initialize_x86(&InitializationConfig::default());
-    let triple = inkwell::targets::TargetTriple::create(ANALYSIS_TRIPLE);
+    let triple = biara_ir_compat::targets::TargetTriple::create(ANALYSIS_TRIPLE);
     let target = Target::from_triple(&triple).map_err(|e| Error::Llvm(e.to_string()))?;
     let machine = target
         .create_target_machine(
@@ -390,6 +402,9 @@ fn lift_with<'ctx>(
         let b = cx.create_builder();
         b.position_at_end(allocas);
         b.build_unconditional_branch(targets.blocks[entry])?;
+        // Every translation block of this function has now been emitted, so
+        // a block still open is one nothing reaches.
+        lower::Lowering::close_function(cx, f);
         if let Some(trimmer) = &mut trimmer {
             trimmer.run(f);
         }
@@ -397,6 +412,22 @@ fn lift_with<'ctx>(
     let entries: BTreeSet<u64> = functions.keys().copied().collect();
     driver(cx, info, dispatch, &entries, &functions, false)?;
     driver(cx, info, run, &entries, &functions, true)?;
+    // `preds` is a cache the block builders do not maintain; derive it once
+    // the module is final so verification and every analysis agree.
+    // `preds` is a cache the block builders do not maintain; derive it once
+    // the module is final so verification and every analysis agree. A block
+    // still open at this point has no control-flow fact to state, so it is
+    // ended as unreachable rather than left ambiguous.
+    module.update(|m| {
+        for f in &mut m.module.functions {
+            for b in &mut f.blocks {
+                if b.term.is_none() {
+                    b.term = Some(biara_ir::Terminator::Unreachable);
+                }
+            }
+            biara_ir::analysis::recompute_preds(f);
+        }
+    });
     module.verify().map_err(|e| Error::Llvm(e.to_string()))?;
     Ok(module)
 }
@@ -443,7 +474,7 @@ fn promote<'ctx>(
     cx: &'ctx Context,
     info: &ContextInfo,
     f: FunctionValue<'ctx>,
-    entry: inkwell::basic_block::BasicBlock<'ctx>,
+    entry: biara_ir_compat::basic_block::BasicBlock<'ctx>,
     used: &BTreeSet<biara_tcg::TempId>,
 ) -> Result<BTreeMap<biara_tcg::TempId, lower::Promoted<'ctx>>, Error> {
     let env = f.get_nth_param(0).unwrap().into_pointer_value();
@@ -484,40 +515,16 @@ fn load_pc<'ctx>(
 
 /// Link the helper bitcode at `path` into `module`. Helpers become internal
 /// so that optimisation inlines the used ones and drops the rest.
-pub fn link_helpers(module: &Module<'_>, path: &Path) -> Result<(), Error> {
-    let helpers = Module::parse_bitcode_from_path(path, module.get_context())
-        .map_err(|e| Error::Llvm(format!("{}: {e}", path.display())))?;
-    // The helpers were compiled for the same host; adopt the lifted module's
-    // target so the linker does not warn.
-    helpers.set_triple(&module.get_triple());
-    helpers.set_data_layout(&module.get_data_layout());
-    // QEMU's module constructors (QOM type registration) are not helpers
-    // and would keep half of QEMU alive.
-    if let Some(ctors) = helpers.get_global("llvm.global_ctors") {
-        unsafe { ctors.delete() };
-    }
-    // Everything defined before linking is lifted code and stays visible.
-    let lifted: BTreeSet<Vec<u8>> = module
-        .get_functions()
-        .filter(|f| f.count_basic_blocks() > 0)
-        .map(|f| f.get_name().to_bytes().to_vec())
-        .collect();
-    module
-        .link_in_module(helpers)
-        .map_err(|e| Error::Llvm(e.to_string()))?;
-
-    let ours = |name: &[u8]| name.starts_with(b"llvm.") || lifted.contains(name);
-    for f in module.get_functions() {
-        if f.count_basic_blocks() > 0 && !ours(f.get_name().to_bytes()) {
-            f.set_linkage(Linkage::Internal);
-        }
-    }
-    for g in module.get_globals() {
-        if g.get_initializer().is_some() && !ours(g.get_name().to_bytes()) {
-            g.set_linkage(Linkage::Internal);
-        }
-    }
-    module.verify().map_err(|e| Error::Llvm(e.to_string()))
+/// Helper linking reads LLVM *bitcode*, a format that only LLVM's reader can
+/// decode. Without LLVM it cannot be done at all, so this reports exactly that
+/// rather than silently producing a module with unresolved helpers.
+pub fn link_helpers(_module: &Module<'_>, path: &Path) -> Result<(), Error> {
+    Err(Error::Llvm(format!(
+        "cannot link helper bitcode {}: reading LLVM bitcode needs LLVM, which is no longer a \
+         dependency. Supply helper definitions as C source (compiled together with the emitted \
+         C) or drop --link-helpers.",
+        path.display()
+    )))
 }
 
 /// Canonicalize (see `memory`), run LLVM's `default<O{level}>` pipeline, then

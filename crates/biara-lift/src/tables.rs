@@ -14,7 +14,7 @@ use std::{
 
 use biara_cfg::{Cfg, ExitKind, Options};
 use biara_tcg::Libtcg;
-use inkwell::{
+use biara_ir_compat::{
     context::{AsContextRef, Context},
     module::Module,
     targets::TargetMachine,
@@ -29,14 +29,16 @@ use crate::{
 /// Announces an indirect target: `void biara.target(i64 pc, i64 block)`.
 pub(crate) const MARKER: &str = "biara.target";
 
-type ReadFn = unsafe extern "C" fn(*mut c_void, u64, *mut u8, usize) -> i32;
-type EmitFn = unsafe extern "C" fn(*mut c_void, u64, u64);
-type FinishFn = unsafe extern "C" fn(*mut c_void, u64, i32);
+type Reader<'r> = &'r dyn Fn(u64, &mut [u8]) -> bool;
 
+/// One indirect site's resolved destinations.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct SiteResolution {
+    /// Targets the site can reach.
     pub targets: BTreeSet<u64>,
+    /// True when every possible target was enumerated.
     pub complete: bool,
+    /// True when an enumeration limit stopped the work.
     pub limited: bool,
 }
 
@@ -50,39 +52,6 @@ impl Default for SiteResolution {
     }
 }
 
-unsafe extern "C" {
-    fn LLVMContextSetDiscardValueNames(context: *mut c_void, discard: i32);
-    fn biara_indirect_targets(
-        func: *mut c_void,
-        marker: *const c_char,
-        read: ReadFn,
-        read_ctx: *mut c_void,
-        max_entries: u64,
-        emit: EmitFn,
-        emit_ctx: *mut c_void,
-        finish: FinishFn,
-    ) -> usize;
-}
-
-type Reader<'r> = &'r dyn Fn(u64, &mut [u8]) -> bool;
-
-unsafe extern "C" fn read_cb(ctx: *mut c_void, addr: u64, buf: *mut u8, len: usize) -> i32 {
-    let read = unsafe { &*(ctx as *const Reader) };
-    read(addr, unsafe { std::slice::from_raw_parts_mut(buf, len) }) as i32
-}
-
-unsafe extern "C" fn emit_cb(ctx: *mut c_void, site: u64, target: u64) {
-    let out = unsafe { &mut *(ctx as *mut BTreeMap<u64, SiteResolution>) };
-    out.entry(site).or_default().targets.insert(target);
-}
-
-unsafe extern "C" fn finish_cb(ctx: *mut c_void, site: u64, status: i32) {
-    let out = unsafe { &mut *(ctx as *mut BTreeMap<u64, SiteResolution>) };
-    let resolution = out.entry(site).or_default();
-    resolution.complete &= status == 0;
-    resolution.limited |= status == 2;
-}
-
 /// Resolve marked targets through readonly guest memory. Each site's result
 /// combines all lifted contexts; failed reads leave a residual unknown.
 pub(crate) fn find(
@@ -92,20 +61,26 @@ pub(crate) fn find(
     max_entries: u64,
 ) -> Result<BTreeMap<u64, SiteResolution>, Error> {
     crate::memory::simplify(module, machine)?;
-    let marker = CString::new(MARKER).unwrap();
-    let mut out = BTreeMap::new();
-    for f in module.get_functions() {
-        unsafe {
-            biara_indirect_targets(
-                f.as_value_ref().cast(),
-                marker.as_ptr(),
-                read_cb,
-                &read as *const Reader as *mut c_void,
-                max_entries,
-                emit_cb,
-                &mut out as *mut _ as *mut c_void,
-                finish_cb,
-            );
+    let mut out: BTreeMap<u64, SiteResolution> = BTreeMap::new();
+    let reader = |addr: u64, len: usize| -> Option<Vec<u8>> {
+        let mut buf = vec![0u8; len];
+        read(addr, &mut buf).then_some(buf)
+    };
+    let mut each = Vec::new();
+    module.update(|m| {
+        for f in &m.module.functions {
+            if f.blocks.is_empty() {
+                continue;
+            }
+            each.push((f.name.clone(), f.clone()));
+        }
+    });
+    for (_, f) in each {
+        for (site, res) in crate::indirect::indirect_targets(&f, &reader, max_entries) {
+            let entry = out.entry(site).or_default();
+            entry.targets.extend(res.targets);
+            entry.complete &= res.complete;
+            entry.limited |= res.limited;
         }
     }
     Ok(out)
@@ -126,10 +101,6 @@ pub fn analyze_resolution(
     max_entries: u64,
 ) -> Result<ResolutionArtifact, Error> {
     let cx = Context::create();
-    // Resolution consumes global function/helper names and pc metadata, not
-    // local SSA names. Avoid their strings and LLVM's value-symbol-table work
-    // for large private analysis graphs; printable/executable lifts keep names.
-    unsafe { LLVMContextSetDiscardValueNames((&cx).as_ctx_ref().cast(), 1) };
     let module = crate::lift_with(
         &cx,
         machine,

@@ -149,7 +149,7 @@ fn exercise(arch: &str, target: &str, opt: u8, base: u64, annotated: bool) {
             "raw-bit moves must not become floats: {raw:?}"
         );
     }
-    let cx = inkwell::context::Context::create();
+    let cx = biara_ir_compat::context::Context::create();
     let prepared = prepare_c(
         &cx,
         &machine,
@@ -354,7 +354,7 @@ int check_vector(void) {{
 #[test]
 fn declared_types_flow_to_transport_and_facts() {
     use biara_lift::{AbiResult, AbiTy};
-    let cx = inkwell::context::Context::create();
+    let cx = biara_ir_compat::context::Context::create();
     let module = cx.create_module("declared");
     let i1 = cx.bool_type();
     let i8t = cx.i8_type();
@@ -363,7 +363,7 @@ fn declared_types_flow_to_transport_and_facts() {
     let i64t = cx.i64_type();
     let f32t = cx.f32_type();
     let f64t = cx.f64_type();
-    let ptrt = cx.ptr_type(inkwell::AddressSpace::default());
+    let ptrt = cx.ptr_type(biara_ir_compat::AddressSpace::default());
     // narrow16(int16_t) -> int16_t: i16 transport, signed spelling.
     let narrow = module.add_function("narrow16", i16t.fn_type(&[i16t.into()], false), None);
     // mixed(u64,double,u64,float) -> double: interleaved formals.
@@ -401,8 +401,8 @@ fn declared_types_flow_to_transport_and_facts() {
     }
     // Attach declared spellings exactly as `prepare_c` does after the
     // native ABI form (param `biara.c_type`, function `biara.c_return`).
-    use inkwell::attributes::AttributeLoc;
-    let attach = |f: inkwell::values::FunctionValue<'_>, params: &[&str], ret: &str| {
+    use biara_ir_compat::attributes::AttributeLoc;
+    let attach = |f: biara_ir_compat::values::FunctionValue<'_>, params: &[&str], ret: &str| {
         for (i, spelling) in params.iter().enumerate() {
             f.add_attribute(
                 AttributeLoc::Param(i as u32),

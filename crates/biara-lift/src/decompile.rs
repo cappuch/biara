@@ -77,7 +77,7 @@ use std::{
 use biara_abi::FunctionAbi;
 use biara_cfg::{Cfg, ExitKind, ReturnConvention};
 use biara_tcg::{ContextInfo, TempId, TempKind, Type, call_flags};
-use inkwell::{
+use biara_ir_compat::{
     context::Context,
     module::Module,
     passes::PassBuilderOptions,
@@ -232,67 +232,6 @@ struct Proto {
     ellipsis: u32,
 }
 
-unsafe extern "C" {
-    #[allow(clippy::too_many_arguments)]
-    fn biara_abi_form(
-        module: *mut c_void,
-        conv: *const Conv,
-        regs: *const Reg,
-        nregs: usize,
-        sigs: *const Sig,
-        nsigs: usize,
-        calls: *const Call,
-        ncalls: usize,
-        helpers: *const HelperRole,
-        nhelpers: usize,
-        drop: *const *mut c_void,
-        ndrop: usize,
-        err: *mut *mut c_char,
-    ) -> i32;
-    fn biara_fold_frames(module: *mut c_void) -> usize;
-    fn biara_div_sugar(module: *mut c_void) -> usize;
-    fn biara_dup_returns(module: *mut c_void) -> usize;
-    fn biara_specialize_helpers(
-        module: *mut c_void,
-        path: *const c_char,
-        names: *const *const c_char,
-        selectors: *const u32,
-        n: usize,
-        err: *mut *mut c_char,
-    ) -> std::ffi::c_long;
-    fn biara_index_switches(module: *mut c_void, read: ReadFn, ctx: *mut c_void) -> usize;
-    fn biara_parallel_function_passes(
-        module: *mut c_void,
-        machine: *mut c_void,
-        pipeline: *const c_char,
-        workers: usize,
-        error: *mut *mut c_char,
-    ) -> i32;
-    #[allow(clippy::too_many_arguments)]
-    fn biara_emit_c_cached(
-        layouts: *mut c_void,
-        module: *mut c_void,
-        cpu: *const CField,
-        ncpu: usize,
-        conv_args: *const *const c_char,
-        nconv: usize,
-        margin: u64,
-        banner: *const c_char,
-        unsupported: *mut usize,
-        data: *const DataSymbol,
-        ndata: usize,
-        strings: *const GuestStr,
-        nstrings: usize,
-        protos: *const Proto,
-        nprotos: usize,
-        syms: *const GuestStr,
-        nsyms: usize,
-        mode: u32,
-        write: WriteFn,
-        ctx: *mut c_void,
-    ) -> i32;
-}
-
 /// Rendered C statistics: how many constructs printed as placeholders
 /// (`/* unsupported ... */`).
 pub struct CStats {
@@ -304,7 +243,7 @@ type WriteFn = unsafe extern "C" fn(*mut c_void, *const c_char, usize) -> i32;
 
 /// Bytes of CPU state before env (`CPUArchState` sits inside `ArchCPU`;
 /// lifted code touches the icount and I/O flags just before it).
-const MARGIN: u64 = 256;
+pub const MARGIN: u64 = 256;
 
 /// Arguments a fixed-arity import takes; `None` for variadic or unknown
 /// imports (whose arity is inferred from the registers set at the call).
@@ -344,7 +283,7 @@ fn guest_strings(
     max_len: usize,
     ptr_bits: u32,
 ) -> (Vec<(u64, CString)>, BTreeMap<String, ProtoShape>) {
-    use inkwell::values::BasicValueEnum;
+    use biara_ir_compat::values::BasicValueEnum;
     let mut out = Vec::new();
     let mut seen = BTreeSet::new();
     let mut protos: BTreeMap<String, ProtoShape> = BTreeMap::new();
@@ -430,7 +369,7 @@ fn guest_strings(
                 for &idx in positions {
                     // Call operands are the arguments, then the callee.
                     match inst.get_operand(idx as u32) {
-                        Some(inkwell::values::Operand::Value(BasicValueEnum::IntValue(v))) => {
+                        Some(biara_ir_compat::values::Operand::Value(BasicValueEnum::IntValue(v))) => {
                             match v.get_zero_extended_constant() {
                                 Some(a) => try_addr(a),
                                 None => continue,
@@ -450,7 +389,7 @@ fn guest_strings(
         for bb in f.get_basic_blocks() {
             for inst in bb.get_instructions() {
                 for op in inst.get_operands() {
-                    if let Some(inkwell::values::Operand::Value(BasicValueEnum::IntValue(v))) = op {
+                    if let Some(biara_ir_compat::values::Operand::Value(BasicValueEnum::IntValue(v))) = op {
                         if v.get_type().get_bit_width() != ptr_bits {
                             continue;
                         }
@@ -633,30 +572,30 @@ fn prepare_c_with<'ctx>(
             push_lane(lane.base, lane.stride, lane.count, lane.slot, "fpr");
         }
     }
-    let mut regs: Vec<Reg> = reg_ids
+    let mut regs_owned: Vec<crate::abi_form::Reg> = reg_ids
         .iter()
         .zip(&reg_names)
-        .map(|(&g, n)| Reg {
+        .map(|(&g, n)| crate::abi_form::Reg {
             home: info.globals[g as usize].mem_offset,
             bits: info.globals[g as usize].ty.bits(),
-            name: n.as_ptr(),
+            name: n.to_string_lossy().into_owned(),
             // x86 segment bases: thread state, not arguments.
-            thread: u32::from(n.to_bytes().ends_with(b"_base")),
+            thread: n.to_bytes().ends_with(b"_base"),
         })
         .collect();
     // FP lane homes join the register table after the GPRs; their indices
     // are `reg_ids.len() + position`. `by_name`/`index` only cover GPRs;
     // lane indices below resolve positionally into `regs`.
-    let fp_base = regs.len() as u32;
-    regs.extend(
+    let fp_base = regs_owned.len() as u32;
+    regs_owned.extend(
         fp_homes
             .iter()
             .zip(&fp_names)
-            .map(|(&(home, bits, _), n)| Reg {
+            .map(|(&(home, bits, _), n)| crate::abi_form::Reg {
                 home,
                 bits,
-                name: n.as_ptr(),
-                thread: 0,
+                name: n.to_string_lossy().into_owned(),
+                thread: false,
             }),
     );
     // Lane index to register-table position: `fp_homes` holds lanes in
@@ -1061,7 +1000,7 @@ fn prepare_c_with<'ctx>(
         });
         entries.push((e, abi.frame.size));
     }
-    let mut sigs = Vec::new();
+    let mut sigs_owned: Vec<crate::abi_form::Sig> = Vec::new();
     for ((e, size), o) in entries.iter().zip(&owned) {
         let f = module
             .get_function(&name(*e))
@@ -1071,24 +1010,25 @@ fn prepare_c_with<'ctx>(
         let below = (size + 32).next_multiple_of(16) + bias;
         let top = o.stack.iter().copied().max().map_or(0, |m| m + 8);
         let above = (top.max(word as i64) as u64 + 16).next_multiple_of(16);
-        sigs.push(Sig {
-            func: f.as_value_ref().cast(),
-            args: o.args.as_ptr(),
-            nargs: o.args.len() as u32,
-            stack_args: o.stack.as_ptr(),
-            nstack: o.stack.len() as u32,
-            rets: o.rets.as_ptr(),
-            nrets: o.rets.len() as u32,
-            balanced: u32::from(o.balanced),
-            preserved: o.preserved.as_ptr(),
-            npreserved: o.preserved.len() as u32,
-            arg_kinds: o.arg_kinds.as_ptr(),
-            ret_kinds: o.ret_kinds.as_ptr(),
-            ret_class: o.ret_class,
-            sret_param: o.sret_param,
+        let _ = &f;
+        sigs_owned.push(crate::abi_form::Sig {
+            function: name(*e).to_owned(),
+            args: o.args.clone(),
+            stack_args: o.stack.clone(),
+            rets: o.rets.clone(),
             below,
             above,
             entry: *e,
+            balanced: o.balanced,
+            preserved: o.preserved.clone(),
+            arg_kinds: Some(o.arg_kinds.clone()),
+            ret_kinds: Some(o.ret_kinds.clone()),
+            ret_class: match o.ret_class {
+                RET_PAIR => crate::abi_form::RetClass::Pair,
+                RET_MEMORY => crate::abi_form::RetClass::Memory,
+                _ => crate::abi_form::RetClass::Direct,
+            },
+            sret_param: (o.sret_param != u32::MAX).then_some(o.sret_param),
         });
     }
 
@@ -1130,15 +1070,16 @@ fn prepare_c_with<'ctx>(
                     continue;
                 };
                 let callee = callee.get_name().to_str().unwrap_or_default().to_owned();
-                let raw = inst.as_value_ref().cast();
+                let raw = inst.ir_id();
                 // Analysis-only return boundaries never reach the C: drop them
                 // here so role lookup never sees a marker callee.
                 if callee == crate::calls::RETURN_MARKER {
                     inst.erase_from_basic_block();
                     continue;
                 }
+                let owner = f.get_name().to_string_lossy().into_owned();
                 if callee == SYSCALL {
-                    raw_calls.push((raw, CALL_SYSCALL, None, 0, u32::MAX));
+                    raw_calls.push((owner, raw, CALL_SYSCALL, None, 0, u32::MAX));
                     continue;
                 }
                 let stub = stub_names.get(&callee).copied();
@@ -1187,18 +1128,26 @@ fn prepare_c_with<'ctx>(
                     }
                     _ => u32::MAX,
                 };
-                raw_calls.push((raw, kind, import, ret, arity));
+                raw_calls.push((owner, raw, kind, import, ret, arity));
             }
         }
     }
-    let calls: Vec<Call> = raw_calls
+    // Call sites as owned values; the containing function is filled in per
+    // function below (the raw list is module-wide, built during lowering).
+    let calls_owned: Vec<crate::abi_form::Call> = raw_calls
         .iter()
-        .map(|&(inst, kind, import, ret, arity)| Call {
-            inst,
-            kind,
-            import: import.map_or(std::ptr::null(), |i| import_names[i].as_ptr()),
-            arity,
-            ret,
+        .map(|(function, inst, kind, import, ret, arity)| crate::abi_form::Call {
+            function: function.clone(),
+            inst: *inst,
+            kind: match *kind {
+                CALL_IMPORT => crate::abi_form::CallKind::Import,
+                CALL_INDIRECT => crate::abi_form::CallKind::Indirect,
+                CALL_SYSCALL => crate::abi_form::CallKind::Syscall,
+                _ => crate::abi_form::CallKind::Direct,
+            },
+            import: import.map(|i| import_names[i].to_string_lossy().into_owned()),
+            arity: (*arity != u32::MAX).then_some(*arity),
+            ret: *ret,
         })
         .collect();
 
@@ -1274,74 +1223,59 @@ fn prepare_c_with<'ctx>(
             regs,
         ));
     }
-    let helpers: Vec<HelperRole> = helper_syms
+    let helpers_owned: Vec<crate::abi_form::HelperRole> = helper_syms
         .iter()
         .zip(&roles)
         .zip(&env_only)
-        .map(|((s, &(mode, regs)), env)| HelperRole {
-            symbol: s.as_ptr(),
-            mode,
-            listed: u32::from(regs.is_some()),
-            reads: regs.map_or(std::ptr::null(), |r| r.0.as_ptr()),
-            nreads: regs.map_or(0, |r| r.0.len() as u32),
-            writes: regs.map_or(std::ptr::null(), |r| r.1.as_ptr()),
-            nwrites: regs.map_or(0, |r| r.1.len() as u32),
-            env_reads: env.as_ref().map_or(std::ptr::null(), |r| r.0.as_ptr()),
-            nenv_reads: env.as_ref().map_or(0, |r| r.0.len() as u32),
-            env_writes: env.as_ref().map_or(std::ptr::null(), |r| r.1.as_ptr()),
-            nenv_writes: env.as_ref().map_or(0, |r| r.1.len() as u32),
+        .map(|((s, &(mode, regs)), env)| crate::abi_form::HelperRole {
+            symbol: s.to_string_lossy().into_owned(),
+            reads: mode & HELPER_READS != 0,
+            writes: mode & HELPER_WRITES != 0,
+            pure_: mode & HELPER_PURE != 0,
+            listed: regs.is_some(),
+            reads_regs: regs.map_or_else(Vec::new, |r| r.0.clone()),
+            writes_regs: regs.map_or_else(Vec::new, |r| r.1.clone()),
+            env_reads: env.as_ref().map(|r| r.0.clone()),
+            env_writes: env.as_ref().map(|r| r.1.clone()),
         })
         .collect();
 
-    let mut drop: Vec<*mut c_void> = stubs
-        .iter()
-        .filter_map(|&e| module.get_function(&name(e)))
-        .map(|f| f.as_value_ref().cast())
-        .collect();
-    for d in [RUN, DISPATCH, SYSCALL] {
-        if let Some(f) = module.get_function(d) {
-            drop.push(f.as_value_ref().cast());
-        }
-    }
-    let conv = Conv {
+    // Owned ABI-form inputs: the register table, signatures, call sites and
+    // helper roles are built from the recovered analysis above.
+    let conv_owned = crate::abi_form::Conv {
         sp,
         pc,
         pop,
-        args: conv_args.as_ptr(),
-        nargs: conv_args.len() as u32,
+        args: conv_args.clone(),
         ret: results[0],
-        sys_args: sys_args.as_ptr(),
-        nsys: sys_args.len() as u32,
+        sys_args,
         sys_ret: by_name(spec.syscall.results[0])?,
         env_size: info.env_size as u64,
         margin: MARGIN,
-        dispatch: u32::from(dispatch),
+        dispatch,
     };
-    let mut err = std::ptr::null_mut();
-    let failed = unsafe {
-        biara_abi_form(
-            module.as_mut_ptr().cast(),
-            &conv,
-            regs.as_ptr(),
-            regs.len(),
-            sigs.as_ptr(),
-            sigs.len(),
-            calls.as_ptr(),
-            calls.len(),
-            helpers.as_ptr(),
-            helpers.len(),
-            drop.as_ptr(),
-            drop.len(),
-            &mut err,
-        )
-    };
-    if failed != 0 {
-        let msg = unsafe { CStr::from_ptr(err) }
-            .to_string_lossy()
-            .into_owned();
-        unsafe { libc_free(err.cast()) };
-        return Err(Error::Llvm(format!("ABI form: {msg}")));
+    let mut drop_owned: Vec<String> = stubs
+        .iter()
+        .filter(|&&e| module.get_function(&name(e)).is_some())
+        .map(|&e| name(e))
+        .collect();
+    for d in [RUN, DISPATCH, SYSCALL] {
+        if module.get_function(d).is_some() {
+            drop_owned.push(d.to_owned());
+        }
     }
+    module.update(|data| {
+        crate::abi_form::form(
+            &mut data.module,
+            &conv_owned,
+            &regs_owned,
+            &sigs_owned,
+            &calls_owned,
+            &helpers_owned,
+            &drop_owned,
+        )
+    })
+    .map_err(|e| Error::Llvm(format!("ABI form: {e}")))?;
     module
         .verify()
         .map_err(|e| Error::Llvm(format!("ABI form: {e}")))?;
@@ -1355,7 +1289,7 @@ fn prepare_c_with<'ctx>(
     // `entries`/`owned` (the pre-ABI-form vectors) align positionally;
     // names resolve through the ABI-form module below.
     {
-        use inkwell::attributes::AttributeLoc;
+        use biara_ir_compat::attributes::AttributeLoc;
         for ((entry, _), o) in entries.iter().zip(&owned) {
             let Some(func_name) = name_of(*entry).or_else(|| names.get(entry).cloned()) else {
                 continue;
@@ -1640,13 +1574,19 @@ impl<'ctx> PreparedC<'ctx> {
         let PreparedC { module, summaries } = self;
         simplify(&module, machine, options, summaries.specialize.as_ref())?;
         // Jump tables: switch on the index rather than on code addresses.
-        let indexed = unsafe {
-            biara_index_switches(
-                module.as_mut_ptr().cast(),
-                read_cb,
-                &read as *const Reader as *mut c_void,
-            )
+        let reader = |addr: u64, len: usize| -> Option<Vec<u8>> {
+            let mut buf = vec![0u8; len];
+            read(addr, &mut buf).then_some(buf)
         };
+        let mut indexed = 0;
+        module.update(|m| {
+            for f in &mut m.module.functions {
+                if f.blocks.is_empty() {
+                    continue;
+                }
+                indexed += crate::index_switches::index_switches(f, &reader).total();
+            }
+        });
         if indexed > 0 {
             // A complete table's switch has no default; with two
             // destinations it reads as an `if` (`switch-range-to-icmp`).
@@ -1923,7 +1863,7 @@ impl<'ctx> TransformedC<'ctx> {
     }
 
     fn bind_structs_inner(
-        module: &inkwell::module::Module<'_>,
+        module: &biara_ir_compat::module::Module<'_>,
         structs: &std::collections::BTreeMap<String, biara_proto::annotations::StructAnnotation>,
         layouts: &mut crate::layouts::Handle,
     ) -> Result<(), Error> {
@@ -2197,115 +2137,104 @@ impl<'ctx> TransformedC<'ctx> {
 
     fn emit(&mut self, mode: u32, write: WriteFn, ctx: *mut c_void) -> Result<CStats, Error> {
         self.ensure_layouts()?;
-        let cpu_names: Vec<CString> = self
+        let cpu: Vec<crate::cgen::CpuField> = self
             .cpu
             .iter()
-            .map(|(_, _, n)| CString::new(n.as_str()).unwrap())
-            .collect();
-        let cpu_fields: Vec<CField> = self
-            .cpu
-            .iter()
-            .zip(&cpu_names)
-            .map(|((off, bytes, _), n)| CField {
+            .map(|(off, bytes, name)| crate::cgen::CpuField {
                 off: MARGIN as i64 + off,
                 bytes: *bytes,
-                name: n.as_ptr(),
+                name: name.clone(),
             })
             .collect();
-        let conv_names: Vec<CString> = self
-            .conv_args
-            .iter()
-            .map(|n| CString::new(n.as_str()).unwrap())
-            .collect();
-        let conv_ptrs: Vec<*const c_char> = conv_names.iter().map(|n| n.as_ptr()).collect();
-        let data_names: Vec<CString> = self
+        let data: Vec<crate::cgen::DataSym> = self
             .data
             .iter()
-            .map(|(_, _, n)| CString::new(n.as_str()).unwrap())
-            .collect();
-        let data_syms: Vec<DataSymbol> = self
-            .data
-            .iter()
-            .zip(&data_names)
-            .map(|((addr, size, _), name)| DataSymbol {
+            .map(|(addr, size, name)| crate::cgen::DataSym {
                 addr: *addr,
                 size: *size,
-                name: name.as_ptr(),
+                name: name.clone(),
             })
             .collect();
-        let fn_names: Vec<CString> = self
-            .fns
-            .iter()
-            .map(|(_, n)| CString::new(n.as_str()).unwrap())
-            .collect();
-        let fn_syms: Vec<GuestStr> = self
-            .fns
-            .iter()
-            .zip(&fn_names)
-            .map(|((addr, _), name)| GuestStr {
-                addr: *addr,
-                text: name.as_ptr(),
-            })
-            .collect();
-        let string_syms: Vec<CString> = self
+        let strings: Vec<crate::cgen::GuestStr> = self
             .strings
             .iter()
-            .map(|(_, t)| CString::new(t.as_str()).unwrap())
-            .collect();
-        let string_ptrs: Vec<GuestStr> = self
-            .strings
-            .iter()
-            .zip(&string_syms)
-            .map(|((addr, _), text)| GuestStr {
+            .map(|(addr, text)| crate::cgen::GuestStr {
                 addr: *addr,
-                text: text.as_ptr(),
+                text: text.clone(),
             })
             .collect();
-        let proto_names: Vec<CString> = self
-            .protos
+        let syms: Vec<crate::cgen::GuestStr> = self
+            .fns
             .iter()
-            .map(|(n, _, _, _)| CString::new(n.as_str()).unwrap())
+            .map(|(addr, name)| crate::cgen::GuestStr {
+                addr: *addr,
+                text: name.clone(),
+            })
             .collect();
-        let proto_syms: Vec<Proto> = self
+        let protos: Vec<crate::cgen::Proto> = self
             .protos
             .iter()
-            .zip(&proto_names)
-            .map(|((_, nargs, mask, ellipsis), name)| Proto {
-                name: name.as_ptr(),
+            .map(|(name, nargs, mask, ellipsis)| crate::cgen::Proto {
+                name: name.clone(),
                 nargs: *nargs,
                 strmask: *mask,
-                ellipsis: u32::from(*ellipsis),
+                ellipsis: *ellipsis,
             })
             .collect();
-        let banner = CString::new(self.banner.as_str()).unwrap();
-        let mut unsupported = 0usize;
-        let failed = unsafe {
-            biara_emit_c_cached(
-                self.layouts.as_ref().unwrap().as_ptr(),
-                self.module.as_mut_ptr().cast(),
-                cpu_fields.as_ptr(),
-                cpu_fields.len(),
-                conv_ptrs.as_ptr(),
-                conv_ptrs.len(),
-                MARGIN,
-                banner.as_ptr(),
-                &mut unsupported,
-                data_syms.as_ptr(),
-                data_syms.len(),
-                string_ptrs.as_ptr(),
-                string_ptrs.len(),
-                proto_syms.as_ptr(),
-                proto_syms.len(),
-                fn_syms.as_ptr(),
-                fn_syms.len(),
-                mode,
-                write,
-                ctx,
-            )
+        // The renderer consumes the compact owned layout facts.
+        let facts = self.layouts.as_ref().unwrap().analysis().layouts();
+        let opts = crate::cgen::Options {
+            cpu: &cpu,
+            conv_args: &self.conv_args,
+            margin: MARGIN,
+            banner: &self.banner,
+            data: &data,
+            strings: &strings,
+            protos: &protos,
+            syms: &syms,
+            layouts: &facts,
         };
-        if failed != 0 {
-            return Err(Error::Llvm("C emitter stopped".into()));
+        // The sink the caller supplied is a C callback; wrap it so `cgen`
+        // writes straight into it chunk by chunk.
+        struct Sink {
+            write: WriteFn,
+            ctx: *mut c_void,
+            err: Option<std::io::Error>,
         }
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                let ok = unsafe {
+                    (self.write)(self.ctx, buf.as_ptr().cast(), buf.len())
+                };
+                if ok != 0 {
+                    let e = std::io::Error::other("C sink failed");
+                    self.err = Some(std::io::Error::other("C sink failed"));
+                    return Err(e);
+                }
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut sink = Sink {
+            write,
+            ctx,
+            err: None,
+        };
+        let ir = self.module.ir();
+        let emitted = if mode == 0 {
+            crate::cgen::emit(&ir, &opts, &mut sink)
+        } else {
+            crate::cgen::emit_packages(&ir, &opts, &mut |s: &str| {
+                use std::io::Write as _;
+                sink.write_all(s.as_bytes())
+            })
+        };
+        if let Some(e) = sink.err {
+            return Err(Error::Io(e));
+        }
+        let unsupported = emitted.map_err(Error::Llvm)?;
         Ok(CStats { unsupported })
     }
 }
@@ -2419,66 +2348,40 @@ fn apply_global_renames(
     Ok(())
 }
 
-/// Inline the `specialize` helpers at calls whose operation argument is
-/// constant (cpp/specialize.cpp); the others stay calls.
-fn specialize_helpers(module: &Module<'_>, specialize: &Specialize) -> Result<usize, Error> {
-    let names: Vec<*const c_char> = specialize.symbols.iter().map(|s| s.as_ptr()).collect();
-    let mut error = std::ptr::null_mut();
-    let inlined = unsafe {
-        biara_specialize_helpers(
-            module.as_mut_ptr().cast(),
-            specialize.bitcode.as_ptr(),
-            names.as_ptr(),
-            specialize.selectors.as_ptr(),
-            names.len(),
-            &mut error,
-        )
-    };
-    if inlined < 0 {
-        let message = unsafe { CStr::from_ptr(error) }
-            .to_string_lossy()
-            .into_owned();
-        unsafe { libc_free(error.cast()) };
-        return Err(Error::Llvm(message));
-    }
-    Ok(inlined as usize)
+/// Helper specialization inlined QEMU's helper definitions from bitcode at
+/// the calls whose operation argument was constant. Reading and inlining
+/// bitcode is LLVM's, so without LLVM there is nothing to inline: the calls
+/// stay calls, which is correct code, just less pretty. Reports 0 inlined.
+fn specialize_helpers(_module: &Module<'_>, _specialize: &Specialize) -> Result<usize, Error> {
+    Ok(0)
 }
 
-unsafe extern "C" {
-    #[link_name = "free"]
-    fn libc_free(p: *mut c_void);
-}
-
+/// Run `pipeline` over every function with a body.
+///
+/// LLVM ran these pipelines in isolated parallel units over its own IR; the
+/// passes here are `biara_ir`'s, applied in order to each function. Running
+/// them serially costs throughput on very large modules but changes nothing
+/// about the result, and an unknown pass name is an error rather than a
+/// silently shorter pipeline.
 fn function_passes(
     module: &Module<'_>,
-    machine: &TargetMachine,
+    _machine: &TargetMachine,
     pipeline: &CStr,
-    options: DecompileOptions,
+    _options: DecompileOptions,
 ) -> Result<(), Error> {
-    let mut error = std::ptr::null_mut();
-    let failed = unsafe {
-        biara_parallel_function_passes(
-            module.as_mut_ptr().cast(),
-            machine.as_mut_ptr().cast(),
-            pipeline.as_ptr(),
-            options.workers(),
-            &mut error,
-        )
-    };
-    let message = if error.is_null() {
-        None
-    } else {
-        let message = unsafe { CStr::from_ptr(error) }
-            .to_string_lossy()
-            .into_owned();
-        unsafe { libc_free(error.cast()) };
-        Some(message)
-    };
-    if failed != 0 {
-        return Err(Error::Llvm(message.unwrap_or_else(|| {
-            "function-local passes failed without a diagnostic".into()
-        })));
-    }
+    let text = pipeline
+        .to_str()
+        .map_err(|_| Error::Llvm("pipeline is not UTF-8".into()))?;
+    // Reject the name before touching anything, so a typo cannot half-run.
+    biara_ir::pass::parse_pipeline(text).map_err(Error::Llvm)?;
+    module.update(|m| {
+        for f in &mut m.module.functions {
+            if f.blocks.is_empty() {
+                continue;
+            }
+            biara_ir::pass::run_pipeline(f, text).expect("validated above");
+        }
+    });
     Ok(())
 }
 
@@ -2496,7 +2399,14 @@ fn simplify(
     for _ in 0..4 {
         run(c"function(sroa,early-cse<memssa>,instcombine<no-verify-fixpoint>)")?;
         memory::rebase_guest_pointers(module)?;
-        let folded = unsafe { biara_fold_frames(module.as_mut_ptr().cast()) };
+        let mut folded = 0;
+        module.update(|m| {
+            for f in &mut m.module.functions {
+                if !f.blocks.is_empty() {
+                    folded += crate::rewrite::fold_frames(f);
+                }
+            }
+        });
         if folded == 0 {
             break;
         }
@@ -2514,14 +2424,28 @@ fn simplify(
         .map_err(|e| Error::Llvm(e.to_string()))?;
     // Plain divisions read as `/` and `%`: fold the prelude calls whose
     // high half only extends the low back into `sdiv`/`srem`.
-    let sugared = unsafe { biara_div_sugar(module.as_mut_ptr().cast()) };
+    let mut sugared = 0;
+    module.update(|m| {
+        for f in &mut m.module.functions {
+            if !f.blocks.is_empty() {
+                sugared += crate::rewrite::div_sugar(f);
+            }
+        }
+    });
     if sugared > 0 {
         run(c"function(simplifycfg,instcombine<no-verify-fixpoint>,adce)")?;
     }
     // One `return` per arm instead of a `common_ret_op` join: duplicate a
     // return-only block into unconditionally-branching predecessors, then
     // clean up what died.
-    let duped = unsafe { biara_dup_returns(module.as_mut_ptr().cast()) };
+    let mut duped = 0;
+    module.update(|m| {
+        for f in &mut m.module.functions {
+            if !f.blocks.is_empty() {
+                duped += crate::rewrite::dup_returns(f);
+            }
+        }
+    });
     if duped > 0 {
         run(c"function(simplifycfg,adce)")?;
     }
@@ -2612,7 +2536,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn generated_c_preserves_scalar_and_vector_bits() {
         let cx = Context::create();
-        let ir = inkwell::memory_buffer::MemoryBuffer::create_from_memory_range_copy(
+        let ir = biara_ir_compat::memory_buffer::MemoryBuffer::create_from_memory_range_copy(
             br#"
                 define double @flip_sign(double %x) {
                     %bits = bitcast double %x to i64
@@ -2689,7 +2613,7 @@ mod tests {
     fn generated_strings_preserve_bytes_and_escaping_pointer_identity() {
         let cx = Context::create();
         let make = || {
-            let ir = inkwell::memory_buffer::MemoryBuffer::create_from_memory_range_copy(
+            let ir = biara_ir_compat::memory_buffer::MemoryBuffer::create_from_memory_range_copy(
                 br#"
                 declare i32 @strcmp(i64, i64)
                 declare i64 @strlen(i64)
@@ -2858,20 +2782,12 @@ mod tests {
             options,
         )
         .unwrap();
-        // Genuine JIT execution: a native machine, never the analysis one.
-        let native = crate::native_machine().unwrap();
-        let _ = &native;
-        let engine = transformed
-            .module
-            .create_jit_execution_engine(inkwell::OptimizationLevel::None)
-            .unwrap();
-        for (name, expected) in [("first", 0x1000), ("second", 0x2000)] {
-            let function = unsafe {
-                engine
-                    .get_function::<unsafe extern "C" fn() -> u64>(name)
-                    .unwrap()
-            };
-            assert_eq!(unsafe { function.call() }, expected);
+        // Execution proof through the interpreter: both functions still
+        // compute their constant after the failed round and the retry.
+        let ir = transformed.module.ir();
+        let mut interp = crate::interp::Interp::new(&ir, (0, 0x10000));
+        for (name, expected) in [("first", 0x1000u128), ("second", 0x2000)] {
+            assert_eq!(interp.call(name, &[]).unwrap(), expected, "{name}");
         }
     }
 
@@ -2918,20 +2834,12 @@ mod tests {
             options,
         )
         .unwrap();
-        let engine = transformed
-            .module
-            .create_jit_execution_engine(inkwell::OptimizationLevel::None)
-            .unwrap();
-        // Genuine JIT execution: a native machine, never the analysis one.
-        let native = crate::native_machine().unwrap();
-        let _ = &native;
-        for (name, expected) in [("first", 0x1000), ("second", 0x2000), ("invalid", 42)] {
-            let function = unsafe {
-                engine
-                    .get_function::<unsafe extern "C" fn() -> u64>(name)
-                    .unwrap()
-            };
-            assert_eq!(unsafe { function.call() }, expected);
+        // After repairing the body, every function (including the repaired
+        // one) still computes its value.
+        let ir = transformed.module.ir();
+        let mut interp = crate::interp::Interp::new(&ir, (0, 0x10000));
+        for (name, expected) in [("first", 0x1000u128), ("second", 0x2000), ("invalid", 42)] {
+            assert_eq!(interp.call(name, &[]).unwrap(), expected, "{name}");
         }
     }
     #[test]
@@ -3142,7 +3050,7 @@ mod tests {
             }
         \0";
         // LLVM's text parser reads the sentinel immediately after the slice.
-        let buffer = inkwell::memory_buffer::MemoryBuffer::create_from_memory_range(
+        let buffer = biara_ir_compat::memory_buffer::MemoryBuffer::create_from_memory_range(
             &source[..source.len() - 1],
             "shared-state",
         );
@@ -3155,31 +3063,29 @@ mod tests {
             DecompileOptions::with_workers(std::num::NonZeroUsize::new(2).unwrap()),
         )
         .unwrap();
-        let engine = module
-            .create_jit_execution_engine(inkwell::OptimizationLevel::None)
-            .unwrap();
-        let first = unsafe {
-            engine
-                .get_function::<unsafe extern "C" fn(u64) -> u64>("first")
-                .unwrap()
-        };
-        let second = unsafe {
-            engine
-                .get_function::<unsafe extern "C" fn(u64) -> u64>("second")
-                .unwrap()
-        };
-        let set_state = unsafe {
-            engine
-                .get_function::<unsafe extern "C" fn(u64)>("set_state")
-                .unwrap()
-        };
-        assert_eq!(unsafe { second.call(5) }, 33);
-        for state in [0, 19, u64::MAX] {
-            unsafe { set_state.call(state) };
-            for x in [0u64, 1, 1 << 63, u64::MAX] {
-                let value = x.wrapping_mul(3).wrapping_add(7);
-                assert_eq!(unsafe { first.call(x) }, value.wrapping_add(7));
-                assert_eq!(unsafe { second.call(x) }, value.wrapping_add(state));
+        // `@factor`/`@state` live in the interpreter's global space, so the
+        // same module state is observed across calls exactly as before.
+        let ir = module.ir();
+        let mut interp = crate::interp::Interp::new(&ir, (0, 0x10000));
+        let m = u64::MAX as u128;
+        assert_eq!(interp.call("second", &[5]).unwrap(), 33);
+        for state in [0u128, 19, m] {
+            interp.call("set_state", &[state]).unwrap();
+            for x in [0u128, 1, 1 << 63, m] {
+                let value = x
+                    .wrapping_mul(3)
+                    .wrapping_add(7)
+                    & u64::MAX as u128;
+                assert_eq!(
+                    interp.call("first", &[x]).unwrap(),
+                    value.wrapping_add(7),
+                    "first({x})"
+                );
+                assert_eq!(
+                    interp.call("second", &[x]).unwrap(),
+                    value.wrapping_add(state),
+                    "second({x})"
+                );
             }
         }
     }

@@ -483,6 +483,8 @@ dependencies = [
  "biara-cfg",
  "biara-diff",
  "biara-engine",
+ "biara-ir",
+ "biara-ir-compat",
  "biara-lift",
  "biara-loader",
  "biara-proto",
@@ -490,7 +492,6 @@ dependencies = [
  "biara-tcg",
  "blake3",
  "clap",
- "inkwell",
  "libc",
  "parking_lot",
  "reqwest",
@@ -522,12 +523,13 @@ name = "biara-engine"
 version = "0.1.0"
 dependencies = [
  "biara-cfg",
+ "biara-ir",
+ "biara-ir-compat",
  "biara-lift",
  "biara-loader",
  "biara-proto",
  "biara-tcg",
  "blake3",
- "inkwell",
  "libc",
  "parking_lot",
  "postcard",
@@ -539,17 +541,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "biara-ir"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "biara-ir-compat"
+version = "0.1.0"
+dependencies = [
+ "biara-ir",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "biara-lift"
 version = "0.1.0"
 dependencies = [
  "biara-abi",
  "biara-cfg",
+ "biara-ir",
+ "biara-ir-compat",
  "biara-loader",
  "biara-proto",
  "biara-tcg",
  "blake3",
- "cc",
- "inkwell",
  "libc",
  "parking_lot",
  "postcard",
@@ -587,6 +605,8 @@ dependencies = [
  "biara-abi",
  "biara-cfg",
  "biara-engine",
+ "biara-ir",
+ "biara-ir-compat",
  "biara-lift",
  "biara-loader",
  "biara-proto",
@@ -594,7 +614,6 @@ dependencies = [
  "blake3",
  "cpp_demangle",
  "iced-x86",
- "inkwell",
  "msvc-demangler",
  "parking_lot",
  "rustc-demangle",
@@ -1909,28 +1928,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "inkwell"
-version = "0.10.0"
-source = "git+https://github.com/TheDan64/inkwell?rev=5718b632ae689376f74ddfb4ff804a90eb7319f0#5718b632ae689376f74ddfb4ff804a90eb7319f0"
-dependencies = [
- "bitflags 2.13.2",
- "inkwell_internals",
- "libc",
- "llvm-sys",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "inkwell_internals"
-version = "0.15.0"
-source = "git+https://github.com/TheDan64/inkwell?rev=5718b632ae689376f74ddfb4ff804a90eb7319f0#5718b632ae689376f74ddfb4ff804a90eb7319f0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 3.0.6",
-]
-
-[[package]]
 name = "ipnet"
 version = "2.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2125,20 +2122,6 @@ name = "litrs"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4744e383959f0db86ede514b809b1c53251889093803c05267acc7d4e7030d70"
-
-[[package]]
-name = "llvm-sys"
-version = "231.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c0475bc87fdfb41f07d459d26d01534dbf24f51260dc8a38b661988e5e6b3432"
-dependencies = [
- "anyhow",
- "cc",
- "lazy_static",
- "libc",
- "regex-lite",
- "semver",
-]
 
 [[package]]
 name = "lock_api"
@@ -3322,12 +3305,6 @@ dependencies = [
  "memchr",
  "regex-syntax",
 ]
-
-[[package]]
-name = "regex-lite"
-version = "0.1.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cab834c73d247e67f4fae452806d17d3c7501756d98c8808d7c9c7aa7d18f973"
 
 [[package]]
 name = "regex-syntax"

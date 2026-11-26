@@ -27,7 +27,7 @@
 
 use std::{ffi::c_void, marker::PhantomData, ptr::NonNull};
 
-use inkwell::{
+use biara_ir_compat::{
     AddressSpace,
     basic_block::BasicBlock,
     module::Module,
@@ -41,39 +41,31 @@ use inkwell::{
 
 use crate::Error;
 
-unsafe extern "C" {
-    fn biara_trimmer_create(machine: *mut c_void) -> *mut c_void;
-    fn biara_trimmer_run(trimmer: *mut c_void, function: *mut c_void);
-    fn biara_trimmer_dispose(trimmer: *mut c_void);
-}
-
 /// The canonicalization prefix, reused one completed function at a time.
-/// Analyses are cleared after each run: neither the raw IR nor cached
-/// analyses accumulate across functions. The target machine outlives it.
+///
+/// LLVM ran `function(sroa,early-cse<memssa>,instcombine<no-verify-fixpoint>)`
+/// here; `biara_ir::pass::simplify` is the same canonicalisation (allocas to
+/// SSA, constant folding, DCE, CFG tidying) applied until it reaches a
+/// fixpoint. Nothing is cached between functions, matching the old contract.
 pub(crate) struct Trimmer<'m> {
-    raw: NonNull<c_void>,
     _machine: PhantomData<&'m TargetMachine>,
 }
 
 impl<'m> Trimmer<'m> {
-    pub(crate) fn new(machine: &'m TargetMachine) -> Self {
+    pub(crate) fn new(_machine: &'m TargetMachine) -> Self {
         Self {
-            raw: NonNull::new(unsafe { biara_trimmer_create(machine.as_mut_ptr().cast()) })
-                .expect("LLVM trimmer allocation"),
             _machine: PhantomData,
         }
     }
 
     pub(crate) fn run(&mut self, function: FunctionValue<'_>) {
-        use inkwell::values::AsValueRef;
-        // LLVM owns the function; the shim neither retains nor deletes it.
-        unsafe { biara_trimmer_run(self.raw.as_ptr(), function.as_value_ref().cast()) };
-    }
-}
-
-impl Drop for Trimmer<'_> {
-    fn drop(&mut self) {
-        unsafe { biara_trimmer_dispose(self.raw.as_ptr()) };
+        let ctx = function.ctx();
+        ctx.update(|m| {
+            let idx = function.index();
+            if let Some(f) = m.module.functions.get_mut(idx) {
+                biara_ir::pass::simplify(f);
+            }
+        });
     }
 }
 
@@ -207,18 +199,24 @@ pub(crate) fn rebase_guest_pointers(module: &Module<'_>) -> Result<(), Error> {
                 }
             }
         }
-        let mut bases: Vec<(IntValue<'_>, inkwell::values::PointerValue<'_>)> = Vec::new();
+        let mut bases: Vec<(IntValue<'_>, biara_ir_compat::values::PointerValue<'_>)> = Vec::new();
         for (inst, base, off) in sites {
             let base_ptr = match bases.iter().find(|(v, _)| *v == base) {
                 Some(&(_, p)) => p,
                 None => {
                     // Right after the definition; phis stay grouped at the
                     // top of their block, arguments go to the entry.
+                    // The base's defining block, when it has one; a value the
+                    // IR cannot place is materialised at the entry.
                     let at = match base.as_instruction() {
-                        Some(def) if def.get_opcode() == InstructionOpcode::Phi => {
-                            first_non_phi(def.get_parent().unwrap())
-                        }
-                        Some(def) => def.get_next_instruction(),
+                        Some(def) if def.get_opcode() == InstructionOpcode::Phi => def
+                            .get_parent()
+                            .and_then(first_non_phi)
+                            .or_else(|| first_non_phi(entry)),
+                        Some(def) => def
+                            .get_next_instruction()
+                            .or_else(|| def.get_parent().and_then(first_non_phi))
+                            .or_else(|| first_non_phi(entry)),
                         None => first_non_phi(entry),
                     };
                     b.position_before(&at.expect("a block ends in a terminator"));
@@ -243,7 +241,10 @@ pub(crate) fn rebase_guest_pointers(module: &Module<'_>) -> Result<(), Error> {
 /// `(%base, C)` when `inst` is `inttoptr (add %base, C)` with a non-constant
 /// `%base` of 64 bits.
 fn base_offset<'ctx>(inst: InstructionValue<'ctx>) -> Option<(IntValue<'ctx>, i64)> {
-    let addr = inst.get_operand(0)?.value()?.into_int_value();
+    // A store of a pointer stores a pointer; there is no integer to rebase.
+    let BasicValueEnum::IntValue(addr) = inst.get_operand(0)?.value()? else {
+        return None;
+    };
     let add = addr.as_instruction()?;
     if add.get_opcode() != InstructionOpcode::Add || addr.get_type().get_bit_width() != 64 {
         return None;

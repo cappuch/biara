@@ -44,8 +44,6 @@ toml = "0.9"
 # decompiling a huge function is allocation-bound under glibc.
 tikv-jemallocator = { version = "0.7", features = ["unprefixed_malloc_on_supported_platforms"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
-# LLVM 23 support is on inkwell master only (0.10.0 stops at LLVM 22).
-inkwell = { git = "https://github.com/TheDan64/inkwell", rev = "5718b632ae689376f74ddfb4ff804a90eb7319f0", default-features = false, features = ["llvm23-1-force-static", "target-x86"] }
 
 # Rune (the UI toolkit behind biara-ui) ships patched copies of these crates; a
 # dependency's [patch] never reaches the workspace that uses it, so the workspace

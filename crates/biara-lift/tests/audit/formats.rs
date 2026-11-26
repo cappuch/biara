@@ -7,36 +7,7 @@
 
 use std::{path::PathBuf, process::Command};
 
-use crate::common::tmp;
-use std::sync::OnceLock;
-
-fn linker() -> PathBuf {
-    static LD: OnceLock<PathBuf> = OnceLock::new();
-    LD.get_or_init(|| {
-        let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
-        let out = std::process::Command::new(rustc)
-            .args(["--print", "sysroot"])
-            .output()
-            .unwrap();
-        let sysroot = String::from_utf8(out.stdout).unwrap();
-        let rustlib = PathBuf::from(sysroot.trim()).join("lib/rustlib");
-        let lld = std::fs::read_dir(&rustlib)
-            .unwrap()
-            .map(|e| e.unwrap().path().join("bin/rust-lld"))
-            .find(|p| p.exists())
-            .unwrap();
-        let dir = tmp().join("ld-audit-formats");
-        std::fs::create_dir_all(&dir).unwrap();
-        for name in ["ld.lld", "lld-link", "ld64.lld"] {
-            let link = dir.join(name);
-            if link.symlink_metadata().is_err() {
-                std::os::unix::fs::symlink(&lld, &link).unwrap_or(());
-            }
-        }
-        dir.join("ld.lld")
-    })
-    .clone()
-}
+use crate::common::{linker, tmp};
 
 /// One corpus binary: how to build it, and how names look in it.
 pub struct Target {
