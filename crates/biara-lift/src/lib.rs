@@ -417,8 +417,17 @@ fn lift_with<'ctx>(
         }
     }
     let entries: BTreeSet<u64> = functions.keys().copied().collect();
-    driver(cx, info, dispatch, &entries, &functions, false)?;
-    driver(cx, info, run, &entries, &functions, true)?;
+    for (function, looping) in [(dispatch, false), (run, true)] {
+        let indexed = entries.len() >= 32;
+        if indexed {
+            module.update(|data| data.index_builder_constants(Some(function.index())));
+        }
+        let result = driver(cx, info, function, &entries, &functions, looping);
+        if indexed {
+            module.update(|data| data.index_builder_constants(None));
+        }
+        result?;
+    }
     // `preds` is a cache the block builders do not maintain; derive it once
     // the module is final so verification and every analysis agree.
     // `preds` is a cache the block builders do not maintain; derive it once
