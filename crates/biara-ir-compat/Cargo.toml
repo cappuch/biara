@@ -1,0 +1,11 @@
+[package]
+name = "biara-ir-compat"
+description = "The inkwell API shape biara-lift was written against, over biara-ir"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+biara-ir.workspace = true
+thiserror.workspace = true

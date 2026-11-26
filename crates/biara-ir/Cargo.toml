@@ -1,0 +1,11 @@
+[package]
+name = "biara-ir"
+description = "The SSA IR, builder and analyses the lifter and decompiler share"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
