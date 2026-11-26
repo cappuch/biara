@@ -134,7 +134,7 @@ pub fn promote_allocas(f: &mut Function) {
     }
 
     let doms = Dominators::new(f);
-    let promotable: Vec<ValueId> = infos
+    let mut promotable: Vec<ValueId> = infos
         .iter()
         .filter(|(_, info)| !info.escaped && !info.stores.is_empty())
         .map(|(v, _)| *v)
@@ -142,6 +142,8 @@ pub fn promote_allocas(f: &mut Function) {
     if promotable.is_empty() {
         return;
     }
+    // Rewriting one slot can expose equal incoming values for another.
+    promotable.sort_unstable();
 
     let mut replacements = vec![None; f.values.len()];
     let mut changed = Vec::new();

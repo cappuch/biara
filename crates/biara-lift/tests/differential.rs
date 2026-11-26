@@ -413,13 +413,19 @@ fn check(name: &str, f: TestFn) {
         let module_ir = module.ir();
         let mut interp = biara_lift::interp::Interp::new(
             &module_ir,
-            (env as u64, env as u64 + info.env_size as u64 + 0x40_0000),
+            (
+                env as u64 - biara_lift::CPU_STATE_MARGIN,
+                env as u64 + info.env_size as u64,
+            ),
         );
         for h in cfg.helpers() {
             interp.bind(h.symbol(), h.addr as u64);
         }
 
         let mut stack = vec![0u64; 1024];
+        let stack_range = stack.as_mut_ptr_range();
+        interp.map((stack_range.start as u64, stack_range.end as u64));
+        interp.map((addr_of!(biara_t_begin) as u64, addr_of!(biara_t_end) as u64));
         for (a, b) in inputs() {
             let expected = unsafe { f(a, b) };
 
